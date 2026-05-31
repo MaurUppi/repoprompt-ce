@@ -40,6 +40,19 @@ EXCLUDED_SWIFT_PREFIXES=(
     "Packages/RepoPromptAgentProviders/.build/"
 )
 
+EXCLUDED_SWIFT_FILES=(
+    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPromptSharedFragments.swift"
+    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Build.swift"
+    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+DeepPlan.swift"
+    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Investigate.swift"
+    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Optimize.swift"
+    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+OracleExport.swift"
+    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Orchestrate.swift"
+    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Refactor.swift"
+    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Reminder.swift"
+    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Review.swift"
+)
+
 fail(){ echo "ERROR: $*" >&2; exit 1; }
 
 ensure_tool(){
@@ -55,9 +68,12 @@ run(){
 
 should_include_swift_file(){
     local file="$1"
-    local prefix
+    local excluded prefix
     for prefix in "${EXCLUDED_SWIFT_PREFIXES[@]}"; do
         [[ "$file" == "$prefix"* ]] && return 1
+    done
+    for excluded in "${EXCLUDED_SWIFT_FILES[@]}"; do
+        [[ "$file" == "$excluded" ]] && return 1
     done
     return 0
 }
@@ -89,6 +105,11 @@ collect_swift_files(){
 run_swiftformat(){
     local mode="$1"
     ensure_tool swiftformat
+    collect_swift_files
+
+    if (( ${#SWIFT_FILES[@]} == 0 )); then
+        fail "No Swift files found in configured style scope."
+    fi
 
     local args=(--config "$ROOT_DIR/.swiftformat")
     if [[ "$mode" == "check" ]]; then
@@ -99,7 +120,7 @@ run_swiftformat(){
     fi
 
     cd "$ROOT_DIR"
-    run swiftformat "${args[@]}" "${STYLE_PATHS[@]}"
+    run swiftformat "${args[@]}" "${SWIFT_FILES[@]}"
 }
 
 run_swiftlint(){
