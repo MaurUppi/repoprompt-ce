@@ -4800,8 +4800,6 @@ class PromptViewModel: ObservableObject {
         gitBaseOverride: String? = nil,
         selectionOverride: StoredSelection? = nil
     ) async -> AIMessage {
-        let activeModel = overrideModel ?? preferredAIModel
-
         // Use pro file edit based on the specified or current chat preset
         let preset = overrideChatPreset ?? currentChatPreset()
         var resolvedConfig: PromptContextResolved = {
