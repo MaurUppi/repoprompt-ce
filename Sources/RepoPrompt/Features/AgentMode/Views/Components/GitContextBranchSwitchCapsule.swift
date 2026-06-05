@@ -58,6 +58,10 @@ struct GitContextBranchSwitchCapsule: View {
         fontPreset.scaledClamped(88, min: 56, max: 128)
     }
 
+    private var popoverMinHeight: CGFloat {
+        fontPreset.scaledClamped(310, min: 260, max: 390)
+    }
+
     private func branchListViewportHeight(for branches: [VCSBranch]) -> CGFloat {
         let visibleRowCount = min(CGFloat(branches.count), 8)
         let interRowSpacing = max(0, visibleRowCount - 1) * 2
@@ -175,6 +179,7 @@ struct GitContextBranchSwitchCapsule: View {
         }
         .padding(12)
         .frame(width: fontPreset.scaledClamped(300, min: 280, max: 380), alignment: .leading)
+        .frame(minHeight: popoverMinHeight, alignment: .topLeading)
     }
 
     private func branchList(_ options: GitBranchSwitchOptions) -> some View {
@@ -339,8 +344,9 @@ struct GitContextBranchSwitchCapsule: View {
             }
         } catch {
             guard !Task.isCancelled else { return }
-            await reloadOptions()
+            showPopover = true
             actionErrorMessage = displayMessage(for: error)
+            await reloadOptions()
         }
     }
 
@@ -362,8 +368,9 @@ struct GitContextBranchSwitchCapsule: View {
             showPopover = false
         } catch {
             guard !Task.isCancelled else { return }
-            await reloadOptions()
+            showPopover = true
             actionErrorMessage = displayMessage(for: error)
+            await reloadOptions()
         }
     }
 

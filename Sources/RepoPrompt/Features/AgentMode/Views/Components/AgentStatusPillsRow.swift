@@ -329,6 +329,14 @@ private struct AgentExecutionLocationPill: View {
         fontPreset.scaledClamped(288, min: 220, max: 360)
     }
 
+    private var optionRowWidth: CGFloat {
+        popoverWidth - 16
+    }
+
+    private var optionRowContentWidth: CGFloat {
+        optionRowWidth - 16
+    }
+
     private func existingWorktreeRowsViewportHeight(rowCount: Int) -> CGFloat {
         let visibleRowCount = min(CGFloat(rowCount), 6)
         let interRowSpacing = max(0, visibleRowCount - 1) * 2
@@ -452,8 +460,9 @@ private struct AgentExecutionLocationPill: View {
                                 existingWorktreeOption(ExistingWorktreePickerRow(selection: selection))
                             }
                         }
+                        .frame(width: optionRowWidth, alignment: .leading)
                     }
-                    .frame(height: existingWorktreeRowsViewportHeight(rowCount: existingWorktrees.count))
+                    .frame(width: optionRowWidth, height: existingWorktreeRowsViewportHeight(rowCount: existingWorktrees.count))
                     .scrollIndicators(.automatic)
                 }
 
@@ -620,6 +629,7 @@ private struct AgentExecutionLocationPill: View {
             isSelected: isSelected(selection),
             isDisabled: isDisabled,
             fontPreset: fontPreset,
+            rowWidth: optionRowContentWidth,
             applySelection: { selection in
                 applySelection(selection)
             }
@@ -635,6 +645,7 @@ private struct AgentExecutionLocationPill: View {
         let isSelected: Bool
         let isDisabled: Bool
         let fontPreset: FontScalePreset
+        let rowWidth: CGFloat
         let applySelection: (AgentModeViewModel.InitialStartLocation) -> Void
 
         @State private var isHovered = false
@@ -669,7 +680,7 @@ private struct AgentExecutionLocationPill: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     Spacer(minLength: 0)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(width: rowWidth, alignment: .leading)
                 .foregroundStyle(isDisabled ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
                 .padding(.horizontal, 8)
                 .padding(.vertical, 5)
@@ -678,20 +689,25 @@ private struct AgentExecutionLocationPill: View {
                     RoundedRectangle(cornerRadius: 7, style: .continuous)
                         .fill(backgroundColor)
                 )
+                .onContinuousHover { phase in
+                    switch phase {
+                    case .active:
+                        isHovered = true
+                    case .ended:
+                        isHovered = false
+                    }
+                }
             }
             .buttonStyle(.plain)
-            .onHover { hovered in
-                isHovered = hovered
-            }
             .help(tooltip)
             .accessibilityHint(isDisabled ? "Unavailable" : tooltip)
         }
 
         private var backgroundColor: Color {
             if isSelected {
-                return Color.accentColor.opacity(isHovered ? 0.16 : 0.12)
+                return Color.accentColor.opacity(isHovered ? 0.24 : 0.12)
             }
-            return isHovered ? Color.secondary.opacity(0.12) : .clear
+            return isHovered ? Color.accentColor.opacity(0.14) : .clear
         }
     }
 
