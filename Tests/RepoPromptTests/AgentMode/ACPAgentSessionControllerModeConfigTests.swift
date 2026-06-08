@@ -186,16 +186,21 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
     }
 
     func testMatchingConfigOptionUpdateReplacesStateAndSkipsSameValue() async throws {
+        let diagnostics = LockedStrings()
         let normalizedUpdates = LockedStrings()
         let fixture = try makeFixture(
             shape: "modern",
             extraEnvironment: ["ACP_NOTIFICATION_MODE": "plan"],
+            diagnostics: diagnostics,
             normalizedUpdates: normalizedUpdates
         )
-        try await withBootstrappedController(fixture.controller) { controller in
-            try await controller.setSessionMode("plan")
-            try await controller.setSessionMode("ask")
+        _ = try await fixture.controller.bootstrap()
+        try await waitUntil("authoritative config update") {
+            diagnostics.values.contains("Processed authoritative config_option_update snapshot.")
         }
+        try await fixture.controller.setSessionMode("plan")
+        try await fixture.controller.setSessionMode("ask")
+        await fixture.controller.shutdown()
 
         let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_config_option")
         let mutation = try XCTUnwrap(mutations.first)
@@ -215,6 +220,9 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
             diagnostics: diagnostics
         )
         _ = try await fixture.controller.bootstrap()
+        try await waitUntil("incomplete config update rejection") {
+            diagnostics.values.contains { $0.contains("Ignoring") && $0.contains("config_option_update") }
+        }
         try await fixture.controller.setSessionMode("plan")
         await fixture.controller.shutdown()
 
@@ -233,6 +241,9 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
             diagnostics: diagnostics
         )
         _ = try await fixture.controller.bootstrap()
+        try await waitUntil("malformed config update invalidation") {
+            diagnostics.values.contains { $0.contains("Invalidated session mode authority") }
+        }
         await assertThrows(containing: "malformed modern session mode config option") {
             try await fixture.controller.setSessionMode("ask")
         }
@@ -243,11 +254,16 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
     }
 
     func testConfigOptionUpdateStateSurvivesTurnReuse() async throws {
+        let diagnostics = LockedStrings()
         let fixture = try makeFixture(
             shape: "modern",
-            extraEnvironment: ["ACP_NOTIFICATION_MODE": "plan"]
+            extraEnvironment: ["ACP_NOTIFICATION_MODE": "plan"],
+            diagnostics: diagnostics
         )
         _ = try await fixture.controller.bootstrap()
+        try await waitUntil("authoritative config update") {
+            diagnostics.values.contains("Processed authoritative config_option_update snapshot.")
+        }
         let didPrepare = await fixture.controller.prepareForNextTurn()
         XCTAssertTrue(didPrepare)
         try await fixture.controller.setSessionMode("plan")
@@ -502,7 +518,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                 config: CursorAgentConfig(
                     modelString: "model-b",
                     includeRepoPromptMCPServer: false,
-                    cleanupProjectMCPConfig: false,
+                    cleanupProjectMCPApproval: false,
                     sessionModeID: CursorAgentConfig.promptOnlySessionModeID
                 ),
                 workspacePath: workspace.path,

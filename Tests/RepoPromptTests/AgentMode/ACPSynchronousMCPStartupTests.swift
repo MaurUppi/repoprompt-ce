@@ -47,23 +47,25 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
         )
     }
 
-    func testCursorStyleSessionNewCatchesSynchronousMCPStartupFailureAndReturns() async throws {
+    func testCursorStyleSessionNewCatchesMissingMCPApprovalAndReturns() async throws {
         let workspace = try makeTemporaryDirectory()
         let recordURL = workspace.appendingPathComponent("cursor-startup.jsonl")
         let acpScriptURL = try makeACPServerScript()
         let mcpScriptURL = try makeMCPServerScript()
+        let missingApprovalURL = workspace.appendingPathComponent("missing-mcp-approvals.json")
         let request = makeRunRequest(agentKind: .cursor, workspacePath: workspace.path)
         let provider = SynchronousStartupFakeACPProvider(
             providerID: .cursor,
             commandPath: acpScriptURL.path,
             environment: [
                 "ACP_STARTUP_STYLE": "cursor",
-                "ACP_RECORD_PATH": recordURL.path
+                "ACP_RECORD_PATH": recordURL.path,
+                "ACP_CURSOR_APPROVAL_PATH": missingApprovalURL.path,
+                "ACP_CURSOR_PROJECT_ROOT": workspace.path
             ],
             mcpServer: RepoPromptMCPServerConfiguration(
                 name: "RepoPromptFixture",
-                command: mcpScriptURL.path,
-                args: ["--fail"]
+                command: mcpScriptURL.path
             )
         )
         let controller = try ACPAgentSessionController(
@@ -78,7 +80,66 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
         XCTAssertEqual(bootstrap.sessionID, "cursor-session")
         XCTAssertEqual(
             recordedEvents(at: recordURL),
-            ["session_new_started", "mcp_startup_failed", "session_new_response"]
+            ["session_new_started", "mcp_not_approved", "mcp_startup_failed", "session_new_response"]
+        )
+    }
+
+    func testCursorStyleSessionNewStartsModernMCPServerWithLeasedApproval() async throws {
+        let workspace = try makeTemporaryDirectory()
+        let cursorDataDirectory = try makeTemporaryDirectory()
+        let recordURL = workspace.appendingPathComponent("cursor-approved-startup.jsonl")
+        let acpScriptURL = try makeACPServerScript()
+        let mcpScriptURL = try makeMCPServerScript()
+        let mcpConfiguration = RepoPromptMCPServerConfiguration(
+            name: "RepoPromptFixture",
+            command: mcpScriptURL.path
+        )
+        let approvalURL = CursorIntegrationConfiguration.projectMCPApprovalURL(
+            workingDirectory: workspace.path,
+            cursorDataDirectory: cursorDataDirectory
+        )
+        let artifact = try XCTUnwrap(
+            CursorIntegrationConfiguration.prepareProjectMCPApproval(
+                workingDirectory: workspace.path,
+                cursorDataDirectory: cursorDataDirectory,
+                repoPromptMCPConfiguration: mcpConfiguration
+            )
+        )
+        defer {
+            CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: artifact.id)
+        }
+        let request = makeRunRequest(agentKind: .cursor, workspacePath: workspace.path)
+        let provider = SynchronousStartupFakeACPProvider(
+            providerID: .cursor,
+            commandPath: acpScriptURL.path,
+            environment: [
+                "ACP_STARTUP_STYLE": "cursor",
+                "ACP_RECORD_PATH": recordURL.path,
+                "ACP_CURSOR_APPROVAL_PATH": approvalURL.path,
+                "ACP_CURSOR_PROJECT_ROOT": workspace.path
+            ],
+            mcpServer: mcpConfiguration,
+            cleanupArtifact: artifact
+        )
+        let controller = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: request,
+            requestTimeouts: .init(bootstrapSeconds: 2)
+        )
+
+        let bootstrap = try await controller.bootstrap()
+        await controller.shutdown()
+
+        XCTAssertEqual(bootstrap.sessionID, "cursor-session")
+        XCTAssertEqual(
+            recordedEvents(at: recordURL),
+            [
+                "session_new_started",
+                "mcp_approval_verified",
+                "mcp_initialize_completed",
+                "mcp_tools_list_completed",
+                "session_new_response"
+            ]
         )
     }
 
@@ -107,6 +168,7 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
         let script = #"""
         #!/usr/bin/env python3
         import json
+        import hashlib
         import os
         import subprocess
         import sys
@@ -174,6 +236,38 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
                 process.terminate()
                 process.wait(timeout=1)
 
+        def require_cursor_approval(server):
+            approval_path = os.environ.get("ACP_CURSOR_APPROVAL_PATH")
+            project_root = os.environ.get("ACP_CURSOR_PROJECT_ROOT")
+            if not approval_path or not project_root:
+                return
+            environment = {}
+            for entry in server.get("env") or []:
+                environment[entry["name"]] = entry["value"]
+            server_config = {
+                "command": server["command"],
+                "args": [value for value in server.get("args") or [] if isinstance(value, str)],
+                "env": environment,
+            }
+            payload = json.dumps(
+                {"path": project_root, "server": server_config},
+                separators=(",", ":"),
+            )
+            approval = (
+                server["name"]
+                + "-"
+                + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+            )
+            try:
+                with open(approval_path, "r", encoding="utf-8") as handle:
+                    approvals = json.load(handle)
+            except Exception:
+                approvals = []
+            if approval not in approvals:
+                record("mcp_not_approved")
+                raise RuntimeError("MCP server has not been approved")
+            record("mcp_approval_verified")
+
         for line in sys.stdin:
             try:
                 request = json.loads(line)
@@ -186,7 +280,10 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
             elif method == "session/new":
                 record("session_new_started")
                 try:
-                    start_mcp((params.get("mcpServers") or [])[0])
+                    server = (params.get("mcpServers") or [])[0]
+                    if style == "cursor":
+                        require_cursor_approval(server)
+                    start_mcp(server)
                 except Exception:
                     record("mcp_startup_failed")
                     if style == "opencode":
@@ -261,6 +358,7 @@ private struct SynchronousStartupFakeACPProvider: ACPAgentProvider {
     let commandPath: String
     let environment: [String: String]
     let mcpServer: RepoPromptMCPServerConfiguration
+    var cleanupArtifact: ACPLaunchCleanupArtifact?
 
     func support(for request: ACPRunRequest) async -> ACPSupportResult {
         .supported
@@ -274,7 +372,8 @@ private struct SynchronousStartupFakeACPProvider: ACPAgentProvider {
             environment: environment,
             workingDirectory: request.workspacePath,
             additionalPathHints: [],
-            enableDebugLogging: false
+            enableDebugLogging: false,
+            cleanupArtifact: cleanupArtifact
         )
     }
 
@@ -305,5 +404,14 @@ private struct SynchronousStartupFakeACPProvider: ACPAgentProvider {
 
     func normalizeError(_ error: Error) -> Error {
         error
+    }
+
+    func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async {
+        guard let artifact = configuration.cleanupArtifact,
+              artifact.kind == CursorIntegrationConfiguration.cleanupArtifactKind
+        else {
+            return
+        }
+        CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: artifact.id)
     }
 }

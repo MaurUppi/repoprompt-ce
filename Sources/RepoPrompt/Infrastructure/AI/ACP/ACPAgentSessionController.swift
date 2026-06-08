@@ -289,13 +289,13 @@ actor ACPAgentSessionController {
             loadSessionIDConfidence: runRequest.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? .candidate : .unavailable
         )
         self.runRequest = runRequest
-        launchConfiguration = try provider.makeLaunchConfiguration(for: runRequest)
         let sessionConfiguration = try provider.makeSessionConfiguration(
             for: runRequest,
             mcpServer: .repoPrompt
         )
         try Self.preflightInjectedMCPServers(in: sessionConfiguration)
         self.sessionConfiguration = sessionConfiguration
+        launchConfiguration = try provider.makeLaunchConfiguration(for: runRequest)
         autoApproveAllToolPermissions = runRequest.autoApproveAllToolPermissions
         mcpClientNameHint = runRequest.agentKind.mcpClientNameHint
         logPrefix = "[ACP][\(provider.providerID.rawValue)]"

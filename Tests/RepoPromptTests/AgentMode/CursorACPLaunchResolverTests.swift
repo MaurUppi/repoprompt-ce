@@ -8,7 +8,11 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let executable = try makeExecutable(named: "cursor-agent", in: directory)
         let resolver = CursorACPLaunchResolver()
         let provider = CursorACPAgentProvider(
-            config: CursorAgentConfig(commandName: executable.path, additionalPathHints: []),
+            config: CursorAgentConfig(
+                commandName: executable.path,
+                additionalPathHints: [],
+                includeRepoPromptMCPServer: false
+            ),
             launchResolver: resolver
         )
 
@@ -28,7 +32,11 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         environment["SHELL"] = "/bin/false"
         let testEnvironment = environment
         let resolver = CursorACPLaunchResolver(environmentProvider: { _ in testEnvironment })
-        let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
+        let config = CursorAgentConfig(
+            commandName: "cursor-agent",
+            additionalPathHints: [],
+            includeRepoPromptMCPServer: false
+        )
 
         let support = await resolver.probeSupport(for: config)
         let provider = CursorACPAgentProvider(config: config, launchResolver: resolver)
@@ -38,6 +46,199 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         XCTAssertEqual(support, .supported)
         XCTAssertEqual(launch.command, executable.resolvingSymlinksInPath().standardizedFileURL.path)
         XCTAssertEqual(probedPath, launch.command)
+    }
+
+    func testLaunchConfigurationLeasesCursorApprovalForModernSessionMCPInjection() async throws {
+        let workspace = try makeTemporaryDirectory()
+        let executableDirectory = try makeTemporaryDirectory()
+        let executable = try makeExecutable(named: "cursor-agent", in: executableDirectory)
+        let cursorDataDirectory = try makeTemporaryDirectory()
+        let mcpConfiguration = RepoPromptMCPServerConfiguration(
+            command: "/tmp/repoprompt-mcp-fixture",
+            args: ["--fixture"],
+            env: [
+                .init(name: "RP_FIXTURE", value: "1")
+            ]
+        )
+        let approvalURL = CursorIntegrationConfiguration.projectMCPApprovalURL(
+            workingDirectory: workspace.path,
+            cursorDataDirectory: cursorDataDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: approvalURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let originalData = Data(#"["existing-approval"]"#.utf8)
+        try originalData.write(to: approvalURL)
+
+        let provider = CursorACPAgentProvider(
+            config: CursorAgentConfig(
+                commandName: executable.path,
+                additionalPathHints: []
+            ),
+            repoPromptMCPConfiguration: mcpConfiguration,
+            launchResolver: CursorACPLaunchResolver(),
+            approvalEnvironmentProvider: {
+                [
+                    "CURSOR_DATA_DIR": cursorDataDirectory.path,
+                    "HOME": "/ignored-by-explicit-cursor-data-dir"
+                ]
+            }
+        )
+
+        let launch = try provider.makeLaunchConfiguration(
+            for: makeRunRequest(workspacePath: workspace.path)
+        )
+        let artifact = try XCTUnwrap(launch.cleanupArtifact)
+        addTeardownBlock {
+            await provider.cleanupLaunchArtifacts(for: launch)
+        }
+        let approvalsData = try Data(contentsOf: approvalURL)
+        let approvals = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: approvalsData) as? [String]
+        )
+        let expectedApproval = try CursorIntegrationConfiguration.approvalIdentifier(
+            projectRoot: workspace.path,
+            repoPromptMCPConfiguration: mcpConfiguration
+        )
+        let session = try provider.makeSessionConfiguration(
+            for: makeRunRequest(workspacePath: workspace.path),
+            mcpServer: .repoPrompt
+        )
+
+        XCTAssertEqual(launch.environment["CURSOR_DATA_DIR"], cursorDataDirectory.path)
+        XCTAssertEqual(artifact.kind, CursorIntegrationConfiguration.cleanupArtifactKind)
+        XCTAssertEqual(approvals, ["existing-approval", expectedApproval])
+        XCTAssertEqual(session.mcpServers, [mcpConfiguration])
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: workspace.appendingPathComponent(".cursor/mcp.json").path
+            )
+        )
+
+        await provider.cleanupLaunchArtifacts(for: launch)
+        XCTAssertEqual(try Data(contentsOf: approvalURL), originalData)
+    }
+
+    func testApprovalIdentifierMatchesCursorCLIHashContract() throws {
+        let configuration = RepoPromptMCPServerConfiguration(
+            command: "/tmp/repoprompt mcp",
+            args: ["--flag", "value"],
+            env: [
+                .init(name: "A", value: "1"),
+                .init(name: "B", value: "two")
+            ]
+        )
+
+        XCTAssertEqual(
+            try CursorIntegrationConfiguration.approvalIdentifier(
+                projectRoot: "/tmp/rpce cursor",
+                repoPromptMCPConfiguration: configuration
+            ),
+            "RepoPromptCE-d23f237662b1345f"
+        )
+
+        let numericAndDuplicateEnvironmentConfiguration = RepoPromptMCPServerConfiguration(
+            command: #"/tmp/repo"prompt\mcp"#,
+            args: ["--path", "a/b", "line\nvalue"],
+            env: [
+                .init(name: "B", value: "first"),
+                .init(name: "2", value: "two"),
+                .init(name: "01", value: "leading"),
+                .init(name: "1", value: "one"),
+                .init(name: "B", value: "last"),
+                .init(name: "A", value: "line\nvalue")
+            ]
+        )
+        XCTAssertEqual(
+            try CursorIntegrationConfiguration.approvalIdentifier(
+                projectRoot: #"/tmp/rpce "cursor""#,
+                repoPromptMCPConfiguration: numericAndDuplicateEnvironmentConfiguration
+            ),
+            "RepoPromptCE-05aa1995d1d02aa0"
+        )
+    }
+
+    func testApprovalCleanupPreservesConcurrentEntriesAndRemovesTemporaryApproval() throws {
+        let workspace = try makeTemporaryDirectory()
+        let cursorDataDirectory = try makeTemporaryDirectory()
+        let configuration = RepoPromptMCPServerConfiguration(command: "/tmp/repoprompt-mcp")
+        let approvalURL = CursorIntegrationConfiguration.projectMCPApprovalURL(
+            workingDirectory: workspace.path,
+            cursorDataDirectory: cursorDataDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: approvalURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data(#"["existing-approval"]"#.utf8).write(to: approvalURL)
+        let artifact = try XCTUnwrap(
+            CursorIntegrationConfiguration.prepareProjectMCPApproval(
+                workingDirectory: workspace.path,
+                cursorDataDirectory: cursorDataDirectory,
+                repoPromptMCPConfiguration: configuration
+            )
+        )
+        let temporaryApproval = try CursorIntegrationConfiguration.approvalIdentifier(
+            projectRoot: workspace.path,
+            repoPromptMCPConfiguration: configuration
+        )
+        let concurrentData = try JSONSerialization.data(
+            withJSONObject: ["existing-approval", temporaryApproval, "cursor-added-approval"],
+            options: [.prettyPrinted]
+        )
+        try concurrentData.write(to: approvalURL, options: .atomic)
+
+        CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: artifact.id)
+
+        let retainedApprovals = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: approvalURL)) as? [String]
+        )
+        XCTAssertEqual(retainedApprovals, ["existing-approval", "cursor-added-approval"])
+    }
+
+    func testConcurrentApprovalLeasesRestoreOriginalDataAfterFinalCleanup() throws {
+        for cleanupFirstLeaseFirst in [true, false] {
+            let workspace = try makeTemporaryDirectory()
+            let cursorDataDirectory = try makeTemporaryDirectory()
+            let approvalURL = CursorIntegrationConfiguration.projectMCPApprovalURL(
+                workingDirectory: workspace.path,
+                cursorDataDirectory: cursorDataDirectory
+            )
+            try FileManager.default.createDirectory(
+                at: approvalURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let originalData = Data(#"["existing-approval"]"#.utf8)
+            try originalData.write(to: approvalURL)
+
+            let first = try XCTUnwrap(
+                CursorIntegrationConfiguration.prepareProjectMCPApproval(
+                    workingDirectory: workspace.path,
+                    cursorDataDirectory: cursorDataDirectory,
+                    repoPromptMCPConfiguration: .init(command: "/tmp/repoprompt-mcp-one")
+                )
+            )
+            let second = try XCTUnwrap(
+                CursorIntegrationConfiguration.prepareProjectMCPApproval(
+                    workingDirectory: workspace.path,
+                    cursorDataDirectory: cursorDataDirectory,
+                    repoPromptMCPConfiguration: .init(command: "/tmp/repoprompt-mcp-two")
+                )
+            )
+            defer {
+                CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: first.id)
+                CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: second.id)
+            }
+
+            let firstCleanup = cleanupFirstLeaseFirst ? first : second
+            let finalCleanup = cleanupFirstLeaseFirst ? second : first
+            CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: firstCleanup.id)
+            XCTAssertNotEqual(try Data(contentsOf: approvalURL), originalData)
+
+            CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: finalCleanup.id)
+            XCTAssertEqual(try Data(contentsOf: approvalURL), originalData)
+        }
     }
 
     func testRepeatedProbeRefreshesCurrentEnvironmentBeforeSpawn() async throws {

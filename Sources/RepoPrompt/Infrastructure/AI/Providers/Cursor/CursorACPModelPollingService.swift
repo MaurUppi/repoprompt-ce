@@ -19,7 +19,7 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
                         enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
                         modelString: modelString,
                         includeRepoPromptMCPServer: false,
-                        cleanupProjectMCPConfig: false
+                        cleanupProjectMCPApproval: false
                     )
                 )
             }
