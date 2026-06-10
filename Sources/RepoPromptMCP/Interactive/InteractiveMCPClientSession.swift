@@ -72,11 +72,43 @@ enum ToolCallTimeoutPolicy: Equatable {
     case none
 }
 
+private final class ToolCallSettlementState: @unchecked Sendable {
+    enum Outcome {
+        case pending
+        case completed
+        case timedOut
+        case callerCancelled
+    }
+
+    private let lock = NSLock()
+    private var outcome: Outcome = .pending
+
+    func claim(_ candidate: Outcome) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .pending = outcome else { return false }
+        outcome = candidate
+        return true
+    }
+
+    func finish() -> Outcome {
+        lock.lock()
+        defer { lock.unlock() }
+        if case .pending = outcome {
+            outcome = .completed
+        }
+        return outcome
+    }
+}
+
 /// Manages an interactive MCP client session with the RepoPrompt app.
 actor InteractiveMCPClientSession {
+    typealias TimeoutSleep = @Sendable (UInt64) async throws -> Void
+
     private let sessionToken: String
     private let clientName: String
     private let logger: Logger
+    private let timeoutSleep: TimeoutSleep
 
     private var client: MCP.Client?
     private var transport: BootstrapSocketMCPTransport?
@@ -107,7 +139,27 @@ actor InteractiveMCPClientSession {
         self.logger = logger ?? Logger(label: "mcp.interactive.session") { _ in
             SwiftLogNoOpLogHandler()
         }
+        timeoutSleep = { nanoseconds in
+            try await Task.sleep(nanoseconds: nanoseconds)
+        }
     }
+
+    #if DEBUG
+        init(
+            connectedClientForTesting client: MCP.Client,
+            timeoutSleep: @escaping TimeoutSleep = { nanoseconds in
+                try await Task.sleep(nanoseconds: nanoseconds)
+            }
+        ) {
+            sessionToken = "test-session"
+            clientName = "test-client"
+            logger = Logger(label: "mcp.interactive.session.tests") { _ in
+                SwiftLogNoOpLogHandler()
+            }
+            self.timeoutSleep = timeoutSleep
+            self.client = client
+        }
+    #endif
 
     // MARK: - Connection
 
@@ -294,32 +346,104 @@ actor InteractiveMCPClientSession {
         }
 
         logger.debug("Calling tool: \(name)")
+        try Task.checkCancellation()
+        let context: RequestContext<CallTool.Result> = try await client.callTool(
+            name: name,
+            arguments: args.isEmpty ? nil : args
+        )
         let effectiveTimeout = resolvedTimeout(timeout)
-        let result: (content: [Tool.Content], isError: Bool?) = if let seconds = effectiveTimeout {
-            try await withThrowingTaskGroup(of: (content: [Tool.Content], isError: Bool?).self) { group in
-                group.addTask {
-                    try await client.callTool(name: name, arguments: args.isEmpty ? nil : args)
-                }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: Self.nanoseconds(forTimeoutSeconds: seconds))
-                    throw InteractiveSessionError.toolCallTimeout(toolName: name, seconds: seconds)
-                }
-                guard let result = try await group.next() else {
-                    throw InteractiveSessionError.toolCallTimeout(toolName: name, seconds: seconds)
-                }
-                group.cancelAll()
-                return result
-            }
-        } else {
-            try await client.callTool(name: name, arguments: args.isEmpty ? nil : args)
-        }
+        let result = try await awaitToolCallResult(
+            context,
+            client: client,
+            toolName: name,
+            timeoutSeconds: effectiveTimeout
+        )
 
         if result.isError != true, shouldClearWindowSelectionAfterCall(toolName: name, args: args) {
             selectedWindowID = nil
             logger.debug("Cleared window selection after open-in-new-window switch")
         }
 
-        return CallTool.Result(content: result.content, isError: result.isError)
+        return result
+    }
+
+    private func awaitToolCallResult(
+        _ context: RequestContext<CallTool.Result>,
+        client: MCP.Client,
+        toolName: String,
+        timeoutSeconds: TimeInterval?
+    ) async throws -> CallTool.Result {
+        let settlement = ToolCallSettlementState()
+        let timeoutTask = timeoutSeconds.map { seconds in
+            Task { [timeoutSleep] in
+                do {
+                    try await timeoutSleep(Self.nanoseconds(forTimeoutSeconds: seconds))
+                } catch {
+                    return
+                }
+                guard settlement.claim(.timedOut) else { return }
+                Task.detached {
+                    try? await client.cancelRequest(
+                        context.requestID,
+                        reason: "CLI tool call timed out after \(seconds) seconds"
+                    )
+                }
+            }
+        }
+        defer { timeoutTask?.cancel() }
+
+        do {
+            let result = try await withTaskCancellationHandler {
+                try await context.value
+            } onCancel: {
+                guard settlement.claim(.callerCancelled) else { return }
+                Task.detached {
+                    try? await client.cancelRequest(
+                        context.requestID,
+                        reason: "CLI caller cancelled tool request"
+                    )
+                }
+            }
+            return try Self.resolveToolCallSettlement(
+                settlement.finish(),
+                result: result,
+                toolName: toolName,
+                timeoutSeconds: timeoutSeconds
+            )
+        } catch {
+            switch settlement.finish() {
+            case .timedOut:
+                throw InteractiveSessionError.toolCallTimeout(
+                    toolName: toolName,
+                    seconds: timeoutSeconds ?? 0
+                )
+            case .callerCancelled:
+                throw CancellationError()
+            case .pending, .completed:
+                throw error
+            }
+        }
+    }
+
+    private static func resolveToolCallSettlement(
+        _ outcome: ToolCallSettlementState.Outcome,
+        result: CallTool.Result,
+        toolName: String,
+        timeoutSeconds: TimeInterval?
+    ) throws -> CallTool.Result {
+        switch outcome {
+        case .completed:
+            result
+        case .timedOut:
+            throw InteractiveSessionError.toolCallTimeout(
+                toolName: toolName,
+                seconds: timeoutSeconds ?? 0
+            )
+        case .callerCancelled:
+            throw CancellationError()
+        case .pending:
+            result
+        }
     }
 
     private static func nanoseconds(forTimeoutSeconds seconds: TimeInterval) -> UInt64 {

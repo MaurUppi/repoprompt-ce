@@ -3,6 +3,11 @@ import Foundation
 extension FileSystemService {
     // MARK: - Parallel scanning support
 
+    struct FolderScanBatchResult {
+        let deltas: [FileSystemDelta]
+        let scannedFolders: Set<String>
+    }
+
     /// Result of scanning a single folder (Sendable for cross-task usage)
     struct ScanResult {
         let folderRel: String
@@ -74,28 +79,30 @@ extension FileSystemService {
 
     /// Scan multiple folders in parallel for better I/O performance.
     /// Uses configurable caps to prevent CPU saturation.
-    func scanFoldersInParallel(_ folders: Set<String>) async throws -> [FileSystemDelta] {
-        guard !folders.isEmpty else { return [] }
+    func scanFoldersInParallel(_ folders: Set<String>) async throws -> FolderScanBatchResult {
+        guard !folders.isEmpty else {
+            return FolderScanBatchResult(deltas: [], scannedFolders: [])
+        }
 
-        // In test mode, always use serial scanning to avoid thread safety issues with SpyFS
-        #if DEBUG
-            if isTestMode {
-                var deltas: [FileSystemDelta] = []
-                for folder in folders {
-                    let folderDeltas = try await scanOneLevelAndDiff(folder)
-                    deltas.append(contentsOf: folderDeltas)
-                }
-                return deltas
-            }
-        #endif
-
-        // Apply batch cap to limit per-tick work in high-churn scenarios
+        // Apply batch cap to limit per-tick work in high-churn scenarios.
         let cappedFolders: Set<String> = if folders.count > maxFoldersPerBatch {
-            // Take a subset; remaining folders will be picked up in subsequent batches
+            // Take a subset; remaining folders stay pending for a subsequent batch.
             Set(folders.prefix(maxFoldersPerBatch))
         } else {
             folders
         }
+
+        // In test mode, use the same cap but scan serially to avoid SpyFS thread-safety issues.
+        #if DEBUG
+            if isTestMode {
+                var deltas: [FileSystemDelta] = []
+                for folder in cappedFolders {
+                    let folderDeltas = try await scanOneLevelAndDiff(folder)
+                    deltas.append(contentsOf: folderDeltas)
+                }
+                return FolderScanBatchResult(deltas: deltas, scannedFolders: cappedFolders)
+            }
+        #endif
 
         // For small sets, just use serial scanning
         if cappedFolders.count <= 2 {
@@ -104,7 +111,7 @@ extension FileSystemService {
                 let folderDeltas = try await scanOneLevelAndDiff(folder)
                 deltas.append(contentsOf: folderDeltas)
             }
-            return deltas
+            return FolderScanBatchResult(deltas: deltas, scannedFolders: cappedFolders)
         }
 
         // Use parallel scanning for larger sets with BOUNDED CONCURRENCY
@@ -211,7 +218,7 @@ extension FileSystemService {
             }
         }
 
-        return aggregatedDeltas
+        return FolderScanBatchResult(deltas: aggregatedDeltas, scannedFolders: cappedFolders)
     }
 
     // MARK: - Single-level scanning & removal

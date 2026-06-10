@@ -189,6 +189,8 @@ actor FileSystemService {
     var pendingScanTargets: [String: FSEventStreamEventId] = [:]
     /// Maps folder relative path → highest FSEvent ID that has already been scanned
     var lastScannedEventIdByFolder: [String: FSEventStreamEventId] = [:]
+    /// Cap-omitted folders that must be scanned by quiet follow-up watcher batches.
+    var pendingQuietFolderScanTargets: Set<String> = []
 
     /// Short-lived cache
     /// results during a directory walk to avoid repeated allocations.

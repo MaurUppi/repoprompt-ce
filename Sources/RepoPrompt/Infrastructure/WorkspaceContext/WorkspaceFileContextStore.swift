@@ -127,6 +127,12 @@ actor WorkspaceFileContextStore {
         let enableHierarchicalIgnores: Bool
     }
 
+    private final class PublicationInvalidationBatch {
+        var topologyInvalidationRequested = false
+        var affectedRootKinds = Set<WorkspaceRootKind>()
+        var searchContentInvalidations = WorkspaceSearchContentInvalidationBatch()
+    }
+
     private struct ScopedIngressBarrierTarget {
         let watcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark
         let acceptedServicePublicationSequence: UInt64
@@ -137,10 +143,71 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    #if DEBUG
+        private struct ScopedIngressBarrierTaskOutput {
+            let sample: WorkspaceIngressBarrierSample
+            let completedAtNanoseconds: UInt64
+        }
+    #else
+        private typealias ScopedIngressBarrierTaskOutput = WorkspaceIngressBarrierSample
+    #endif
+
+    private final class ScopedIngressBarrierJoin: @unchecked Sendable {
+        private let lock = NSLock()
+        private var completedOutput: ScopedIngressBarrierTaskOutput?
+        private var waiters: [UUID: CheckedContinuation<ScopedIngressBarrierTaskOutput?, Never>] = [:]
+
+        func value() async -> ScopedIngressBarrierTaskOutput? {
+            let waiterID = UUID()
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    lock.lock()
+                    if Task.isCancelled {
+                        lock.unlock()
+                        continuation.resume(returning: nil)
+                    } else if let completedOutput {
+                        lock.unlock()
+                        continuation.resume(returning: completedOutput)
+                    } else {
+                        waiters[waiterID] = continuation
+                        lock.unlock()
+                    }
+                }
+            } onCancel: {
+                cancelWaiter(id: waiterID)
+            }
+        }
+
+        func complete(with output: ScopedIngressBarrierTaskOutput) {
+            let continuations: [CheckedContinuation<ScopedIngressBarrierTaskOutput?, Never>]
+            lock.lock()
+            guard completedOutput == nil else {
+                lock.unlock()
+                return
+            }
+            completedOutput = output
+            continuations = Array(waiters.values)
+            waiters.removeAll(keepingCapacity: false)
+            lock.unlock()
+            continuations.forEach { $0.resume(returning: output) }
+        }
+
+        private func cancelWaiter(id waiterID: UUID) {
+            let continuation: CheckedContinuation<ScopedIngressBarrierTaskOutput?, Never>?
+            lock.lock()
+            continuation = waiters.removeValue(forKey: waiterID)
+            lock.unlock()
+            continuation?.resume(returning: nil)
+        }
+    }
+
     private struct ScopedIngressBarrierFlight {
         let token: UInt64
         let target: ScopedIngressBarrierTarget
-        let task: Task<WorkspaceIngressBarrierSample, Never>
+        let join: ScopedIngressBarrierJoin
+        #if DEBUG
+            let startedAtNanoseconds: UInt64
+        #endif
     }
 
     #if DEBUG
@@ -149,6 +216,87 @@ actor WorkspaceFileContextStore {
             let joinCount: Int
             let successorCount: Int
         }
+
+        struct ScopedIngressBarrierDebugSnapshot: Equatable {
+            struct Active: Equatable {
+                let targetWatcherWatermark: UInt64
+                let targetServicePublicationSequence: UInt64
+                let ageMilliseconds: UInt64
+            }
+
+            struct Completed: Equatable {
+                let token: UInt64
+                let targetWatcherWatermark: UInt64
+                let targetServicePublicationSequence: UInt64
+                let publishedServicePublicationSequence: UInt64
+                let appliedServicePublicationSequence: UInt64
+                let appliedWatcherWatermark: UInt64
+                let durationMilliseconds: UInt64
+            }
+
+            let launchCount: Int
+            let joinCount: Int
+            let successorCount: Int
+            let completionCount: Int
+            let active: Active?
+            let lastCompleted: Completed?
+        }
+
+        struct PublicationInvalidationDebugSample: Equatable {
+            let servicePublicationSequence: UInt64
+            let watcherAcceptedWatermark: UInt64?
+            let preparedDeltaCount: Int
+            let topologyInvalidationCount: Int
+            let catalogGenerationAdvanceCount: Int
+            let searchCatalogCacheClearCount: Int
+            let pathWorkerInvalidationRequestCount: Int
+            let contentInvalidationCount: Int
+            let distinctContentKeyCount: Int
+            let decodedCacheInvalidationRequestCount: Int
+            let codemapInvalidationRequestCount: Int
+            let appliedIndexEventYieldCount: Int
+        }
+
+        struct PublicationInvalidationHistoryDebugSnapshot: Equatable {
+            let retainedSampleLimit: Int
+            let totalObservedPublicationCount: Int
+            let droppedPublicationSampleCount: Int
+            let samples: [PublicationInvalidationDebugSample]
+        }
+
+        struct ReadSearchRootDiagnosticsSnapshot: Equatable {
+            let rootID: UUID
+            let rootToken: UUID
+            let ingress: WorkspaceFileSystemIngressCoordinator.DebugSnapshot
+            let barrier: ScopedIngressBarrierDebugSnapshot
+            let invalidation: PublicationInvalidationHistoryDebugSnapshot
+            let producedAppliedIndexGeneration: UInt64
+        }
+
+        private final class PublicationInvalidationRecorder: @unchecked Sendable {
+            let preparedDeltaCount: Int
+            var topologyInvalidationCount = 0
+            var catalogGenerationAdvanceCount = 0
+            var searchCatalogCacheClearCount = 0
+            var pathWorkerInvalidationRequestCount = 0
+            var contentInvalidationCount = 0
+            var decodedCacheInvalidationRequestCount = 0
+            var codemapInvalidationRequestCount = 0
+            var appliedIndexEventYieldCount = 0
+            var distinctContentKeys = Set<WorkspaceSearchContentCacheKey>()
+
+            init(preparedDeltaCount: Int) {
+                self.preparedDeltaCount = preparedDeltaCount
+            }
+        }
+
+        private struct PublicationInvalidationHistoryState {
+            var totalObservedPublicationCount = 0
+            var samples: [PublicationInvalidationDebugSample] = []
+        }
+
+        @TaskLocal private static var activePublicationInvalidationRecorder: PublicationInvalidationRecorder?
+        private static let publicationInvalidationSampleLimit = 32
     #endif
 
     #if DEBUG
@@ -164,6 +312,9 @@ actor WorkspaceFileContextStore {
         private var scopedIngressBarrierLaunchCountsByRootID: [UUID: Int] = [:]
         private var scopedIngressBarrierJoinCountsByRootID: [UUID: Int] = [:]
         private var scopedIngressBarrierSuccessorCountsByRootID: [UUID: Int] = [:]
+        private var scopedIngressBarrierCompletionCountsByRootID: [UUID: Int] = [:]
+        private var lastCompletedScopedIngressBarrierByRootID: [UUID: ScopedIngressBarrierDebugSnapshot.Completed] = [:]
+        private var publicationInvalidationHistoryByRootID: [UUID: PublicationInvalidationHistoryState] = [:]
 
         func setRootLoadWillStartHandler(_ handler: (@Sendable (String) async -> Void)?) {
             rootLoadWillStartHandler = handler
@@ -207,6 +358,119 @@ actor WorkspaceFileContextStore {
                 joinCount: scopedIngressBarrierJoinCountsByRootID[rootID] ?? 0,
                 successorCount: scopedIngressBarrierSuccessorCountsByRootID[rootID] ?? 0
             )
+        }
+
+        func readSearchRootDiagnosticsSnapshot(
+            recentPublicationLimit: Int = 8
+        ) -> [ReadSearchRootDiagnosticsSnapshot] {
+            let requestedLimit = min(max(0, recentPublicationLimit), Self.publicationInvalidationSampleLimit)
+            return rootLoadOrder.compactMap { rootID in
+                guard let state = rootStatesByID[rootID] else { return nil }
+                let history = publicationInvalidationHistoryByRootID[rootID] ?? PublicationInvalidationHistoryState()
+                return ReadSearchRootDiagnosticsSnapshot(
+                    rootID: rootID,
+                    rootToken: state.service.diagnosticRootToken,
+                    ingress: publisherIngressCoordinator.debugSnapshot(rootID: rootID),
+                    barrier: scopedIngressBarrierDebugSnapshot(rootID: rootID),
+                    invalidation: PublicationInvalidationHistoryDebugSnapshot(
+                        retainedSampleLimit: Self.publicationInvalidationSampleLimit,
+                        totalObservedPublicationCount: history.totalObservedPublicationCount,
+                        droppedPublicationSampleCount: max(0, history.totalObservedPublicationCount - history.samples.count),
+                        samples: requestedLimit == 0 ? [] : Array(history.samples.suffix(requestedLimit))
+                    ),
+                    producedAppliedIndexGeneration: appliedIndexGenerationsByRootID[rootID] ?? 0
+                )
+            }
+        }
+
+        private func scopedIngressBarrierDebugSnapshot(rootID: UUID) -> ScopedIngressBarrierDebugSnapshot {
+            let active = scopedIngressBarrierFlightsByRootID[rootID].map { flight in
+                ScopedIngressBarrierDebugSnapshot.Active(
+                    targetWatcherWatermark: flight.target.watcherAcceptedWatermark.rawValue,
+                    targetServicePublicationSequence: flight.target.acceptedServicePublicationSequence,
+                    ageMilliseconds: Self.elapsedMilliseconds(
+                        since: flight.startedAtNanoseconds,
+                        now: debugNowNanoseconds()
+                    )
+                )
+            }
+            return ScopedIngressBarrierDebugSnapshot(
+                launchCount: scopedIngressBarrierLaunchCountsByRootID[rootID] ?? 0,
+                joinCount: scopedIngressBarrierJoinCountsByRootID[rootID] ?? 0,
+                successorCount: scopedIngressBarrierSuccessorCountsByRootID[rootID] ?? 0,
+                completionCount: scopedIngressBarrierCompletionCountsByRootID[rootID] ?? 0,
+                active: active,
+                lastCompleted: lastCompletedScopedIngressBarrierByRootID[rootID]
+            )
+        }
+
+        func retainedReadSearchDiagnosticRootIDsForTesting() -> Set<UUID> {
+            Set(scopedIngressBarrierLaunchCountsByRootID.keys)
+                .union(scopedIngressBarrierJoinCountsByRootID.keys)
+                .union(scopedIngressBarrierSuccessorCountsByRootID.keys)
+                .union(scopedIngressBarrierCompletionCountsByRootID.keys)
+                .union(lastCompletedScopedIngressBarrierByRootID.keys)
+                .union(publicationInvalidationHistoryByRootID.keys)
+        }
+
+        private func recordScopedIngressBarrierCompletion(
+            rootID: UUID,
+            token: UInt64,
+            target: ScopedIngressBarrierTarget,
+            sample: WorkspaceIngressBarrierSample,
+            startedAtNanoseconds: UInt64,
+            completedAtNanoseconds: UInt64
+        ) {
+            guard rootStatesByID[rootID] != nil else { return }
+            scopedIngressBarrierCompletionCountsByRootID[rootID, default: 0] += 1
+            guard token > (lastCompletedScopedIngressBarrierByRootID[rootID]?.token ?? 0) else { return }
+            lastCompletedScopedIngressBarrierByRootID[rootID] = ScopedIngressBarrierDebugSnapshot.Completed(
+                token: token,
+                targetWatcherWatermark: target.watcherAcceptedWatermark.rawValue,
+                targetServicePublicationSequence: target.acceptedServicePublicationSequence,
+                publishedServicePublicationSequence: sample.publishedServicePublicationSequence,
+                appliedServicePublicationSequence: sample.appliedServicePublicationSequence,
+                appliedWatcherWatermark: sample.appliedWatcherWatermark,
+                durationMilliseconds: Self.elapsedMilliseconds(
+                    since: startedAtNanoseconds,
+                    now: completedAtNanoseconds
+                )
+            )
+        }
+
+        private func recordPublicationInvalidationDiagnostics(
+            rootID: UUID,
+            servicePublicationSequence: UInt64,
+            watcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark?,
+            recorder: PublicationInvalidationRecorder
+        ) {
+            guard rootStatesByID[rootID] != nil else { return }
+            let sample = PublicationInvalidationDebugSample(
+                servicePublicationSequence: servicePublicationSequence,
+                watcherAcceptedWatermark: watcherAcceptedWatermark?.rawValue,
+                preparedDeltaCount: recorder.preparedDeltaCount,
+                topologyInvalidationCount: recorder.topologyInvalidationCount,
+                catalogGenerationAdvanceCount: recorder.catalogGenerationAdvanceCount,
+                searchCatalogCacheClearCount: recorder.searchCatalogCacheClearCount,
+                pathWorkerInvalidationRequestCount: recorder.pathWorkerInvalidationRequestCount,
+                contentInvalidationCount: recorder.contentInvalidationCount,
+                distinctContentKeyCount: recorder.distinctContentKeys.count,
+                decodedCacheInvalidationRequestCount: recorder.decodedCacheInvalidationRequestCount,
+                codemapInvalidationRequestCount: recorder.codemapInvalidationRequestCount,
+                appliedIndexEventYieldCount: recorder.appliedIndexEventYieldCount
+            )
+            var history = publicationInvalidationHistoryByRootID[rootID] ?? PublicationInvalidationHistoryState()
+            history.totalObservedPublicationCount += 1
+            history.samples.append(sample)
+            if history.samples.count > Self.publicationInvalidationSampleLimit {
+                history.samples.removeFirst(history.samples.count - Self.publicationInvalidationSampleLimit)
+            }
+            publicationInvalidationHistoryByRootID[rootID] = history
+        }
+
+        private static func elapsedMilliseconds(since start: UInt64, now: UInt64) -> UInt64 {
+            guard now >= start else { return 0 }
+            return (now - start) / 1_000_000
         }
 
         func searchDecodedContentCacheSnapshotForTesting() async -> WorkspaceSearchDecodedContentCache.Snapshot {
@@ -286,6 +550,7 @@ actor WorkspaceFileContextStore {
     #endif
     private var searchContentInvalidationEpochsByFileID: [UUID: UInt64] = [:]
     private var nextSearchContentInvalidationEpoch: UInt64 = 0
+    private var activePublicationInvalidationBatch: PublicationInvalidationBatch?
     private static let maxCachedSearchCatalogSnapshotScopes = 16
     private static let defaultMaxPendingDeltasPerRoot = 10000
     private let pathMatchWorker = PathMatchWorker()
@@ -301,26 +566,52 @@ actor WorkspaceFileContextStore {
     private var appliedIndexContinuations: [UUID: AsyncStream<WorkspaceAppliedIndexBatchEvent>.Continuation] = [:]
     private var appliedIndexGenerationsByRootID: [UUID: UInt64] = [:]
     private var watcherCancellablesByRootID: [UUID: AnyCancellable] = [:]
-    private let publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator()
+    private let publisherIngressCoordinator: WorkspaceFileSystemIngressCoordinator
     private var scopedIngressBarrierFlightsByRootID: [UUID: ScopedIngressBarrierFlight] = [:]
     private var nextScopedIngressBarrierToken: UInt64 = 0
     private static let maxConcurrentScopedIngressBarriers = 8
     private var codeScanResultTask: Task<Void, Never>?
+    #if DEBUG
+        private let debugNowNanoseconds: @Sendable () -> UInt64
+    #endif
 
-    init(searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production) {
-        storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
-        #if os(macOS)
-            let source = DispatchSource.makeMemoryPressureSource(
-                eventMask: [.warning, .critical],
-                queue: .global(qos: .utility)
-            )
-            searchContentMemoryPressureSource = source
-            source.setEventHandler { [weak self] in
-                Task { await self?.clearSearchDecodedContentCache() }
-            }
-            source.activate()
-        #endif
-    }
+    #if DEBUG
+        init(
+            searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production,
+            debugNowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
+        ) {
+            storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
+            self.debugNowNanoseconds = debugNowNanoseconds
+            publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator(debugNowNanoseconds: debugNowNanoseconds)
+            #if os(macOS)
+                let source = DispatchSource.makeMemoryPressureSource(
+                    eventMask: [.warning, .critical],
+                    queue: .global(qos: .utility)
+                )
+                searchContentMemoryPressureSource = source
+                source.setEventHandler { [weak self] in
+                    Task { await self?.clearSearchDecodedContentCache() }
+                }
+                source.activate()
+            #endif
+        }
+    #else
+        init(searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production) {
+            storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
+            publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator()
+            #if os(macOS)
+                let source = DispatchSource.makeMemoryPressureSource(
+                    eventMask: [.warning, .critical],
+                    queue: .global(qos: .utility)
+                )
+                searchContentMemoryPressureSource = source
+                source.setEventHandler { [weak self] in
+                    Task { await self?.clearSearchDecodedContentCache() }
+                }
+                source.activate()
+            #endif
+        }
+    #endif
 
     deinit {
         #if os(macOS)
@@ -500,6 +791,9 @@ actor WorkspaceFileContextStore {
     }
 
     private func yieldAppliedIndexEvent(_ event: WorkspaceAppliedIndexBatchEvent) {
+        #if DEBUG
+            Self.activePublicationInvalidationRecorder?.appliedIndexEventYieldCount += 1
+        #endif
         for continuation in appliedIndexContinuations.values {
             continuation.yield(event)
         }
@@ -585,7 +879,16 @@ actor WorkspaceFileContextStore {
         }
         let preparedDeltas = FileSystemDeltaPreparation.coalesce(deltas, inRoot: root.standardizedFullPath)
             .compactMap { FileSystemDeltaPreparation.prepare($0, inRoot: root.standardizedFullPath) }
-        await applyPreparedIndexDeltas(rootID: root.id, deltas: preparedDeltas)
+        #if DEBUG
+            await applyPreparedIndexDeltas(
+                rootID: root.id,
+                deltas: preparedDeltas,
+                watcherAcceptedWatermark: watcherAcceptedWatermark,
+                servicePublicationSequence: servicePublicationSequence
+            )
+        #else
+            await applyPreparedIndexDeltas(rootID: root.id, deltas: preparedDeltas)
+        #endif
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.WorkspaceIngress.storeCanonicalApplyCompleted,
             correlation: publicationCorrelation,
@@ -628,6 +931,16 @@ actor WorkspaceFileContextStore {
             .filter(isDiscoverableFolderID)
             .compactMap { foldersByID[$0] }
             .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
+    }
+
+    func appliedIndexRootSnapshot(rootID: UUID) -> WorkspaceAppliedIndexRootSnapshot? {
+        guard let root = rootStatesByID[rootID]?.root else { return nil }
+        return WorkspaceAppliedIndexRootSnapshot(
+            root: root,
+            generation: appliedIndexGenerationsByRootID[rootID] ?? 0,
+            files: files(inRoot: rootID),
+            folders: folders(inRoot: rootID)
+        )
     }
 
     func catalogGeneration(rootScope: WorkspaceLookupRootScope = .visibleWorkspace) -> UInt64 {
@@ -888,13 +1201,16 @@ actor WorkspaceFileContextStore {
 
         var samplesByIndex: [Int: WorkspaceIngressBarrierSample] = [:]
         for chunkStart in stride(from: 0, to: orderedRootIDs.count, by: Self.maxConcurrentScopedIngressBarriers) {
+            guard !Task.isCancelled else { break }
             let chunkEnd = min(chunkStart + Self.maxConcurrentScopedIngressBarriers, orderedRootIDs.count)
             await withTaskGroup(of: (Int, WorkspaceIngressBarrierSample?).self) { group in
                 for index in chunkStart ..< chunkEnd {
                     let rootID = orderedRootIDs[index]
                     guard let target = targetsByRootID[rootID] else { continue }
                     group.addTask { [weak self] in
-                        await (index, self?.awaitAppliedIngress(rootID: rootID, target: target))
+                        guard !Task.isCancelled, let self else { return (index, nil) }
+                        let sample = await awaitAppliedIngress(rootID: rootID, target: target)
+                        return (index, sample)
                     }
                 }
                 for await (index, sample) in group {
@@ -909,12 +1225,13 @@ actor WorkspaceFileContextStore {
         rootID: UUID,
         target: ScopedIngressBarrierTarget
     ) async -> WorkspaceIngressBarrierSample? {
-        guard let state = rootStatesByID[rootID] else { return nil }
+        guard !Task.isCancelled, let state = rootStatesByID[rootID] else { return nil }
         if let flight = scopedIngressBarrierFlightsByRootID[rootID], flight.target.covers(target) {
             #if DEBUG
                 scopedIngressBarrierJoinCountsByRootID[rootID, default: 0] += 1
             #endif
-            return await flight.task.value
+            guard let output = await flight.join.value() else { return nil }
+            return scopedIngressBarrierSample(from: output)
         }
 
         let isSuccessor = scopedIngressBarrierFlightsByRootID[rootID] != nil
@@ -928,8 +1245,12 @@ actor WorkspaceFileContextStore {
             if isSuccessor {
                 scopedIngressBarrierSuccessorCountsByRootID[rootID, default: 0] += 1
             }
+            let barrierCompletionNowNanoseconds = debugNowNanoseconds
+            let barrierStartedAtNanoseconds = barrierCompletionNowNanoseconds()
             let scopedIngressBarrierWillFlushHandler = scopedIngressBarrierWillFlushHandler
             let publisherIngressWillWaitHandler = publisherIngressWillWaitHandler
+        #else
+            let barrierStartedAtNanoseconds: UInt64 = 0
         #endif
         #if DEBUG || EDIT_FLOW_PERF
             let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
@@ -985,7 +1306,7 @@ actor WorkspaceFileContextStore {
                     barrierSequence: applied.appliedServicePublicationSequence
                 )
             )
-            return WorkspaceIngressBarrierSample(
+            let sample = WorkspaceIngressBarrierSample(
                 rootID: rootID,
                 rootPath: root.standardizedFullPath,
                 pendingRawEventCountBeforeFlush: pendingCount,
@@ -994,17 +1315,81 @@ actor WorkspaceFileContextStore {
                 appliedServicePublicationSequence: applied.appliedServicePublicationSequence,
                 appliedWatcherWatermark: applied.appliedWatcherWatermark.rawValue
             )
+            #if DEBUG
+                return ScopedIngressBarrierTaskOutput(
+                    sample: sample,
+                    completedAtNanoseconds: barrierCompletionNowNanoseconds()
+                )
+            #else
+                return sample
+            #endif
         }
-        scopedIngressBarrierFlightsByRootID[rootID] = ScopedIngressBarrierFlight(
-            token: token,
-            target: target,
-            task: task
-        )
-        let sample = await task.value
+        let join = ScopedIngressBarrierJoin()
+        #if DEBUG
+            scopedIngressBarrierFlightsByRootID[rootID] = ScopedIngressBarrierFlight(
+                token: token,
+                target: target,
+                join: join,
+                startedAtNanoseconds: barrierStartedAtNanoseconds
+            )
+        #else
+            scopedIngressBarrierFlightsByRootID[rootID] = ScopedIngressBarrierFlight(
+                token: token,
+                target: target,
+                join: join
+            )
+        #endif
+        Task { [weak self, join] in
+            let output = await task.value
+            guard let self else {
+                join.complete(with: output)
+                return
+            }
+            await finishScopedIngressBarrier(
+                rootID: rootID,
+                token: token,
+                target: target,
+                output: output,
+                startedAtNanoseconds: barrierStartedAtNanoseconds,
+                join: join
+            )
+        }
+        guard let output = await join.value() else { return nil }
+        return scopedIngressBarrierSample(from: output)
+    }
+
+    private func finishScopedIngressBarrier(
+        rootID: UUID,
+        token: UInt64,
+        target: ScopedIngressBarrierTarget,
+        output: ScopedIngressBarrierTaskOutput,
+        startedAtNanoseconds: UInt64,
+        join: ScopedIngressBarrierJoin
+    ) {
+        #if DEBUG
+            recordScopedIngressBarrierCompletion(
+                rootID: rootID,
+                token: token,
+                target: target,
+                sample: output.sample,
+                startedAtNanoseconds: startedAtNanoseconds,
+                completedAtNanoseconds: output.completedAtNanoseconds
+            )
+        #endif
         if scopedIngressBarrierFlightsByRootID[rootID]?.token == token {
             scopedIngressBarrierFlightsByRootID.removeValue(forKey: rootID)
         }
-        return sample
+        join.complete(with: output)
+    }
+
+    private func scopedIngressBarrierSample(
+        from output: ScopedIngressBarrierTaskOutput
+    ) -> WorkspaceIngressBarrierSample {
+        #if DEBUG
+            output.sample
+        #else
+            output
+        #endif
     }
 
     /// Compatibility wrapper for callers that still consume the original diagnostic shape.
@@ -1256,7 +1641,7 @@ actor WorkspaceFileContextStore {
 
         let deltas: [FileSystemDelta]
         do {
-            deltas = try await state.service.scanFoldersInParallel(folderPaths)
+            deltas = try await state.service.scanFoldersInParallel(folderPaths).deltas
         } catch {
             return []
         }
@@ -2027,6 +2412,14 @@ actor WorkspaceFileContextStore {
                 isRootUnload: true
             ))
             appliedIndexGenerationsByRootID.removeValue(forKey: rootID)
+            #if DEBUG
+                publicationInvalidationHistoryByRootID.removeValue(forKey: rootID)
+                scopedIngressBarrierLaunchCountsByRootID.removeValue(forKey: rootID)
+                scopedIngressBarrierJoinCountsByRootID.removeValue(forKey: rootID)
+                scopedIngressBarrierSuccessorCountsByRootID.removeValue(forKey: rootID)
+                scopedIngressBarrierCompletionCountsByRootID.removeValue(forKey: rootID)
+                lastCompletedScopedIngressBarrierByRootID.removeValue(forKey: rootID)
+            #endif
         }
 
         let unloadedRootKinds = Set(statesToUnload.map(\.state.root.kind))
@@ -3019,6 +3412,17 @@ actor WorkspaceFileContextStore {
         return true
     }
 
+    private func directoryAppearsPresentOnDisk(root: WorkspaceRootRecord, relativePath: String) -> Bool {
+        let fullPath = StandardizedPath.join(standardizedRoot: root.standardizedFullPath, standardizedRelativePath: StandardizedPath.relative(relativePath))
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: fullPath, isDirectory: &isDirectory), isDirectory.boolValue else { return false }
+        if let values = try? URL(fileURLWithPath: fullPath).resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) {
+            if values.isSymbolicLink == true { return false }
+            if values.isDirectory == false { return false }
+        }
+        return true
+    }
+
     @discardableResult
     private func pruneCatalogFileMissingOnDisk(
         rootID: UUID,
@@ -3063,8 +3467,71 @@ actor WorkspaceFileContextStore {
         return true
     }
 
-    private func applyPreparedIndexDeltas(rootID: UUID, deltas: [PreparedFileSystemDelta]) async {
+    #if DEBUG
+        private func applyPreparedIndexDeltas(
+            rootID: UUID,
+            deltas: [PreparedFileSystemDelta],
+            watcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark?,
+            servicePublicationSequence: UInt64?
+        ) async {
+            guard let servicePublicationSequence else {
+                await applyPreparedIndexDeltasBody(rootID: rootID, deltas: deltas)
+                return
+            }
+            let recorder = PublicationInvalidationRecorder(preparedDeltaCount: deltas.count)
+            await Self.$activePublicationInvalidationRecorder.withValue(recorder) {
+                await applyPreparedIndexDeltasBody(rootID: rootID, deltas: deltas)
+            }
+            recordPublicationInvalidationDiagnostics(
+                rootID: rootID,
+                servicePublicationSequence: servicePublicationSequence,
+                watcherAcceptedWatermark: watcherAcceptedWatermark,
+                recorder: recorder
+            )
+        }
+    #else
+        private func applyPreparedIndexDeltas(rootID: UUID, deltas: [PreparedFileSystemDelta]) async {
+            await applyPreparedIndexDeltasBody(rootID: rootID, deltas: deltas)
+        }
+    #endif
+
+    private func applyPreparedIndexDeltasBody(rootID: UUID, deltas: [PreparedFileSystemDelta]) async {
+        let applicableDeltas = await preflightPreparedIndexDeltas(rootID: rootID, deltas: deltas)
+        applyPreparedIndexDeltaMutations(rootID: rootID, deltas: applicableDeltas)
+    }
+
+    private func preflightPreparedIndexDeltas(
+        rootID: UUID,
+        deltas: [PreparedFileSystemDelta]
+    ) async -> [PreparedFileSystemDelta] {
+        var applicableDeltas: [PreparedFileSystemDelta] = []
+        applicableDeltas.reserveCapacity(deltas.count)
+        for prepared in deltas {
+            switch prepared.delta {
+            case .fileAdded:
+                guard let service = rootStatesByID[rootID]?.service,
+                      await service.catalogEligibleRegularFileExists(relativePath: prepared.relativePath)
+                else { continue }
+                applicableDeltas.append(prepared)
+            case .folderAdded:
+                guard let service = rootStatesByID[rootID]?.service,
+                      await service.catalogFolderIsDiscoverable(relativePath: prepared.relativePath)
+                else { continue }
+                applicableDeltas.append(prepared)
+            case .fileRemoved, .folderRemoved, .fileModified, .folderModified:
+                applicableDeltas.append(prepared)
+            }
+        }
+        return applicableDeltas
+    }
+
+    private func applyPreparedIndexDeltaMutations(rootID: UUID, deltas: [PreparedFileSystemDelta]) {
         guard let root = rootStatesByID[rootID]?.root else { return }
+        precondition(activePublicationInvalidationBatch == nil)
+        let invalidationBatch = PublicationInvalidationBatch()
+        activePublicationInvalidationBatch = invalidationBatch
+        defer { activePublicationInvalidationBatch = nil }
+
         var upsertedFiles: [WorkspaceFileRecord] = []
         var upsertedFolders: [WorkspaceFolderRecord] = []
         var removedFileIDs: [UUID] = []
@@ -3077,10 +3544,7 @@ actor WorkspaceFileContextStore {
             let relativePath = prepared.relativePath
             switch prepared.delta {
             case .fileAdded:
-                guard let state = rootStatesByID[rootID],
-                      await state.service.catalogEligibleRegularFileExists(relativePath: relativePath),
-                      regularFileAppearsPresentOnDisk(root: root, relativePath: relativePath)
-                else { continue }
+                guard regularFileAppearsPresentOnDisk(root: root, relativePath: relativePath) else { continue }
                 let existingFile = file(rootID: rootID, relativePath: relativePath)
                 let existed = existingFile != nil
                 if let existingFile {
@@ -3099,9 +3563,7 @@ actor WorkspaceFileContextStore {
                     upsertedFolders.append(contentsOf: discoverableParentFolders(for: relativePath, rootID: rootID))
                 }
             case .folderAdded:
-                guard let state = rootStatesByID[rootID],
-                      await state.service.catalogFolderIsDiscoverable(relativePath: relativePath)
-                else { continue }
+                guard directoryAppearsPresentOnDisk(root: root, relativePath: relativePath) else { continue }
                 indexFolder(relativePath: relativePath, root: root)
                 if let folder = folder(rootID: rootID, relativePath: relativePath) {
                     // Same upsert semantics as files: repeated folder add deltas are
@@ -3138,6 +3600,8 @@ actor WorkspaceFileContextStore {
                 }
             }
         }
+
+        finalizePublicationInvalidations(invalidationBatch)
         publishAppliedIndexEvent(
             root: root,
             upsertedFiles: upsertedFiles,
@@ -3641,6 +4105,9 @@ actor WorkspaceFileContextStore {
         for scope in WorkspaceFileContextStore.catalogGenerationScopes {
             guard scopeIncludesAnyRootKind(scope, affectedRootKinds) else { continue }
             catalogGenerationsByScope[scope] = (catalogGenerationsByScope[scope] ?? 0) &+ 1
+            #if DEBUG
+                Self.activePublicationInvalidationRecorder?.catalogGenerationAdvanceCount += 1
+            #endif
         }
     }
 
@@ -3694,6 +4161,9 @@ actor WorkspaceFileContextStore {
     }
 
     private func clearSearchCatalogSnapshotCache() {
+        #if DEBUG
+            Self.activePublicationInvalidationRecorder?.searchCatalogCacheClearCount += 1
+        #endif
         searchCatalogSnapshotsByScope.removeAll(keepingCapacity: true)
     }
 
@@ -3728,26 +4198,65 @@ actor WorkspaceFileContextStore {
     }
 
     private func invalidateSearchContent(_ file: WorkspaceFileRecord) {
-        nextSearchContentInvalidationEpoch &+= 1
-        let invalidationEpoch = nextSearchContentInvalidationEpoch
-        searchContentInvalidationEpochsByFileID[file.id] = invalidationEpoch
         let key = WorkspaceSearchContentCacheKey(
             rootID: file.rootID,
             fileID: file.id,
             standardizedRelativePath: file.standardizedRelativePath
         )
+        #if DEBUG
+            if let recorder = Self.activePublicationInvalidationRecorder {
+                recorder.contentInvalidationCount += 1
+                recorder.distinctContentKeys.insert(key)
+            }
+        #endif
+        nextSearchContentInvalidationEpoch &+= 1
+        let invalidationEpoch = nextSearchContentInvalidationEpoch
+        searchContentInvalidationEpochsByFileID[file.id] = invalidationEpoch
+        if let activePublicationInvalidationBatch {
+            activePublicationInvalidationBatch.searchContentInvalidations.record(key, through: invalidationEpoch)
+            return
+        }
         Task {
             await searchDecodedContentCache.invalidate(key, through: invalidationEpoch)
         }
     }
 
+    private func finalizePublicationInvalidations(_ batch: PublicationInvalidationBatch) {
+        if batch.topologyInvalidationRequested {
+            performPathMatchSnapshotInvalidation(affectedRootKinds: batch.affectedRootKinds)
+        }
+        guard !batch.searchContentInvalidations.isEmpty else { return }
+        #if DEBUG
+            Self.activePublicationInvalidationRecorder?.decodedCacheInvalidationRequestCount += 1
+        #endif
+        let searchContentInvalidations = batch.searchContentInvalidations
+        Task {
+            await searchDecodedContentCache.invalidate(searchContentInvalidations)
+        }
+    }
+
     private func invalidatePathMatchSnapshot(affectedRootKinds: Set<WorkspaceRootKind>) {
+        if let activePublicationInvalidationBatch {
+            activePublicationInvalidationBatch.topologyInvalidationRequested = true
+            activePublicationInvalidationBatch.affectedRootKinds.formUnion(affectedRootKinds)
+            return
+        }
+        performPathMatchSnapshotInvalidation(affectedRootKinds: affectedRootKinds)
+    }
+
+    private func performPathMatchSnapshotInvalidation(affectedRootKinds: Set<WorkspaceRootKind>) {
+        #if DEBUG
+            Self.activePublicationInvalidationRecorder?.topologyInvalidationCount += 1
+        #endif
         bumpCatalogGenerations(affectedRootKinds: affectedRootKinds)
         clearSearchCatalogSnapshotCache()
         invalidatePathMatchCache()
     }
 
     private func invalidatePathMatchCache() {
+        #if DEBUG
+            Self.activePublicationInvalidationRecorder?.pathWorkerInvalidationRequestCount += 1
+        #endif
         Task { await pathMatchWorker.invalidateCache() }
     }
 
@@ -3874,6 +4383,9 @@ actor WorkspaceFileContextStore {
     }
 
     private func invalidateCodemapSnapshot(rootID: UUID, relativePath: String) {
+        #if DEBUG
+            Self.activePublicationInvalidationRecorder?.codemapInvalidationRequestCount += 1
+        #endif
         guard let state = rootStatesByID[rootID],
               let fileID = state.fileIDsByRelativePath[StandardizedPath.relative(relativePath)],
               codemapSnapshotsByFileID.removeValue(forKey: fileID) != nil
