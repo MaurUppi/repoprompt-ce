@@ -182,12 +182,24 @@ struct WorkspaceReadableFileService {
 
     func readAlwaysReadableExternalFile(_ file: WorkspaceExternalReadableFile) async throws -> String {
         let path = file.absolutePath
+        let workRecorder = MCPToolWorkCountDiagnostics.readFileExternalRecorder()
         return try await Task.detached(priority: .userInitiated) {
             let url = URL(fileURLWithPath: path)
             let data = try Data(contentsOf: url)
-            if let decoded = String(data: data, encoding: .utf8) { return decoded }
-            if let decoded = String(data: data, encoding: .unicode) { return decoded }
-            return String(decoding: data, as: UTF8.self)
+            let decodeStart = DispatchTime.now().uptimeNanoseconds
+            let decoded: String = if let utf8 = String(data: data, encoding: .utf8) {
+                utf8
+            } else if let unicode = String(data: data, encoding: .unicode) {
+                unicode
+            } else {
+                String(decoding: data, as: UTF8.self)
+            }
+            let decodeEnd = DispatchTime.now().uptimeNanoseconds
+            workRecorder(
+                data.count,
+                Int(clamping: decodeEnd >= decodeStart ? (decodeEnd - decodeStart) / 1000 : 0)
+            )
+            return decoded
         }.value
     }
 

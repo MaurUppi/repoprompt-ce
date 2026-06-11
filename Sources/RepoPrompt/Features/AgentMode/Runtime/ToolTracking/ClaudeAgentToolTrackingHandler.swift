@@ -542,6 +542,10 @@ final class ClaudeAgentToolTrackingHandler {
                 session.appendItem(toolItem)
             }
             hooks.requestUIRefresh(session.tabID, false)
+            MCPToolObserverAttributionContext.record(
+                correlationPath: "signature_pending_map",
+                scannedItemCount: session.items.count
+            )
             return
         }
 
@@ -576,6 +580,10 @@ final class ClaudeAgentToolTrackingHandler {
             updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
             session.replaceItem(at: existingInvocationIndex, with: updated)
             hooks.requestUIRefresh(session.tabID, false)
+            MCPToolObserverAttributionContext.record(
+                correlationPath: "signature",
+                scannedItemCount: session.items.count
+            )
             return
         }
 
@@ -604,6 +612,10 @@ final class ClaudeAgentToolTrackingHandler {
             updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
             session.replaceItem(at: fallbackIndex, with: updated)
             hooks.requestUIRefresh(session.tabID, false)
+            MCPToolObserverAttributionContext.record(
+                correlationPath: "signature_nil_id",
+                scannedItemCount: session.items.count
+            )
             return
         }
 
@@ -636,6 +648,10 @@ final class ClaudeAgentToolTrackingHandler {
             updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
             session.replaceItem(at: fallbackByNameIndex, with: updated)
             hooks.requestUIRefresh(session.tabID, false)
+            MCPToolObserverAttributionContext.record(
+                correlationPath: "name_fallback",
+                scannedItemCount: session.items.count
+            )
             return
         }
 
@@ -647,6 +663,10 @@ final class ClaudeAgentToolTrackingHandler {
         )
         session.appendItem(toolItem)
         hooks.requestUIRefresh(session.tabID, false)
+        MCPToolObserverAttributionContext.record(
+            correlationPath: "new_item",
+            scannedItemCount: session.items.count
+        )
     }
 
     func handleTrackerToolResult(
@@ -669,8 +689,10 @@ final class ClaudeAgentToolTrackingHandler {
         let resolvedInvocationID = providerInvocationByTrackerInvocationID[invocationID] ?? invocationID
         providerInvocationByTrackerInvocationID.removeValue(forKey: invocationID)
 
+        var correlationPath = "none"
         let targetIndex: Int? = {
             if let byInvocation = session.items.lastIndex(where: { $0.toolInvocationID == resolvedInvocationID }) {
+                correlationPath = "invocation_id"
                 return byInvocation
             }
             if let providerInvocationID = consumePendingProviderInvocationID(
@@ -683,6 +705,7 @@ final class ClaudeAgentToolTrackingHandler {
                         "providerInvocation=\(providerInvocationID.uuidString) signature=\(Self.diagnosticSignature(signature))"
                 )
                 providerInvocationByTrackerInvocationID[invocationID] = providerInvocationID
+                correlationPath = "signature_pending_map"
                 return byProviderInvocation
             }
             let matchingPendingSignatureIndices = session.items.indices.filter { index in
@@ -704,6 +727,7 @@ final class ClaudeAgentToolTrackingHandler {
                         "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
                         "resolvedInvocation=\(resolvedInvocationID.uuidString) matches=\(matchingPendingSignatureIndices.count)"
                 )
+                correlationPath = "signature"
                 return byPendingCallSignature
             }
             let normalizedToolName = MCPIntegrationHelper.normalizedRepoPromptToolName(toolName)
@@ -726,10 +750,15 @@ final class ClaudeAgentToolTrackingHandler {
                         "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
                         "matches=\(matchingPendingNameIndices.count)"
                 )
+                correlationPath = "name_fallback"
                 return byPendingCallName
             }
             return nil
         }()
+        MCPToolObserverAttributionContext.record(
+            correlationPath: correlationPath,
+            scannedItemCount: session.items.count
+        )
 
         let trimmedResult = resultJSON.trimmingCharacters(in: .whitespacesAndNewlines)
         if isError, trimmedResult.isEmpty {

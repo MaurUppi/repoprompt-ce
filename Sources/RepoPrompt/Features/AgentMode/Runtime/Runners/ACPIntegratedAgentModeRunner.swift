@@ -1215,6 +1215,7 @@ final class ACPIntegratedAgentModeRunner {
                    && shouldUpdateExistingToolCall($0, storedToolName: storedToolName, argsJSON: argsJSON, tabID: session.tabID)
            })
         {
+            MCPToolObserverAttributionContext.record(correlationPath: "invocation_id", scannedItemCount: session.items.count)
             return index
         }
         if let argsJSON,
@@ -1224,6 +1225,7 @@ final class ACPIntegratedAgentModeRunner {
                    == toolInvocationSignature(toolName: storedToolName, argsJSON: argsJSON)
            })
         {
+            MCPToolObserverAttributionContext.record(correlationPath: "signature", scannedItemCount: session.items.count)
             return index
         }
         if let argsJSON,
@@ -1238,16 +1240,19 @@ final class ACPIntegratedAgentModeRunner {
                     == MCPIntegrationHelper.normalizedRepoPromptToolName(storedToolName)
             }
             if placeholderCandidates.count == 1 {
+                MCPToolObserverAttributionContext.record(correlationPath: "placeholder", scannedItemCount: session.items.count)
                 return placeholderCandidates[0]
             }
         }
         if allowNameOnlyFallback {
+            MCPToolObserverAttributionContext.record(correlationPath: "name_fallback", scannedItemCount: session.items.count)
             return lastCurrentTurnItemIndex(in: session, where: {
                 $0.kind == .toolCall
                     && MCPIntegrationHelper.normalizedRepoPromptToolName($0.toolName ?? "")
                     == MCPIntegrationHelper.normalizedRepoPromptToolName(storedToolName)
             })
         }
+        MCPToolObserverAttributionContext.record(correlationPath: "none", scannedItemCount: session.items.count)
         return nil
     }
 
@@ -1265,6 +1270,7 @@ final class ACPIntegratedAgentModeRunner {
                    && shouldUpdateExistingToolCall($0, storedToolName: storedToolName, argsJSON: argsJSON, tabID: session.tabID)
            })
         {
+            MCPToolObserverAttributionContext.record(correlationPath: "invocation_id_call", scannedItemCount: session.items.count)
             return index
         }
         if let invocationID,
@@ -1274,6 +1280,7 @@ final class ACPIntegratedAgentModeRunner {
                    && shouldUpdateExistingToolResult($0, storedToolName: storedToolName, argsJSON: argsJSON, tabID: session.tabID)
            })
         {
+            MCPToolObserverAttributionContext.record(correlationPath: "invocation_id_result", scannedItemCount: session.items.count)
             return index
         }
         let signature = toolInvocationSignature(toolName: storedToolName, argsJSON: argsJSON)
@@ -1283,6 +1290,7 @@ final class ACPIntegratedAgentModeRunner {
                    && toolInvocationSignature(toolName: $0.toolName, argsJSON: $0.toolArgsJSON) == signature
            })
         {
+            MCPToolObserverAttributionContext.record(correlationPath: "signature_call", scannedItemCount: session.items.count)
             return index
         }
         if argsJSON != nil,
@@ -1291,15 +1299,18 @@ final class ACPIntegratedAgentModeRunner {
                    && toolInvocationSignature(toolName: $0.toolName, argsJSON: $0.toolArgsJSON) == signature
            })
         {
+            MCPToolObserverAttributionContext.record(correlationPath: "signature_result", scannedItemCount: session.items.count)
             return index
         }
         if allowNameOnlyFallback {
+            MCPToolObserverAttributionContext.record(correlationPath: "name_fallback", scannedItemCount: session.items.count)
             return lastCurrentTurnItemIndex(in: session, where: {
                 $0.kind == .toolCall
                     && MCPIntegrationHelper.normalizedRepoPromptToolName($0.toolName ?? "")
                     == MCPIntegrationHelper.normalizedRepoPromptToolName(storedToolName)
             })
         }
+        MCPToolObserverAttributionContext.record(correlationPath: "none", scannedItemCount: session.items.count)
         return nil
     }
 

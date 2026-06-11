@@ -837,13 +837,11 @@ extension BootstrapSocketProxy {
                 ) { framed in
                     try writeToSocket(framed, socketFD: socketFD)
                 }
-                if let delivered = prepared.deliveryFrame {
-                    MCPResponseDeliveryTracer.emitFrame(
+                if prepared.deliveryFrame != nil {
+                    MCPResponseDeliveryTracer.emitPreparedFrame(
                         layer: "proxy_app_uds",
                         phase: "socket_write_completed",
-                        frame: delivered,
-                        direction: .clientToServer,
-                        connectionGeneration: prepared.connectionGeneration
+                        prepared: prepared
                     )
                 }
             }
@@ -1070,12 +1068,12 @@ extension BootstrapSocketProxy {
                 if let delivered = prepared.deliveryFrame,
                    Self.extractProgressMessage(from: delivered) == nil
                 {
-                    MCPResponseDeliveryTracer.emitFrame(
+                    MCPResponseDeliveryTracer.emitPreparedFrame(
                         layer: "proxy_stdout",
                         phase: "stdout_write_completed",
-                        frame: delivered,
-                        direction: .serverToClient,
-                        connectionGeneration: prepared.connectionGeneration
+                        prepared: prepared,
+                        publicationPending: false,
+                        terminalBarrier: false
                     )
                 }
             }
@@ -1235,8 +1233,9 @@ actor MCPService: Service {
     private var killSignalContinuation: CheckedContinuation<CLIKillSignal.SignalContent?, Never>?
 
     init() {
-        sessionToken = UUID().uuidString
-        bridgeLedger = JSONRPCBridgeLedger(traceSink: { event in
+        let sessionToken = UUID().uuidString
+        self.sessionToken = sessionToken
+        bridgeLedger = JSONRPCBridgeLedger(connectionID: sessionToken, traceSink: { event in
             MCPResponseDeliveryTracer.emit(event)
         })
         // No TCP/Bonjour transport – bootstrap socket only

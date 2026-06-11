@@ -13,6 +13,12 @@ actor WorkspaceSearchService {
         let indexedPaths: [String]
         let entriesByIndexedPath: [String: WorkspaceSearchCatalogEntry]
         let index: PathSearchIndex
+        #if DEBUG
+            let orderMicroseconds: UInt64
+            let materializationMicroseconds: UInt64
+            let cIndexBuildMicroseconds: UInt64
+            let totalMicroseconds: UInt64
+        #endif
     }
 
     private var readyIndex = PathSearchIndex()
@@ -31,6 +37,26 @@ actor WorkspaceSearchService {
     private var automaticIndexBuildDelayNanoseconds: UInt64
     private var discardedAutomaticRebuildCompletions = 0
     private var isReadyIndexUsable = true
+    #if DEBUG
+        struct RebuildWorkDiagnosticsSnapshot: Equatable {
+            let rebuildCount: Int
+            let orderMicroseconds: UInt64
+            let materializationMicroseconds: UInt64
+            let cIndexBuildMicroseconds: UInt64
+            let totalMicroseconds: UInt64
+            let debounceCancellationCount: Int
+            let staleDiscardedCount: Int
+            let lastEntryCount: Int
+        }
+
+        private var debugRebuildCount = 0
+        private var debugOrderMicroseconds: UInt64 = 0
+        private var debugMaterializationMicroseconds: UInt64 = 0
+        private var debugCIndexBuildMicroseconds: UInt64 = 0
+        private var debugTotalMicroseconds: UInt64 = 0
+        private var debugDebounceCancellationCount = 0
+        private var debugLastEntryCount = 0
+    #endif
 
     init(automaticIndexBuildDelayNanoseconds: UInt64 = 0) {
         self.automaticIndexBuildDelayNanoseconds = automaticIndexBuildDelayNanoseconds
@@ -68,6 +94,21 @@ actor WorkspaceSearchService {
     var discardedStaleRebuildCount: Int {
         discardedAutomaticRebuildCompletions
     }
+
+    #if DEBUG
+        func workDiagnosticsSnapshot() -> RebuildWorkDiagnosticsSnapshot {
+            RebuildWorkDiagnosticsSnapshot(
+                rebuildCount: debugRebuildCount,
+                orderMicroseconds: debugOrderMicroseconds,
+                materializationMicroseconds: debugMaterializationMicroseconds,
+                cIndexBuildMicroseconds: debugCIndexBuildMicroseconds,
+                totalMicroseconds: debugTotalMicroseconds,
+                debounceCancellationCount: debugDebounceCancellationCount,
+                staleDiscardedCount: discardedAutomaticRebuildCompletions,
+                lastEntryCount: debugLastEntryCount
+            )
+        }
+    #endif
 
     func startKeepingFresh(
         with store: WorkspaceFileContextStore,
@@ -122,6 +163,9 @@ actor WorkspaceSearchService {
         latestObservedCatalogGeneration = snapshot.generation
 
         let prepared = await Self.prepareIndex(from: snapshot)
+        #if DEBUG
+            recordPreparedIndexWork(prepared)
+        #endif
         guard serial == rebuildSerial, !Task.isCancelled else {
             activeRebuildGeneration = nil
             return currentIndexedGeneration ?? snapshot.generation
@@ -273,6 +317,11 @@ actor WorkspaceSearchService {
         debounceNanoseconds: UInt64
     ) {
         pendingRebuildGeneration = targetGeneration
+        #if DEBUG
+            if pendingRebuildTask != nil {
+                debugDebounceCancellationCount += 1
+            }
+        #endif
         pendingRebuildTask?.cancel()
         pendingRebuildTask = Task { [weak self, store] in
             if debounceNanoseconds > 0 {
@@ -317,6 +366,9 @@ actor WorkspaceSearchService {
             try? await Task.sleep(nanoseconds: automaticIndexBuildDelayNanoseconds)
         }
         let prepared = await Self.prepareIndex(from: snapshot)
+        #if DEBUG
+            recordPreparedIndexWork(prepared)
+        #endif
         guard !Task.isCancelled,
               latestObservedCatalogGeneration == prepared.generation,
               pendingRebuildGeneration == nil || pendingRebuildGeneration == prepared.generation,
@@ -357,20 +409,68 @@ actor WorkspaceSearchService {
     }
 
     private static func prepareIndex(from snapshot: WorkspaceSearchCatalogSnapshot) async -> PreparedIndex {
+        #if DEBUG
+            let totalStart = DispatchTime.now().uptimeNanoseconds
+            let orderStart = totalStart
+        #endif
         let ordered = orderEntries(snapshot.entries)
+        #if DEBUG
+            let orderEnd = DispatchTime.now().uptimeNanoseconds
+            let materializationStart = orderEnd
+        #endif
         let paths = ordered.map(indexPath(for:))
         let entriesByIndexedPath = Dictionary(zip(paths, ordered), uniquingKeysWith: { first, _ in first })
+        #if DEBUG
+            let materializationEnd = DispatchTime.now().uptimeNanoseconds
+            let cIndexStart = materializationEnd
+        #endif
         let index = PathSearchIndex()
         await index.rebuild(paths: paths)
-        return PreparedIndex(
-            generation: snapshot.generation,
-            diagnostics: snapshot.diagnostics,
-            orderedEntries: ordered,
-            indexedPaths: paths,
-            entriesByIndexedPath: entriesByIndexedPath,
-            index: index
-        )
+        #if DEBUG
+            let cIndexEnd = DispatchTime.now().uptimeNanoseconds
+        #endif
+        #if DEBUG
+            return PreparedIndex(
+                generation: snapshot.generation,
+                diagnostics: snapshot.diagnostics,
+                orderedEntries: ordered,
+                indexedPaths: paths,
+                entriesByIndexedPath: entriesByIndexedPath,
+                index: index,
+                orderMicroseconds: elapsedMicroseconds(since: orderStart, through: orderEnd),
+                materializationMicroseconds: elapsedMicroseconds(
+                    since: materializationStart,
+                    through: materializationEnd
+                ),
+                cIndexBuildMicroseconds: elapsedMicroseconds(since: cIndexStart, through: cIndexEnd),
+                totalMicroseconds: elapsedMicroseconds(since: totalStart, through: cIndexEnd)
+            )
+        #else
+            return PreparedIndex(
+                generation: snapshot.generation,
+                diagnostics: snapshot.diagnostics,
+                orderedEntries: ordered,
+                indexedPaths: paths,
+                entriesByIndexedPath: entriesByIndexedPath,
+                index: index
+            )
+        #endif
     }
+
+    #if DEBUG
+        private func recordPreparedIndexWork(_ prepared: PreparedIndex) {
+            debugRebuildCount += 1
+            debugOrderMicroseconds &+= prepared.orderMicroseconds
+            debugMaterializationMicroseconds &+= prepared.materializationMicroseconds
+            debugCIndexBuildMicroseconds &+= prepared.cIndexBuildMicroseconds
+            debugTotalMicroseconds &+= prepared.totalMicroseconds
+            debugLastEntryCount = prepared.orderedEntries.count
+        }
+
+        private static func elapsedMicroseconds(since start: UInt64, through end: UInt64) -> UInt64 {
+            end >= start ? (end - start) / 1000 : 0
+        }
+    #endif
 
     private static func orderEntries(_ entries: [WorkspaceSearchCatalogEntry]) -> [WorkspaceSearchCatalogEntry] {
         entries.sorted {

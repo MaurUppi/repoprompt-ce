@@ -3,6 +3,7 @@
     import CoreServices
     import MCP
     @testable import RepoPrompt
+    import RepoPromptShared
     import XCTest
 
     final class MCPReadSearchLatencyDiagnosticsGuardTests: XCTestCase {
@@ -108,6 +109,207 @@
             XCTAssertNotNil(scheduler["owner_lane_count"])
             XCTAssertNotNil(scheduler["grant_count"])
             XCTAssertNotNil(scheduler["overload_count"])
+        }
+
+        func testPermitLifecycleTimelineEventsJoinBySharedRequestIdentity() async throws {
+            let manager = ServerNetworkManager.shared
+            let connectionID = UUID()
+            _ = await manager.debugInstallConnectionLimiterForTesting(connectionID: connectionID)
+            addTeardownBlock {
+                await manager.debugRemoveConnection(connectionID)
+            }
+
+            let identity = MCPRequestTimelineIdentity(
+                jsonRPCRequestID: .number(41),
+                connectionID: connectionID.uuidString,
+                connectionGeneration: 7,
+                appInvocationID: UUID().uuidString,
+                requestOrdinal: 3
+            )
+            _ = startedCapture(label: "permit-identity", maxSamples: 100)
+            let correlation = try XCTUnwrap(
+                EditFlowPerf.makeLifecycleCorrelationIfActive(requestIdentity: identity)
+            )
+
+            let value = try await manager.withConnectionCallPermitForTesting(
+                connectionID: connectionID,
+                lane: .ordinary,
+                toolName: "read_file",
+                lifecycleCorrelation: correlation
+            ) {
+                "ok"
+            }
+            XCTAssertEqual(value, "ok")
+
+            let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            let permitEvents = snapshot.lifecycleEvents.filter {
+                [
+                    "MCP.ToolCall.PermitQueued",
+                    "MCP.ToolCall.PermitAcquired",
+                    "MCP.ToolCall.PermitReleased"
+                ].contains($0.eventName)
+            }
+            XCTAssertEqual(permitEvents.map(\.eventName), [
+                "MCP.ToolCall.PermitQueued",
+                "MCP.ToolCall.PermitAcquired",
+                "MCP.ToolCall.PermitReleased"
+            ])
+            XCTAssertEqual(Set(permitEvents.map(\.correlationID)).count, 1)
+            XCTAssertTrue(permitEvents.allSatisfy { $0.requestIdentity == identity })
+            XCTAssertTrue(permitEvents.allSatisfy {
+                $0.sanitizedDimensions.contains("tool=read_file")
+                    && $0.sanitizedDimensions.contains("admissionClass=ordinary")
+                    && $0.sanitizedDimensions.contains("queueDepth=")
+                    && $0.sanitizedDimensions.contains("ownerResource=connection_\(connectionID.uuidString)")
+            })
+            XCTAssertTrue(permitEvents.last?.sanitizedDimensions.contains("outcome=completed") == true)
+
+            let payloads = try XCTUnwrap(
+                EditFlowPerf.debugCaptureSnapshot(finish: false)
+                    .payload()["lifecycle_events"] as? [[String: Any]]
+            )
+            let joinedIdentities = payloads.compactMap { $0["request_identity"] as? [String: Any] }
+            XCTAssertEqual(joinedIdentities.count, 3)
+            XCTAssertTrue(joinedIdentities.allSatisfy {
+                $0["jsonrpc_request_id"] as? String == "number:41"
+                    && $0["connection_id"] as? String == connectionID.uuidString
+                    && ($0["connection_generation"] as? NSNumber)?.uint64Value == 7
+                    && $0["app_invocation_id"] as? String == identity.appInvocationID
+                    && ($0["request_ordinal"] as? NSNumber)?.uint64Value == 3
+            })
+
+            let managerSource = try source("Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift")
+            for hook in [
+                "EditFlowPerf.Lifecycle.MCPToolCall.permitQueued",
+                "EditFlowPerf.Lifecycle.MCPToolCall.permitAcquired",
+                "EditFlowPerf.Lifecycle.MCPToolCall.permitReleased",
+                "requestIdentity: resolvedRequestIdentity"
+            ] {
+                XCTAssertTrue(managerSource.contains(hook), "Missing permit timeline hook: \(hook)")
+            }
+        }
+
+        func testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices() throws {
+            let connectionID = UUID().uuidString
+            let identity = MCPRequestTimelineIdentity(
+                jsonRPCRequestID: .string("request-7"),
+                connectionID: connectionID,
+                connectionGeneration: 2,
+                requestOrdinal: 11
+            )
+            let invocationID = try XCTUnwrap(identity.appInvocationID)
+            XCTAssertEqual(
+                invocationID,
+                MCPRequestTimelineIdentity.deterministicAppInvocationID(
+                    jsonRPCRequestID: .string("request-7"),
+                    connectionID: connectionID,
+                    connectionGeneration: 2,
+                    requestOrdinal: 11
+                )
+            )
+            let otherConnectionIdentity = MCPRequestTimelineIdentity(
+                jsonRPCRequestID: .string("request-7"),
+                connectionID: UUID().uuidString,
+                connectionGeneration: 2,
+                requestOrdinal: 11
+            )
+            XCTAssertNotEqual(invocationID, otherConnectionIdentity.appInvocationID)
+
+            _ = startedCapture(label: "wi2-all-stages", maxSamples: 200)
+            let correlation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive(requestIdentity: identity))
+            for event in [
+                EditFlowPerf.Lifecycle.MCPToolCall.received,
+                EditFlowPerf.Lifecycle.MCPToolCall.permitQueued,
+                EditFlowPerf.Lifecycle.MCPToolCall.permitAcquired,
+                EditFlowPerf.Lifecycle.MCPToolCall.mainActorScheduled,
+                EditFlowPerf.Lifecycle.MCPToolCall.mainActorEntered,
+                EditFlowPerf.Lifecycle.MCPToolCall.mainActorExited,
+                EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderBegan,
+                EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
+                EditFlowPerf.Lifecycle.MCPToolCall.observerScheduled,
+                EditFlowPerf.Lifecycle.MCPToolCall.observerEntered,
+                EditFlowPerf.Lifecycle.MCPToolCall.observerExited,
+                EditFlowPerf.Lifecycle.MCPToolCall.publicationOwnershipState,
+                EditFlowPerf.Lifecycle.MCPToolCall.handlerResultReady,
+                EditFlowPerf.Lifecycle.MCPToolCall.permitReleased
+            ] {
+                EditFlowPerf.lifecycleEvent(event, correlation: correlation)
+            }
+            let capturePayload = EditFlowPerf.debugCaptureSnapshot(finish: true).payload()
+            XCTAssertEqual((capturePayload["request_timeline_count"] as? NSNumber)?.intValue, 1)
+            let timelines = try XCTUnwrap(capturePayload["request_timelines"] as? [[String: Any]])
+            XCTAssertEqual(timelines.first?["join_key"] as? String, invocationID)
+            let catalog = try XCTUnwrap(capturePayload["workload_matrix_catalog"] as? [[String: Any]])
+            XCTAssertEqual(Set(catalog.compactMap { $0["id"] as? String }), [
+                "same_connection_ordinary_burst",
+                "same_connection_mixed_ordinary_search",
+                "distinct_connections_one_window",
+                "distinct_windows",
+                "agent_transcript_short_vs_long"
+            ])
+
+            let previousPerf = UserDefaults.standard.object(forKey: "enableAgentModePerfDiagnostics")
+            UserDefaults.standard.set(true, forKey: "enableAgentModePerfDiagnostics")
+            defer {
+                if let previousPerf {
+                    UserDefaults.standard.set(previousPerf, forKey: "enableAgentModePerfDiagnostics")
+                } else {
+                    UserDefaults.standard.removeObject(forKey: "enableAgentModePerfDiagnostics")
+                }
+                MCPResponseDeliveryTracer.resetDebugEvents()
+            }
+            MCPResponseDeliveryTracer.resetDebugEvents()
+            for (layer, phase) in [
+                ("app_uds_transport", "frame_accepted"),
+                ("app_sdk", "sdk_decode_completed"),
+                ("app_tool_handler", "handler_result_ready"),
+                ("app_uds_transport", "sdk_encode_completed"),
+                ("app_uds_transport", "transport_write_completed"),
+                ("proxy_ledger", "frame_committed"),
+                ("proxy_stdout", "stdout_write_completed")
+            ] {
+                MCPResponseDeliveryTracer.emit(MCPResponseDeliveryTraceEvent(
+                    layer: layer,
+                    phase: phase,
+                    connectionID: connectionID,
+                    connectionGeneration: 2,
+                    direction: phase == "frame_accepted" ? .clientToServer : .serverToClient,
+                    id: .string("request-7"),
+                    method: "tools/call",
+                    tool: "read_file",
+                    requestOrdinal: 11,
+                    requestIdentity: identity
+                ))
+            }
+            let delivery = MCPResponseDeliveryTracer.debugEventSnapshot()
+            XCTAssertEqual(delivery.count, 7)
+            XCTAssertTrue(delivery.allSatisfy { $0.requestIdentity?.appInvocationID == invocationID })
+
+            let sources = try [
+                source("Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift"),
+                source("Sources/RepoPrompt/Infrastructure/MCP/UnixSocketMCPTransport.swift"),
+                source("Sources/RepoPromptShared/MCP/JSONRPCBridgeLedger.swift"),
+                source("Sources/RepoPromptMCP/main.swift"),
+                source("Sources/RepoPrompt/Infrastructure/AI/Agents/AgentToolTracker.swift"),
+                source("Sources/RepoPrompt/Features/AgentMode/Runtime/AgentRunTerminalCommitBarrier.swift")
+            ].joined(separator: "\n")
+            for hook in [
+                "frame_accepted",
+                "sdk_decode_completed",
+                "permitQueued",
+                "permitAcquired",
+                "mainActorScheduled",
+                "resolvedProviderBegan",
+                "observerScheduled",
+                "handler_result_ready",
+                "sdk_encode_completed",
+                "transport_write_completed",
+                "stdout_write_completed",
+                "publicationPending",
+                "terminalBarrier"
+            ] {
+                XCTAssertTrue(sources.contains(hook), "Missing WI-2 stage hook: \(hook)")
+            }
         }
 
         func testLimiterDiagnosticsReportPromptQueuedCancellationAndIdleState() async {
@@ -242,6 +444,20 @@
             XCTAssertNotNil(windowPayload["projection_direct_folder_id_lookup_count"])
             XCTAssertNotNil(windowPayload["projection_direct_id_lookup_miss_count"])
             XCTAssertNotNil(windowPayload["projection_canonical_resync_count"])
+            let uiIndexRebuild = try XCTUnwrap(windowPayload["ui_index_rebuild"] as? [String: Any])
+            XCTAssertNotNil(uiIndexRebuild["count"])
+            XCTAssertNotNil(uiIndexRebuild["visited_file_count"])
+            let storeWork = try XCTUnwrap(windowPayload["store_work"] as? [String: Any])
+            XCTAssertNotNil(storeWork["invalidations"])
+            XCTAssertNotNil(storeWork["catalog_rebuild"])
+            let searchRebuild = try XCTUnwrap(windowPayload["search_rebuild"] as? [String: Any])
+            XCTAssertNotNil(searchRebuild["c_index_build_us"])
+            XCTAssertNotNil(searchRebuild["stale_discarded_count"])
+            let duplication = try XCTUnwrap(runtime["physical_root_duplication"] as? [[String: Any]])
+            XCTAssertTrue(duplication.isEmpty)
+            let toolWork = try XCTUnwrap(runtime["tool_work"] as? [String: Any])
+            XCTAssertNotNil(toolWork["git_invocations"])
+            XCTAssertNotNil(toolWork["read_file_invocations"])
             let autoSelection = try XCTUnwrap(windowPayload["read_file_auto_selection"] as? [String: Any])
             for key in [
                 "canonical_lane_count",
@@ -1863,17 +2079,17 @@
             XCTAssertTrue(store.contains("private static let maxCachedSearchCatalogSnapshotScopes = 16"))
             XCTAssertTrue(store.contains("private var searchCatalogSnapshotsByScope: [WorkspaceLookupRootScope: SearchCatalogSnapshotCacheEntry] = [:]"))
             XCTAssertTrue(store.contains("case .sessionBoundWorkspace:\n            scopedSnapshotGeneration(scope: .allLoaded)"))
-            XCTAssertTrue(store.contains("rootStatesByID[originalRootID] = state\n            clearSearchCatalogSnapshotCache()\n            indexed.append(fullPath)"))
+            XCTAssertTrue(store.contains("rootStatesByID[originalRootID] = state\n            clearSearchCatalogSnapshotCache(\n                reasons: [.explicitMaterialization]"))
             assertSourceOrder(
                 in: store,
                 hooks: [
                     "guard !statesToUnload.isEmpty else { return }",
-                    "clearSearchCatalogSnapshotCache()",
+                    "clearSearchCatalogSnapshotCache(\n            reasons: [.rootUnload]",
                     "await searchDecodedContentCache.invalidate(rootID: entry.rootID)",
                     "#if DEBUG"
                 ]
             )
-            XCTAssertTrue(store.contains("bumpCatalogGenerations(affectedRootKinds: affectedRootKinds)\n        clearSearchCatalogSnapshotCache()\n        invalidatePathMatchCache()"))
+            XCTAssertTrue(store.contains("bumpCatalogGenerations(affectedRootKinds: affectedRootKinds)\n        clearSearchCatalogSnapshotCache(\n            reasons: reasons"))
             XCTAssertTrue(store.contains("#endif\n        invalidatePathMatchCache()\n        finishRootUnload(for: unloadingPaths)"))
             XCTAssertTrue(store.contains("cacheHit: true"))
             XCTAssertTrue(store.contains("cacheHit: false"))

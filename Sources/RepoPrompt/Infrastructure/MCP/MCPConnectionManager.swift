@@ -1073,13 +1073,124 @@ actor ServerNetworkManager {
 
         func withPermit<T>(
             lane: MCPConnectionCallLane,
+            toolName: String? = nil,
+            lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
+            ownerResource: String? = nil,
+            ownerWindowID: Int? = nil,
+            ownerRunID: String? = nil,
             _ operation: @Sendable () async throws -> T
         ) async throws -> T {
             guard case .open = admissionCloseState else { throw AdmissionRejected() }
             admittedCallCount += 1
             defer { admittedCallCount -= 1 }
-            return try await limiter(for: lane).withPermit(operation)
+
+            let laneLimiter = limiter(for: lane)
+            #if DEBUG
+                let queuedSnapshot = await laneLimiter.debugSnapshot()
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.MCPToolCall.permitQueued,
+                    correlation: lifecycleCorrelation,
+                    EditFlowPerf.Dimensions(
+                        toolName: toolName,
+                        outcome: "queued",
+                        activeCount: queuedSnapshot.activePermitCount,
+                        admissionClass: lane.rawValue,
+                        queueDepth: queuedSnapshot.waiterCount + (queuedSnapshot.permits == 0 ? 1 : 0),
+                        windowID: ownerWindowID,
+                        runID: ownerRunID,
+                        ownerResource: ownerResource,
+                        permitActive: false,
+                        publicationPending: false,
+                        terminalBarrier: false
+                    )
+                )
+            #endif
+
+            do {
+                let result = try await laneLimiter.withPermit {
+                    #if DEBUG
+                        let acquiredSnapshot = await laneLimiter.debugSnapshot()
+                        EditFlowPerf.lifecycleEvent(
+                            EditFlowPerf.Lifecycle.MCPToolCall.permitAcquired,
+                            correlation: lifecycleCorrelation,
+                            EditFlowPerf.Dimensions(
+                                toolName: toolName,
+                                outcome: "acquired",
+                                activeCount: acquiredSnapshot.activePermitCount,
+                                admissionClass: lane.rawValue,
+                                queueDepth: acquiredSnapshot.waiterCount,
+                                windowID: ownerWindowID,
+                                runID: ownerRunID,
+                                ownerResource: ownerResource,
+                                permitActive: true,
+                                publicationPending: false,
+                                terminalBarrier: false
+                            )
+                        )
+                    #endif
+                    return try await operation()
+                }
+                #if DEBUG
+                    await recordPermitReleased(
+                        laneLimiter: laneLimiter,
+                        lane: lane,
+                        toolName: toolName,
+                        lifecycleCorrelation: lifecycleCorrelation,
+                        ownerResource: ownerResource,
+                        ownerWindowID: ownerWindowID,
+                        ownerRunID: ownerRunID,
+                        outcome: "completed"
+                    )
+                #endif
+                return result
+            } catch {
+                #if DEBUG
+                    await recordPermitReleased(
+                        laneLimiter: laneLimiter,
+                        lane: lane,
+                        toolName: toolName,
+                        lifecycleCorrelation: lifecycleCorrelation,
+                        ownerResource: ownerResource,
+                        ownerWindowID: ownerWindowID,
+                        ownerRunID: ownerRunID,
+                        outcome: error is CancellationError ? "cancelled" : "failed"
+                    )
+                #endif
+                throw error
+            }
         }
+
+        #if DEBUG
+            private func recordPermitReleased(
+                laneLimiter: AsyncLimiter,
+                lane: MCPConnectionCallLane,
+                toolName: String?,
+                lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?,
+                ownerResource: String?,
+                ownerWindowID: Int?,
+                ownerRunID: String?,
+                outcome: String
+            ) async {
+                let releasedSnapshot = await laneLimiter.debugSnapshot()
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.MCPToolCall.permitReleased,
+                    correlation: lifecycleCorrelation,
+                    EditFlowPerf.Dimensions(
+                        toolName: toolName,
+                        outcome: outcome,
+                        activeCount: releasedSnapshot.activePermitCount,
+                        admissionClass: lane.rawValue,
+                        queueDepth: releasedSnapshot.waiterCount,
+                        windowID: ownerWindowID,
+                        runID: ownerRunID,
+                        ownerResource: ownerResource,
+                        permitActive: false,
+                        publicationPending: true,
+                        terminalBarrier: false
+                    )
+                )
+            }
+        #endif
 
         func hasInFlightCalls() -> Bool {
             admittedCallCount > 0
@@ -1168,6 +1279,10 @@ actor ServerNetworkManager {
                     ordinary: ordinarySnapshot,
                     fileSearch: fileSearchSnapshot
                 )
+            }
+
+            func diagnosticsSnapshot(for lane: MCPConnectionCallLane) async -> AsyncLimiter.DebugSnapshot {
+                await limiter(for: lane).debugSnapshot()
             }
 
             func admissionRetryWaiterCountForTesting() -> Int {
@@ -2366,6 +2481,10 @@ actor ServerNetworkManager {
         Self.currentConnectionID
     }
 
+    private func requestTimelineConnectionGeneration(for connectionID: UUID) -> UInt64? {
+        connectionLifecycleGenerationByID[connectionID]
+    }
+
     /// Runs the given async operation with the TaskLocal connectionID and lifecycle correlation set.
     /// Use this to propagate the connection context across Task boundaries.
     nonisolated static func withConnectionID<T>(
@@ -3076,8 +3195,44 @@ actor ServerNetworkManager {
         guard let observers = toolCallObservers[runID], !observers.isEmpty else {
             return 0
         }
-        for (_, callback) in observers {
+        #if DEBUG
+            let batchStart = DispatchTime.now().uptimeNanoseconds
+        #endif
+        for (position, entry) in observers.enumerated() {
+            let (token, callback) = entry
+            #if DEBUG
+                let scheduledAt = DispatchTime.now().uptimeNanoseconds
+                let dimensions = EditFlowPerf.Dimensions(
+                    toolName: toolName,
+                    observerToken: token.uuidString,
+                    observerType: "legacy_call",
+                    serialPosition: position,
+                    queueDelayMicroseconds: Self.debugElapsedMicroseconds(from: batchStart, to: scheduledAt),
+                    correlationPath: "not_applicable",
+                    scannedItemCount: 0,
+                    runID: runID.uuidString
+                )
+                EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.MCPToolCall.observerScheduled, dimensions)
+                EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.MCPToolCall.observerEntered, dimensions)
+            #endif
             callback(toolName)
+            #if DEBUG
+                let finishedAt = DispatchTime.now().uptimeNanoseconds
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.MCPToolCall.observerExited,
+                    EditFlowPerf.Dimensions(
+                        toolName: toolName,
+                        observerToken: token.uuidString,
+                        observerType: "legacy_call",
+                        serialPosition: position,
+                        queueDelayMicroseconds: Self.debugElapsedMicroseconds(from: batchStart, to: scheduledAt),
+                        durationMicroseconds: Self.debugElapsedMicroseconds(from: scheduledAt, to: finishedAt),
+                        correlationPath: "not_applicable",
+                        scannedItemCount: 0,
+                        runID: runID.uuidString
+                    )
+                )
+            #endif
         }
         connectionLog("Tool call observer fired for runID \(runID) tool \(toolName) count \(observers.count)")
         return observers.count
@@ -3131,8 +3286,50 @@ actor ServerNetworkManager {
             }
             return 0
         }
-        for (_, observer) in observers {
-            await observer.onCalled(invocationID, toolName, args)
+        #if DEBUG
+            let batchStart = DispatchTime.now().uptimeNanoseconds
+        #endif
+        for (position, entry) in observers.enumerated() {
+            let (token, observer) = entry
+            #if DEBUG
+                let scheduledAt = DispatchTime.now().uptimeNanoseconds
+                let dimensions = EditFlowPerf.Dimensions(
+                    toolName: toolName,
+                    observerToken: token.uuidString,
+                    observerType: "event_call",
+                    serialPosition: position,
+                    queueDelayMicroseconds: Self.debugElapsedMicroseconds(from: batchStart, to: scheduledAt),
+                    correlationPath: "invocation_id",
+                    scannedItemCount: 0,
+                    runID: runID.uuidString
+                )
+                EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.MCPToolCall.observerScheduled, dimensions)
+                EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.MCPToolCall.observerEntered, dimensions)
+            #endif
+            #if DEBUG
+                let recorder = MCPToolObserverAttributionRecorder()
+                await MCPToolObserverAttributionContext.$recorder.withValue(recorder) {
+                    await observer.onCalled(invocationID, toolName, args)
+                }
+                let attribution = recorder.snapshot()
+                let finishedAt = DispatchTime.now().uptimeNanoseconds
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.MCPToolCall.observerExited,
+                    EditFlowPerf.Dimensions(
+                        toolName: toolName,
+                        observerToken: token.uuidString,
+                        observerType: "event_call",
+                        serialPosition: position,
+                        queueDelayMicroseconds: Self.debugElapsedMicroseconds(from: batchStart, to: scheduledAt),
+                        durationMicroseconds: Self.debugElapsedMicroseconds(from: scheduledAt, to: finishedAt),
+                        correlationPath: attribution?.correlationPath ?? "unreported",
+                        scannedItemCount: attribution?.scannedItemCount ?? 0,
+                        runID: runID.uuidString
+                    )
+                )
+            #else
+                await observer.onCalled(invocationID, toolName, args)
+            #endif
         }
         connectionLog("Tool called observers fired for runID \(runID) tool \(toolName) count \(observers.count)")
         return observers.count
@@ -3151,13 +3348,62 @@ actor ServerNetworkManager {
             }
             return 0
         }
-        for (_, observer) in observers {
+        #if DEBUG
+            let batchStart = DispatchTime.now().uptimeNanoseconds
+        #endif
+        var firedCount = 0
+        for (position, entry) in observers.enumerated() {
+            let (token, observer) = entry
             guard let onCompleted = observer.onCompleted else { continue }
-            await onCompleted(invocationID, toolName, args, resultJSON, isError)
+            firedCount += 1
+            #if DEBUG
+                let scheduledAt = DispatchTime.now().uptimeNanoseconds
+                let recorder = MCPToolObserverAttributionRecorder()
+                let dimensions = EditFlowPerf.Dimensions(
+                    toolName: toolName,
+                    observerToken: token.uuidString,
+                    observerType: "event_completion",
+                    serialPosition: position,
+                    queueDelayMicroseconds: Self.debugElapsedMicroseconds(from: batchStart, to: scheduledAt),
+                    resultBytes: resultJSON.utf8.count,
+                    runID: runID.uuidString
+                )
+                EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.MCPToolCall.observerScheduled, dimensions)
+                EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.MCPToolCall.observerEntered, dimensions)
+                await MCPToolObserverAttributionContext.$recorder.withValue(recorder) {
+                    await onCompleted(invocationID, toolName, args, resultJSON, isError)
+                }
+                let attribution = recorder.snapshot()
+                let finishedAt = DispatchTime.now().uptimeNanoseconds
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.MCPToolCall.observerExited,
+                    EditFlowPerf.Dimensions(
+                        toolName: toolName,
+                        observerToken: token.uuidString,
+                        observerType: "event_completion",
+                        serialPosition: position,
+                        queueDelayMicroseconds: Self.debugElapsedMicroseconds(from: batchStart, to: scheduledAt),
+                        durationMicroseconds: Self.debugElapsedMicroseconds(from: scheduledAt, to: finishedAt),
+                        correlationPath: attribution?.correlationPath ?? "unreported",
+                        scannedItemCount: attribution?.scannedItemCount ?? 0,
+                        resultBytes: resultJSON.utf8.count,
+                        runID: runID.uuidString
+                    )
+                )
+            #else
+                await onCompleted(invocationID, toolName, args, resultJSON, isError)
+            #endif
         }
-        connectionLog("Tool completed observers fired for runID \(runID) tool \(toolName) count \(observers.count)")
-        return observers.count
+        connectionLog("Tool completed observers fired for runID \(runID) tool \(toolName) count \(firedCount)")
+        return firedCount
     }
+
+    #if DEBUG
+        private nonisolated static func debugElapsedMicroseconds(from start: UInt64, to end: UInt64) -> Int {
+            guard end >= start else { return 0 }
+            return Int(min((end - start) / 1000, UInt64(Int.max)))
+        }
+    #endif
 
     // MARK: - Connection Waiter Helpers (event-driven, replaces 100ms polling)
 
@@ -9671,7 +9917,53 @@ actor ServerNetworkManager {
                     }
                 }
             #endif
-            let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
+            #if DEBUG
+                let transportRequestIdentity = MCPRequestTimelineRegistry.shared.claimToolRequest(
+                    connectionID: connectionID.uuidString,
+                    originalToolName: originalName
+                )
+                let inheritedRequestIdentity = transportRequestIdentity?.fillingMissingFields(
+                    from: MCPRequestTimelineContext.current
+                ) ?? MCPRequestTimelineContext.current
+                let fallbackConnectionGeneration = await requestTimelineConnectionGeneration(for: connectionID)
+                let requestIdentity = MCPRequestTimelineIdentity(
+                    jsonRPCRequestID: inheritedRequestIdentity?.jsonRPCRequestID,
+                    connectionID: inheritedRequestIdentity?.connectionID ?? connectionID.uuidString,
+                    connectionGeneration: inheritedRequestIdentity?.connectionGeneration ?? fallbackConnectionGeneration,
+                    appInvocationID: inheritedRequestIdentity?.appInvocationID,
+                    requestOrdinal: inheritedRequestIdentity?.requestOrdinal
+                )
+                let invocationID = requestIdentity.appInvocationID.flatMap { UUID(uuidString: $0) } ?? UUID()
+                let resolvedRequestIdentity: MCPRequestTimelineIdentity? = MCPRequestTimelineIdentity(
+                    jsonRPCRequestID: requestIdentity.jsonRPCRequestID,
+                    connectionID: requestIdentity.connectionID,
+                    connectionGeneration: requestIdentity.connectionGeneration,
+                    appInvocationID: invocationID.uuidString,
+                    requestOrdinal: requestIdentity.requestOrdinal
+                )
+                let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive(
+                    requestIdentity: resolvedRequestIdentity
+                )
+                if let resolvedRequestIdentity {
+                    MCPResponseDeliveryTracer.emit(MCPResponseDeliveryTraceEvent(
+                        layer: "app_sdk",
+                        phase: "sdk_decode_completed",
+                        connectionID: resolvedRequestIdentity.connectionID,
+                        connectionGeneration: resolvedRequestIdentity.connectionGeneration,
+                        direction: .clientToServer,
+                        id: resolvedRequestIdentity.jsonRPCRequestID,
+                        method: "tools/call",
+                        tool: toolName,
+                        invocationID: invocationID.uuidString,
+                        requestOrdinal: resolvedRequestIdentity.requestOrdinal,
+                        requestIdentity: resolvedRequestIdentity
+                    ))
+                }
+            #else
+                let invocationID = UUID()
+                let resolvedRequestIdentity: MCPRequestTimelineIdentity? = nil
+                let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
+            #endif
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.MCPToolCall.received,
                 correlation: lifecycleCorrelation,
@@ -9940,6 +10232,8 @@ actor ServerNetworkManager {
                     connectionID: connectionID,
                     lane: callLane,
                     resolution: limiterResolution,
+                    toolName: toolName,
+                    lifecycleCorrelation: lifecycleCorrelation,
                     cancellationResult: {
                         Self.executionContractToolErrorResult(
                             rawJSON: capturedRawJSON,
@@ -10146,7 +10440,6 @@ actor ServerNetworkManager {
                                         ? nil
                                         : await self.runIDForConnection(connectionID)
                                 }
-                                let invocationID = UUID()
                                 if let runID = observerRunIDForCallbacksFinal {
                                     let observerState = EditFlowPerf.begin(
                                         EditFlowPerf.Stage.MCPToolCall.observerCallbacks,
@@ -10352,6 +10645,20 @@ actor ServerNetworkManager {
                                         correlation: lifecycleCorrelation,
                                         EditFlowPerf.Dimensions(toolName: toolName)
                                     )
+                                    EditFlowPerf.lifecycleEvent(
+                                        EditFlowPerf.Lifecycle.MCPToolCall.publicationOwnershipState,
+                                        correlation: lifecycleCorrelation,
+                                        EditFlowPerf.Dimensions(
+                                            toolName: toolName,
+                                            windowID: Self.currentToolDispatchAuthorization?.windowIdentity?.windowID,
+                                            runID: observerRunIDForCallbacksFinal?.uuidString,
+                                            providerActive: true,
+                                            networkScopeActive: Self.currentToolDispatchAuthorization?.windowIdentity != nil,
+                                            permitActive: true,
+                                            publicationPending: false,
+                                            terminalBarrier: false
+                                        )
+                                    )
 
                                     let tracedOperation: @Sendable () async throws -> Value = {
                                         do {
@@ -10382,6 +10689,21 @@ actor ServerNetworkManager {
                                                 correlation: lifecycleCorrelation,
                                                 EditFlowPerf.Dimensions(toolName: toolName, outcome: "success")
                                             )
+                                            EditFlowPerf.lifecycleEvent(
+                                                EditFlowPerf.Lifecycle.MCPToolCall.publicationOwnershipState,
+                                                correlation: lifecycleCorrelation,
+                                                EditFlowPerf.Dimensions(
+                                                    toolName: toolName,
+                                                    outcome: "provider_completed",
+                                                    windowID: Self.currentToolDispatchAuthorization?.windowIdentity?.windowID,
+                                                    runID: observerRunIDForCallbacksFinal?.uuidString,
+                                                    providerActive: false,
+                                                    networkScopeActive: Self.currentToolDispatchAuthorization?.windowIdentity != nil,
+                                                    permitActive: true,
+                                                    publicationPending: true,
+                                                    terminalBarrier: false
+                                                )
+                                            )
                                             return value
                                         } catch {
                                             let outcome = MCPToolExecutionCancelledError.matches(error) ? "cancelled" : "error"
@@ -10390,6 +10712,21 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Lifecycle.MCPToolCall.resolvedProviderEnded,
                                                 correlation: lifecycleCorrelation,
                                                 EditFlowPerf.Dimensions(toolName: toolName, outcome: outcome)
+                                            )
+                                            EditFlowPerf.lifecycleEvent(
+                                                EditFlowPerf.Lifecycle.MCPToolCall.publicationOwnershipState,
+                                                correlation: lifecycleCorrelation,
+                                                EditFlowPerf.Dimensions(
+                                                    toolName: toolName,
+                                                    outcome: outcome,
+                                                    windowID: Self.currentToolDispatchAuthorization?.windowIdentity?.windowID,
+                                                    runID: observerRunIDForCallbacksFinal?.uuidString,
+                                                    providerActive: false,
+                                                    networkScopeActive: Self.currentToolDispatchAuthorization?.windowIdentity != nil,
+                                                    permitActive: true,
+                                                    publicationPending: true,
+                                                    terminalBarrier: false
+                                                )
                                             )
                                             throw error
                                         }
@@ -10452,11 +10789,19 @@ actor ServerNetworkManager {
                                     MCPResponseDeliveryTracer.emit(MCPResponseDeliveryTraceEvent(
                                         layer: "app_tool_handler",
                                         phase: "handler_result_ready",
-                                        connectionID: connectionID.uuidString,
+                                        connectionID: resolvedRequestIdentity?.connectionID ?? connectionID.uuidString,
+                                        connectionGeneration: resolvedRequestIdentity?.connectionGeneration,
                                         method: "tools/call",
                                         tool: toolName,
                                         invocationID: invocationID.uuidString,
-                                        lifecycleState: outcome
+                                        lifecycleState: outcome,
+                                        requestOrdinal: resolvedRequestIdentity?.requestOrdinal,
+                                        requestIdentity: resolvedRequestIdentity,
+                                        providerActive: false,
+                                        networkScopeActive: Self.currentToolDispatchAuthorization?.windowIdentity != nil,
+                                        permitActive: true,
+                                        publicationPending: true,
+                                        terminalBarrier: false
                                     ))
                                     return EditFlowPerf.measure(
                                         EditFlowPerf.Stage.MCPToolCall.handlerResultHandoff,
@@ -11688,6 +12033,8 @@ actor ServerNetworkManager {
         connectionID: UUID,
         lane: MCPConnectionCallLane,
         resolution: ConnectionCallLimiterResolution,
+        toolName: String? = nil,
+        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
         _ operation: @Sendable () async -> T
     ) async throws -> T {
         #if DEBUG
@@ -11712,7 +12059,23 @@ actor ServerNetworkManager {
                 #if DEBUG
                     let afterPermitAcquired = debugAfterConnectionCallPermitAcquiredForTesting
                 #endif
-                return try await attemptedLimiters.withPermit(lane: lane) {
+                #if DEBUG
+                    let ownerResource = "connection:\(connectionID.uuidString)"
+                    let ownerWindowID = connectionWindowMap[connectionID]
+                    let ownerRunID = runIDByConnectionID[connectionID]?.uuidString
+                #else
+                    let ownerResource: String? = nil
+                    let ownerWindowID: Int? = nil
+                    let ownerRunID: String? = nil
+                #endif
+                return try await attemptedLimiters.withPermit(
+                    lane: lane,
+                    toolName: toolName,
+                    lifecycleCorrelation: lifecycleCorrelation,
+                    ownerResource: ownerResource,
+                    ownerWindowID: ownerWindowID,
+                    ownerRunID: ownerRunID
+                ) {
                     #if DEBUG
                         await afterPermitAcquired?(connectionID)
                     #endif
@@ -11750,6 +12113,8 @@ actor ServerNetworkManager {
         connectionID: UUID,
         lane: MCPConnectionCallLane,
         resolution: ConnectionCallLimiterResolution,
+        toolName: String? = nil,
+        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
         cancellationResult: @Sendable () -> T,
         _ operation: @Sendable () async -> T
     ) async -> T {
@@ -11758,6 +12123,8 @@ actor ServerNetworkManager {
                 connectionID: connectionID,
                 lane: lane,
                 resolution: resolution,
+                toolName: toolName,
+                lifecycleCorrelation: lifecycleCorrelation,
                 operation
             )
         } catch {
@@ -11807,6 +12174,8 @@ actor ServerNetworkManager {
         func withConnectionCallPermitForTesting<T>(
             connectionID: UUID,
             lane: MCPConnectionCallLane,
+            toolName: String? = nil,
+            lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
             _ operation: @Sendable () async -> T
         ) async throws -> T {
             if let resolution = connectionCallLimiterResolution(for: connectionID) {
@@ -11814,12 +12183,22 @@ actor ServerNetworkManager {
                     connectionID: connectionID,
                     lane: lane,
                     resolution: resolution,
+                    toolName: toolName,
+                    lifecycleCorrelation: lifecycleCorrelation,
                     operation
                 )
             }
             guard let limiters = callLimiters[connectionID] else { throw CancellationError() }
             await debugAfterConnectionCallLimiterResolutionForTesting?(connectionID)
-            return try await limiters.withPermit(lane: lane, operation)
+            return try await limiters.withPermit(
+                lane: lane,
+                toolName: toolName,
+                lifecycleCorrelation: lifecycleCorrelation,
+                ownerResource: "connection:\(connectionID.uuidString)",
+                ownerWindowID: connectionWindowMap[connectionID],
+                ownerRunID: runIDByConnectionID[connectionID]?.uuidString,
+                operation
+            )
         }
 
         func connectionIsEvictableForTesting(_ connectionID: UUID) async -> Bool {

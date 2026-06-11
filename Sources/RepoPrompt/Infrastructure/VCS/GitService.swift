@@ -698,7 +698,9 @@ actor GitService {
         fingerprintData.append(0)
 
         // Include per-path size/mtime to invalidate cache when modified file content changes.
-        let paths = changedPathsFromPorcelainZ(statusData)
+        let paths = MCPToolWorkCountDiagnostics.measureGitParse {
+            changedPathsFromPorcelainZ(statusData)
+        }
         let fm = FileManager.default
         for path in Set(paths).sorted() {
             fingerprintData.append(Data(path.utf8))
@@ -713,7 +715,9 @@ actor GitService {
             }
             fingerprintData.append(0)
         }
-        let statusHash = sha256Hex(fingerprintData)
+        let statusHash = MCPToolWorkCountDiagnostics.measureGitParse {
+            sha256Hex(fingerprintData)
+        }
         return GitDiffFingerprint(
             headSHA: headSHA,
             baseRef: baseRef,
@@ -1665,8 +1669,9 @@ actor GitService {
         }
 
         // Parse outputs ----------------------------------------------------------
-        let statsMap = parseNumstatOutput(numOut) // path → (add,del)
-        let statusMap = parseNameStatusOutput(nameOut) // path → "M"
+        let (statsMap, statusMap) = MCPToolWorkCountDiagnostics.measureGitParse {
+            (parseNumstatOutput(numOut), parseNameStatusOutput(nameOut))
+        }
 
         // Merge into unified results --------------------------------------------
         var results: [UncommittedFile] = []
@@ -1805,8 +1810,9 @@ actor GitService {
     ) async throws -> [UncommittedFile] {
         let numOut = try await getDiffNumstat(compare: compare, detectRenames: detectRenames, at: repoURL)
         let nameOut = try await getDiffNameStatus(compare: compare, detectRenames: detectRenames, at: repoURL)
-        let statsMap = parseNumstatOutput(numOut)
-        let statusMap = parseNameStatusOutput(nameOut)
+        let (statsMap, statusMap) = MCPToolWorkCountDiagnostics.measureGitParse {
+            (parseNumstatOutput(numOut), parseNameStatusOutput(nameOut))
+        }
 
         var results: [UncommittedFile] = []
         let allPaths = Set(statsMap.keys).union(statusMap.keys)
@@ -1934,62 +1940,51 @@ actor GitService {
             throw GitError(message: "git status --porcelain -z failed: \(stderr)")
         }
 
-        var staged: [String] = []
-        var modified: [String] = []
-        var untracked: [String] = []
+        return MCPToolWorkCountDiagnostics.measureGitParse {
+            var staged: [String] = []
+            var modified: [String] = []
+            var untracked: [String] = []
 
-        // Parse NUL-delimited entries
-        // Format: XY<space>path<NUL>[origPath<NUL> for renames]
-        let entries = stdout.split(separator: "\0", omittingEmptySubsequences: false).map(String.init)
-        var i = 0
-        while i < entries.count {
-            let entry = entries[i]
-            guard entry.count >= 3 else {
-                i += 1
-                continue
+            // Parse NUL-delimited entries
+            // Format: XY<space>path<NUL>[origPath<NUL> for renames]
+            let entries = stdout.split(separator: "\0", omittingEmptySubsequences: false).map(String.init)
+            var i = 0
+            while i < entries.count {
+                let entry = entries[i]
+                guard entry.count >= 3 else {
+                    i += 1
+                    continue
+                }
+
+                let indexStatus = entry[entry.startIndex]
+                let workTreeStatus = entry[entry.index(after: entry.startIndex)]
+                let pathStart = entry.index(entry.startIndex, offsetBy: 3)
+                let path = String(entry[pathStart...])
+
+                guard !path.isEmpty else {
+                    i += 1
+                    continue
+                }
+                if indexStatus == "?" && workTreeStatus == "?" {
+                    untracked.append(path)
+                    i += 1
+                    continue
+                }
+                if indexStatus != " " && indexStatus != "?" {
+                    staged.append(path)
+                }
+                if workTreeStatus != " " && workTreeStatus != "?" {
+                    modified.append(path)
+                }
+                i += (indexStatus == "R" || indexStatus == "C") ? 2 : 1
             }
 
-            let indexStatus = entry[entry.startIndex]
-            let workTreeStatus = entry[entry.index(after: entry.startIndex)]
-            let pathStart = entry.index(entry.startIndex, offsetBy: 3)
-            let path = String(entry[pathStart...])
-
-            // Skip empty paths
-            guard !path.isEmpty else {
-                i += 1
-                continue
-            }
-
-            // Untracked
-            if indexStatus == "?" && workTreeStatus == "?" {
-                untracked.append(path)
-                i += 1
-                continue
-            }
-
-            // Staged: X is not space and not ?
-            if indexStatus != " " && indexStatus != "?" {
-                staged.append(path)
-            }
-
-            // Modified in working tree: Y is not space and not ?
-            if workTreeStatus != " " && workTreeStatus != "?" {
-                modified.append(path)
-            }
-
-            // Handle renames/copies which have an additional path
-            if indexStatus == "R" || indexStatus == "C" {
-                i += 2 // Skip the original path
-            } else {
-                i += 1
-            }
+            return WorkingStatus(
+                staged: staged.sorted(),
+                modified: modified.sorted(),
+                untracked: untracked.sorted()
+            )
         }
-
-        return WorkingStatus(
-            staged: staged.sorted(),
-            modified: modified.sorted(),
-            untracked: untracked.sorted()
-        )
     }
 
     /// Summary of a commit for log output.
@@ -2270,6 +2265,7 @@ actor GitService {
         requiresRepoContext: Bool = true
     ) async throws -> (String, String, Int32) {
         let process = Process()
+        let commandRecorder = MCPToolWorkCountDiagnostics.gitCommandRecorder()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = args
         process.currentDirectoryURL = repoURL
@@ -2309,6 +2305,7 @@ actor GitService {
         let (outStream, outDrain) = GitProcessPipeDrain.makeStream()
         let (errStream, errDrain) = GitProcessPipeDrain.makeStream()
 
+        let processMetrics = GitProcessMetricsBox()
         let outCollector = Task(priority: .userInitiated) { () -> Data in
             var buf = Data()
             for await chunk in outStream {
@@ -2351,13 +2348,25 @@ actor GitService {
 
                         let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
                         let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+                        commandRecorder(
+                            repoURL.standardizedFileURL.path,
+                            args,
+                            0,
+                            processMetrics.spawnMicroseconds,
+                            stdoutData.count + stderrData.count
+                        )
 
                         continuation.resume(returning: (stdout, stderr, proc.terminationStatus))
                     }
                 }
 
                 do {
+                    let spawnStart = DispatchTime.now().uptimeNanoseconds
                     try process.run()
+                    let spawnEnd = DispatchTime.now().uptimeNanoseconds
+                    processMetrics.spawnMicroseconds = Int(
+                        clamping: spawnEnd >= spawnStart ? (spawnEnd - spawnStart) / 1000 : 0
+                    )
 
                     // If stdin data was provided, write it after the process starts.
                     // Use raw FD writes via FDWriteSupport instead of FileHandle.write()
@@ -2381,6 +2390,13 @@ actor GitService {
                         }
                     }
                 } catch {
+                    commandRecorder(
+                        repoURL.standardizedFileURL.path,
+                        args,
+                        0,
+                        processMetrics.spawnMicroseconds,
+                        0
+                    )
                     // Ensure handlers and collectors are released when launch fails.
                     outPipe.fileHandleForReading.readabilityHandler = nil
                     errPipe.fileHandleForReading.readabilityHandler = nil
@@ -2793,6 +2809,24 @@ actor GitService {
 }
 
 /// Serializes pipe readability callbacks with process termination and cancellation.
+private final class GitProcessMetricsBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedSpawnMicroseconds = 0
+
+    var spawnMicroseconds: Int {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedSpawnMicroseconds
+        }
+        set {
+            lock.lock()
+            storedSpawnMicroseconds = max(0, newValue)
+            lock.unlock()
+        }
+    }
+}
+
 ///
 /// `FileHandle.readabilityHandler` may already be executing when a process termination
 /// handler clears it. Without this lock, that callback can read the final bytes, lose the

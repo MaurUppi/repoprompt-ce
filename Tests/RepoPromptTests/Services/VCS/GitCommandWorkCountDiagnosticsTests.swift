@@ -1,0 +1,144 @@
+@testable import RepoPrompt
+import XCTest
+
+#if DEBUG
+    final class GitCommandWorkCountDiagnosticsTests: XCTestCase {
+        func testWarmStatusUsesThreeGitProcessesWithoutUpstream() async throws {
+            let fixture = try GitWorkCountFixture()
+            defer { fixture.cleanup() }
+            let git = GitService()
+
+            let snapshot = try await capture(operation: "status") {
+                _ = try await git.getCurrentBranch(at: fixture.repo)
+                _ = try await git.getUpstreamRef(at: fixture.repo)
+                _ = try await git.getWorkingStatus(at: fixture.repo)
+            }
+
+            XCTAssertEqual(snapshot.commandCount, 3, snapshot.commands.joined(separator: "\n"))
+            XCTAssertEqual(snapshot.repositories, [fixture.repo.path])
+            XCTAssertGreaterThan(snapshot.outputBytes, 0)
+            XCTAssertGreaterThanOrEqual(snapshot.spawnMicroseconds, 0)
+            XCTAssertGreaterThanOrEqual(snapshot.parseMicroseconds, 0)
+        }
+
+        func testUncommittedSummaryUsesSixGitProcesses() async throws {
+            let fixture = try GitWorkCountFixture()
+            defer { fixture.cleanup() }
+            let vcs = VCSService()
+            let engine = GitDiffEngine(vcsService: vcs, gitService: GitService())
+
+            let snapshot = try await capture(operation: "diff_summary") {
+                _ = try await engine.buildSnapshotInputs(
+                    compare: .uncommitted(base: "HEAD"),
+                    scope: .all,
+                    selectedAbsolutePaths: [],
+                    repoURL: fixture.repo,
+                    contextLines: 3,
+                    detectRenames: false,
+                    generateDiffText: false
+                )
+            }
+
+            XCTAssertEqual(snapshot.commandCount, 6, snapshot.commands.joined(separator: "\n"))
+        }
+
+        func testArtifactModesPreserveCurrentSevenAndFourteenPlusUntrackedCounts() async throws {
+            let fixture = try GitWorkCountFixture()
+            defer { fixture.cleanup() }
+            let vcs = VCSService()
+            let engine = GitDiffEngine(vcsService: vcs, gitService: GitService())
+            let publisher = GitDiffSnapshotPublisher(
+                engine: engine,
+                store: GitDiffSnapshotStore(),
+                vcsService: vcs
+            )
+            let repo = GitRepoDescriptor(rootURL: fixture.repo)
+
+            for (mode, expectedCommandCount) in [
+                (GitDiffPublishMode.quick, 7),
+                (.standard, 15),
+                (.deep, 15)
+            ] {
+                let snapshot = try await capture(operation: "artifact_\(mode.rawValue)") {
+                    _ = try await publisher.publish(
+                        workspaceDirectory: fixture.workspace,
+                        repo: repo,
+                        mode: mode,
+                        compareSpec: .uncommitted(base: "HEAD"),
+                        compareDisplay: "uncommitted:HEAD",
+                        compareInput: nil,
+                        scope: .all,
+                        selectedAbsolutePaths: [],
+                        contextLines: 3,
+                        detectRenames: false,
+                        snapshotIDOverride: "wi3-\(mode.rawValue)-\(UUID().uuidString)",
+                        tabID: nil
+                    )
+                }
+                XCTAssertEqual(
+                    snapshot.commandCount,
+                    expectedCommandCount,
+                    "\(mode.rawValue):\n\(snapshot.commands.joined(separator: "\n"))"
+                )
+            }
+        }
+
+        private func capture(
+            operation: String,
+            body: () async throws -> Void
+        ) async throws -> MCPToolWorkCountDiagnostics.GitInvocationSnapshot {
+            MCPToolWorkCountDiagnostics.resetForTesting()
+            try await MCPToolWorkCountDiagnostics.withGitInvocation(operation: operation, body)
+            return try XCTUnwrap(MCPToolWorkCountDiagnostics.debugSnapshots().git.last)
+        }
+    }
+
+    private struct GitWorkCountFixture {
+        let sandbox: URL
+        let repo: URL
+        let workspace: URL
+
+        init() throws {
+            sandbox = FileManager.default.temporaryDirectory
+                .appendingPathComponent("GitCommandWorkCountDiagnosticsTests-\(UUID().uuidString)", isDirectory: true)
+            repo = sandbox.appendingPathComponent("repo", isDirectory: true).standardizedFileURL
+            workspace = sandbox.appendingPathComponent("workspace", isDirectory: true).standardizedFileURL
+            try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+            try runGit(["init"], cwd: repo)
+            try runGit(["config", "user.name", "RepoPrompt Test"], cwd: repo)
+            try runGit(["config", "user.email", "repoprompt@example.test"], cwd: repo)
+            try runGit(["config", "commit.gpgSign", "false"], cwd: repo)
+            try runGit(["checkout", "-b", "main"], cwd: repo)
+            try "base\n".write(to: repo.appendingPathComponent("Tracked.txt"), atomically: true, encoding: .utf8)
+            try runGit(["add", "Tracked.txt"], cwd: repo)
+            try runGit(["commit", "-m", "Initial commit"], cwd: repo)
+            try "changed\n".write(to: repo.appendingPathComponent("Tracked.txt"), atomically: true, encoding: .utf8)
+            try "untracked\n".write(to: repo.appendingPathComponent("Untracked.txt"), atomically: true, encoding: .utf8)
+        }
+
+        func cleanup() {
+            try? FileManager.default.removeItem(at: sandbox)
+        }
+
+        private func runGit(_ arguments: [String], cwd: URL) throws {
+            var environment = ProcessInfo.processInfo.environment
+            environment["GIT_CONFIG_NOSYSTEM"] = "1"
+            environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
+            environment["GIT_TERMINAL_PROMPT"] = "0"
+            let result = try TestProcessRunner.run(
+                executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+                arguments: arguments,
+                currentDirectoryURL: cwd,
+                environment: environment
+            )
+            guard result.terminationStatus == 0 else {
+                throw NSError(
+                    domain: "GitCommandWorkCountDiagnosticsTests.git",
+                    code: Int(result.terminationStatus),
+                    userInfo: [NSLocalizedDescriptionKey: result.outputText]
+                )
+            }
+        }
+    }
+#endif

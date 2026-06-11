@@ -137,6 +137,13 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
     }
 
     private func executeGitTool(args: [String: Value], connectionID: UUID?) async throws -> ToolResultDTOs.GitToolReplyDTO {
+        let operation = args["op"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "status"
+        return try await MCPToolWorkCountDiagnostics.withGitInvocation(operation: operation) { [self] in
+            try await executeGitToolBody(args: args, connectionID: connectionID)
+        }
+    }
+
+    private func executeGitToolBody(args: [String: Value], connectionID: UUID?) async throws -> ToolResultDTOs.GitToolReplyDTO {
         typealias Reply = ToolResultDTOs.GitToolReplyDTO
 
         enum GitOp: String {
@@ -195,6 +202,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
 
         // For now, use primary repo for single-repo operations
         // Multi-root execution will be implemented for operations that benefit from it (status, diff)
+        MCPToolWorkCountDiagnostics.setGitRepositories(repos.map(\.repoKey))
         let primaryRepo = repos[0]
         let repoURL = primaryRepo.rootURL
         let isMultiRepo = repos.count > 1

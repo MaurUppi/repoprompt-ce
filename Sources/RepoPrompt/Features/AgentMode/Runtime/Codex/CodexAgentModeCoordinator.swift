@@ -4565,11 +4565,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
         let argsJSON = Self.encodeArgsToJSON(args)
         let canonicalToolName = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName) ?? toolName
+        var correlationPath = "none"
         let matchingIndex: Int? = {
             func namesMatch(_ candidate: String?) -> Bool {
                 (MCPIntegrationHelper.canonicalRepoPromptToolName(candidate) ?? candidate) == canonicalToolName
             }
             if let invocationID {
+                correlationPath = "invocation_id"
                 return session.items.lastIndex(where: {
                     ($0.kind == .toolCall || $0.kind == .toolResult)
                         && $0.toolInvocationID == invocationID
@@ -4592,14 +4594,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     argsJSON: $0.toolArgsJSON
                 ) == fallbackSignature
             }) {
+                correlationPath = "signature"
                 return argsMatchedIndex
             }
+            correlationPath = "name_fallback"
             return session.items.lastIndex(where: {
                 ($0.kind == .toolCall || $0.kind == .toolResult)
                     && $0.toolInvocationID == nil
                     && namesMatch($0.toolName)
             })
         }()
+        MCPToolObserverAttributionContext.record(
+            correlationPath: correlationPath,
+            scannedItemCount: session.items.count
+        )
         if let index = matchingIndex {
             // Prevent apply_patch terminal → running regression.
             if Self.shouldIgnoreApplyPatchRunningRegression(

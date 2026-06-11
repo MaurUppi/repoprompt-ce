@@ -3591,6 +3591,22 @@ final class MCPServerViewModel: ObservableObject {
         lineCount: Int? = nil,
         lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool) {
+        try await MCPToolWorkCountDiagnostics.withReadFileInvocation { [self] in
+            try await readFileBody(
+                path: path,
+                startLine1Based: startLine1Based,
+                lineCount: lineCount,
+                lookupRootScope: lookupRootScope
+            )
+        }
+    }
+
+    private func readFileBody(
+        path: String,
+        startLine1Based: Int? = nil,
+        lineCount: Int? = nil,
+        lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
+    ) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool) {
         try Task.checkCancellation()
         let store = promptVM.workspaceFileContextStore
         let readableService = WorkspaceReadableFileService(store: store)
@@ -3767,6 +3783,7 @@ final class MCPServerViewModel: ObservableObject {
 
         // If start is beyond file end, return empty content with a helpful message
         if !(first < total || total == 0) {
+            MCPToolWorkCountDiagnostics.recordReadFileResult(returnedBytes: 0, returnedLines: 0, cacheHit: false)
             return (
                 ToolResultDTOs.ReadFileReply(
                     content: "",
@@ -3792,6 +3809,11 @@ final class MCPServerViewModel: ObservableObject {
         let shownFirst = total == 0 ? 0 : (first + 1)
         let shownLast = total == 0 ? 0 : lastExclusive
 
+        MCPToolWorkCountDiagnostics.recordReadFileResult(
+            returnedBytes: contentSlice.utf8.count,
+            returnedLines: max(0, shownLast - shownFirst + (shownLast == 0 ? 0 : 1)),
+            cacheHit: false
+        )
         return (
             ToolResultDTOs.ReadFileReply(
                 content: contentSlice,
