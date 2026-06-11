@@ -1208,6 +1208,10 @@ actor WorkspaceFileContextStore {
             publisherIngressCoordinator.appliedSnapshot(rootID: rootID)
         }
 
+        func acceptedWatcherWatermarkForTesting(rootID: UUID) throws -> FileSystemWatcherIngressMailbox.Watermark {
+            try state(for: rootID).service.captureAcceptedWatcherWatermark()
+        }
+
         func publisherIngressDebugSnapshotForTesting(
             rootID: UUID
         ) -> WorkspaceFileSystemIngressCoordinator.DebugSnapshot {

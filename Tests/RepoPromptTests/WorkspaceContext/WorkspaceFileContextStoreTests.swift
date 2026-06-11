@@ -823,17 +823,18 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let record = try await store.loadRoot(path: root.path)
             try await store.startWatchingRoot(id: record.id)
             let baselineIngress = await store.appliedIngressSnapshotForTesting(rootID: record.id)
+            let baselineWatcherWatermark = try await store.acceptedWatcherWatermarkForTesting(rootID: record.id)
 
             try await store.publishSyntheticFileSystemDeltasForTesting(rootID: record.id, deltas: [.fileModified("Synthetic.swift", nil)])
             let samples = await store.awaitAppliedIngressForAllRoots()
             let sample = try XCTUnwrap(samples.first)
             let applied = await store.appliedIngressSnapshotForTesting(rootID: record.id)
 
-            XCTAssertEqual(sample.acceptedWatcherWatermark, baselineIngress.appliedWatcherWatermark.rawValue)
-            XCTAssertEqual(sample.appliedWatcherWatermark, baselineIngress.appliedWatcherWatermark.rawValue)
+            XCTAssertEqual(sample.acceptedWatcherWatermark, baselineWatcherWatermark.rawValue)
+            XCTAssertEqual(sample.appliedWatcherWatermark, baselineWatcherWatermark.rawValue)
             XCTAssertGreaterThan(sample.appliedServicePublicationSequence, baselineIngress.appliedServicePublicationSequence)
             XCTAssertGreaterThan(applied.appliedServicePublicationSequence, baselineIngress.appliedServicePublicationSequence)
-            XCTAssertEqual(applied.appliedWatcherWatermark, baselineIngress.appliedWatcherWatermark)
+            XCTAssertEqual(applied.appliedWatcherWatermark, baselineWatcherWatermark)
             let syntheticFile = await store.file(rootID: record.id, relativePath: "Synthetic.swift")
             XCTAssertNotNil(syntheticFile)
 
@@ -1733,7 +1734,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let record = try await store.loadRoot(path: root.path)
             try await store.startWatchingRoot(id: record.id)
             let rootID = record.id
-            let baselineIngress = await store.appliedIngressSnapshotForTesting(rootID: rootID)
+            let baselineWatcherWatermark = try await store.acceptedWatcherWatermarkForTesting(rootID: rootID)
             let flushGate = AsyncGate()
             await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
                 guard observedRootID == rootID else { return }
@@ -1799,7 +1800,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(statsWhileBlocked.coalescedSuccessorCount, 1)
             XCTAssertEqual(flightCountWhileBlocked, 2)
             XCTAssertEqual(flushStartCountWhileBlocked, 1)
-            XCTAssertEqual(active.targetWatcherWatermark, baselineIngress.appliedWatcherWatermark.rawValue)
+            XCTAssertEqual(active.targetWatcherWatermark, baselineWatcherWatermark.rawValue)
             XCTAssertEqual(pending.targetWatcherWatermark, secondAccepted.rawValue)
             XCTAssertEqual(pending.targetServicePublicationSequence, acceptedServicePublicationSequence)
             XCTAssertEqual(pending.ageMilliseconds, 175)
@@ -1820,7 +1821,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(settledFlushStartCount, 2)
             XCTAssertEqual(
                 firstSamples.first?.acceptedWatcherWatermark,
-                baselineIngress.appliedWatcherWatermark.rawValue
+                baselineWatcherWatermark.rawValue
             )
             XCTAssertEqual(secondSample.acceptedWatcherWatermark, secondAccepted.rawValue)
             XCTAssertEqual(thirdSample.acceptedWatcherWatermark, secondAccepted.rawValue)
