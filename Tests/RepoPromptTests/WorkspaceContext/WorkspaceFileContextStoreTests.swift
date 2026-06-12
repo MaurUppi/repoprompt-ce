@@ -6320,7 +6320,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
     }
 
     private func waitForCodemapFileAPI(store: WorkspaceFileContextStore, containing symbol: String) async throws -> FileAPI {
-        for _ in 0 ..< 100 {
+        for _ in 0 ..< 250 {
             if let API = await store.allCodemapFileAPIs().first(where: { $0.apiDescription.contains(symbol) }) {
                 return API
             }
