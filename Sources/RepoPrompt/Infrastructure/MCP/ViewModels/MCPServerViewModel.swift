@@ -781,14 +781,15 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return context.selection }
             return await stabilizedVirtualSelection(for: context)
         },
-        buildCurrentSelectionReply: { [weak self] includeBlocks, display, extraInvalid, viewMode, resolvedContext in
+        buildCurrentSelectionReply: { [weak self] includeBlocks, display, extraInvalid, viewMode, resolvedContext, lookupContext in
             guard let self else { throw MCPError.internalError("Window deallocated while building selection reply") }
             return await buildCurrentSelectionReply(
                 includeBlocks: includeBlocks,
                 display: display,
                 extraInvalid: extraInvalid,
                 viewMode: viewMode,
-                resolvedContext: resolvedContext
+                resolvedContext: resolvedContext,
+                lookupContext: lookupContext
             )
         },
         buildSelectionPreviewReply: { [weak self] selection, includeBlocks, display, extraInvalid, viewMode, codeMapUsageOverride, lookupContext in
@@ -803,9 +804,9 @@ final class MCPServerViewModel: ObservableObject {
                 lookupContext: lookupContext
             )
         },
-        buildSelectionMutationReply: { [weak self] selection, includeBlocks, display, extraInvalid, viewMode, codeMapUsageOverride, virtualContext in
+        buildSelectionMutationReply: { [weak self] selection, includeBlocks, display, extraInvalid, viewMode, codeMapUsageOverride, virtualContext, lookupContext in
             guard let self else { throw MCPError.internalError("Window deallocated while building selection mutation reply") }
-            return await buildTabSelectionReply(
+            return await buildSelectionMutationReply(
                 from: selection,
                 includeBlocks: includeBlocks,
                 display: display,
@@ -813,7 +814,7 @@ final class MCPServerViewModel: ObservableObject {
                 viewMode: viewMode,
                 codeMapUsageOverride: codeMapUsageOverride,
                 virtualContext: virtualContext,
-                ingressPolicy: .alreadyAwaited
+                lookupContext: lookupContext
             )
         },
         buildManageSelectionSetSelection: { [weak self] inputs, mode, existing, lookupRootScope in
