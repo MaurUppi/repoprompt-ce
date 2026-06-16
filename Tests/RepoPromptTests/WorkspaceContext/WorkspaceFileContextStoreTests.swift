@@ -1196,21 +1196,29 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
         func testAcceptedCallbackBeforeActorEntryDelaysBarrierUntilCanonicalApply() async throws {
             let root = try makeTemporaryRoot(name: "AcceptedCallbackCanonicalBarrier")
+            let addedFileURL = root.appendingPathComponent("BeforeActorEntry.swift")
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
-            try await store.startWatchingRoot(id: record.id)
+            let rootID = record.id
+            let attached = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(rootID: rootID)
+            XCTAssertTrue(attached)
+            try write("accepted", to: addedFileURL)
 
             let sinkGate = AsyncGate()
             let barrierCompleted = AsyncSignal()
-            let rootID = record.id
             await store.setWatcherSinkWillApplyHandler { observedRootID in
                 guard observedRootID == rootID else { return }
                 await sinkGate.markStartedAndWaitForRelease()
             }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.stopWatchingRoot(id: rootID)
+            }
 
             let acceptedPayload = try await store.acceptWatcherPayloadForTesting(
                 rootID: rootID,
-                events: [(absolutePath: "/outside/before-actor-entry.swift", flags: createdFileFlags, eventId: 100)],
+                events: [(absolutePath: addedFileURL.path, flags: createdFileFlags, eventId: 100)],
                 scheduleDrain: false
             )
             let accepted = try XCTUnwrap(acceptedPayload)
@@ -1228,9 +1236,6 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let sample = try XCTUnwrap(samples.first)
             XCTAssertEqual(sample.acceptedWatcherWatermark, accepted.rawValue)
             XCTAssertGreaterThanOrEqual(sample.appliedWatcherWatermark, accepted.rawValue)
-
-            await store.setWatcherSinkWillApplyHandler(nil)
-            await store.stopWatchingRoot(id: rootID)
         }
 
         func testBarrierCaptureCutExcludesCallbackAcceptedAfterCaptureUntilNextBarrier() async throws {
