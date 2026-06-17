@@ -566,13 +566,11 @@ func contextBuilderFollowUpChatID(for dto: ToolResultDTOs.ContextBuilderDTO?) ->
 
     switch responseType {
     case "review":
-        return reviewChatID ?? planChatID
-    case "plan":
-        return planChatID ?? reviewChatID
+        return reviewChatID
+    case "plan", "question":
+        return planChatID
     default:
-        // Legacy payloads did not always include response_type; preserve the prior
-        // plan-first fallback unless the payload only contains a review branch.
-        return planChatID ?? reviewChatID
+        return nil
     }
 }
 

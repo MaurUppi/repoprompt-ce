@@ -1423,6 +1423,14 @@ enum AgentToolResultPersistencePolicy {
                 renderSummary: renderSummary
             )
         }
+        if normalizedToolName == "context_builder",
+           let rawOutput = rawObject?["rawOutput"] as? [String: Any]
+        {
+            return contextBuilderSummaryJSON(
+                statusWord: statusWord,
+                rawObject: rawOutput
+            )
+        }
         if let cursorSummaryJSON = cursorACPSummaryJSON(
             normalizedToolName: normalizedToolName,
             statusWord: statusWord,
@@ -2102,16 +2110,15 @@ enum AgentToolResultPersistencePolicy {
             object["response_type"] = responseType
         }
 
-        let normalizedResponseType = responseType?.lowercased()
-        let preferredKeys: [String] = switch normalizedResponseType {
-        case "review": ["review", "plan"]
-        case "plan", "question": ["plan", "review"]
-        default: ["plan", "review"]
+        let selectedKey: String? = switch responseType?.lowercased() {
+        case "review": "review"
+        case "plan", "question": "plan"
+        default: nil
         }
-        for key in preferredKeys {
-            guard let reply = boundedContextBuilderReply(rawObject[key] as? [String: Any]) else { continue }
-            object[key] = reply
-            break
+        if let selectedKey,
+           let reply = boundedContextBuilderReply(rawObject[selectedKey] as? [String: Any])
+        {
+            object[selectedKey] = reply
         }
 
         guard let json = jsonString(from: object), !exceedsPersistedToolSummaryBudget(json) else {

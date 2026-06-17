@@ -4,14 +4,18 @@ import XCTest
 final class OracleOperationToolCardRoutingTests: XCTestCase {
     func testContextBuilderSelectsExactPlanOrReviewChatID() throws {
         let planDTO = try contextBuilderDTO(responseType: "plan")
+        let questionDTO = try contextBuilderDTO(responseType: "question")
         let reviewDTO = try contextBuilderDTO(responseType: "review")
 
         XCTAssertEqual(contextBuilderFollowUpChatID(for: planDTO), "plan-chat")
+        XCTAssertEqual(contextBuilderFollowUpChatID(for: questionDTO), "plan-chat")
         XCTAssertEqual(contextBuilderFollowUpChatID(for: reviewDTO), "review-chat")
 
         let tabID = UUID()
+        let workspaceID = UUID()
         let openContext = AgentOracleOpenContext(
             windowID: 42,
+            workspaceID: workspaceID,
             tabID: tabID,
             chatID: "ambient-chat"
         )
@@ -21,6 +25,7 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         ))
 
         XCTAssertEqual(userInfo["windowID"] as? Int, 42)
+        XCTAssertEqual(userInfo["workspaceID"] as? UUID, workspaceID)
         XCTAssertEqual(userInfo["tabID"] as? UUID, tabID)
         XCTAssertEqual(userInfo["chatID"] as? String, "review-chat")
     }
@@ -28,18 +33,28 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
     func testContextBuilderOperationRoutingRejectsMissingOrBlankChatIDWithoutAmbientFallback() {
         let openContext = AgentOracleOpenContext(
             windowID: 42,
+            workspaceID: UUID(),
             tabID: UUID(),
             chatID: "ambient-chat"
         )
 
         XCTAssertNil(contextBuilderOraclePopoverUserInfo(openContext: openContext, chatID: nil))
         XCTAssertNil(contextBuilderOraclePopoverUserInfo(openContext: openContext, chatID: "   \n"))
+        XCTAssertNil(contextBuilderOraclePopoverUserInfo(
+            openContext: AgentOracleOpenContext(windowID: 42, workspaceID: nil, tabID: UUID()),
+            chatID: "exact-chat"
+        ))
+        XCTAssertNil(contextBuilderOraclePopoverUserInfo(
+            openContext: AgentOracleOpenContext(windowID: 42, workspaceID: UUID(), tabID: nil),
+            chatID: "exact-chat"
+        ))
     }
 
     func testDirectOracleResultRoutingRequiresExactResultChatID() throws {
         let tabID = UUID()
         let openContext = AgentOracleOpenContext(
             windowID: 7,
+            workspaceID: UUID(),
             tabID: tabID,
             chatID: "ambient-chat"
         )
@@ -94,6 +109,7 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
     func testOracleToolCallRoutingRequiresExactArgumentChatID() throws {
         let openContext = AgentOracleOpenContext(
             windowID: 9,
+            workspaceID: UUID(),
             tabID: UUID(),
             chatID: "ambient-chat"
         )
@@ -128,6 +144,60 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             ),
             openContext: openContext
         ))
+    }
+
+    func testDirectOracleRoutingRejectsNestedAliasedAndConflictingChatIDs() {
+        let openContext = AgentOracleOpenContext(
+            windowID: 11,
+            workspaceID: UUID(),
+            tabID: UUID()
+        )
+
+        let rejectedPayloads: [[String: Any]] = [
+            ["result": ["chat_id": "nested-only"]],
+            ["chatID": "camel-only"],
+            ["chat_id": 42],
+            ["chat_id": "authoritative", "result": ["chat_id": "conflict"]],
+            ["chat_id": "authoritative", "items": [["chatID": "conflict"]]]
+        ]
+
+        for payload in rejectedPayloads {
+            XCTAssertNil(oracleToolResultPopoverUserInfo(
+                item: toolResultItem(toolName: "ask_oracle", payload: payload),
+                openContext: openContext
+            ))
+            XCTAssertNil(oracleToolCallPopoverUserInfo(
+                item: AgentChatItem(
+                    kind: .toolCall,
+                    text: "",
+                    toolName: "oracle_send",
+                    toolArgsJSON: jsonString(payload)
+                ),
+                openContext: openContext
+            ))
+        }
+    }
+
+    func testContextBuilderRoutingRejectsMismatchedOrUnknownResponseBranch() throws {
+        let reviewWithPlanOnly = try XCTUnwrap(ToolJSON.decode(
+            ToolResultDTOs.ContextBuilderDTO.self,
+            from: jsonString([
+                "status": "success",
+                "response_type": "review",
+                "plan": ["chat_id": "wrong-plan-chat", "mode": "plan"]
+            ])
+        ))
+        let unknownWithPlan = try XCTUnwrap(ToolJSON.decode(
+            ToolResultDTOs.ContextBuilderDTO.self,
+            from: jsonString([
+                "status": "success",
+                "response_type": "clarify",
+                "plan": ["chat_id": "wrong-plan-chat", "mode": "plan"]
+            ])
+        ))
+
+        XCTAssertNil(contextBuilderFollowUpChatID(for: reviewWithPlanOnly))
+        XCTAssertNil(contextBuilderFollowUpChatID(for: unknownWithPlan))
     }
 
     private func contextBuilderDTO(responseType: String) throws -> ToolResultDTOs.ContextBuilderDTO {

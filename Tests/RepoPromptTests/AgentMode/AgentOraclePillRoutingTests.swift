@@ -7,12 +7,14 @@ final class AgentOraclePillRoutingTests: XCTestCase {
     func testExplicitRequestStateRejectsBlankStaleTabAndMismatchedSession() throws {
         let tabID = UUID()
         let otherTabID = UUID()
-        let session = ChatSession(composeTabID: tabID, name: "Exact Session")
-        let otherSession = ChatSession(composeTabID: tabID, name: "Other Session")
+        let workspaceID = UUID()
+        let session = ChatSession(workspaceID: workspaceID, composeTabID: tabID, name: "Exact Session")
+        let otherSession = ChatSession(workspaceID: workspaceID, composeTabID: tabID, name: "Other Session")
 
         XCTAssertNil(
             AgentOraclePillLogic.explicitOpenRequest(
                 chatID: "  \n ",
+                workspaceID: workspaceID,
                 tabID: tabID,
                 generation: 1
             )
@@ -21,6 +23,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         let request = try XCTUnwrap(
             AgentOraclePillLogic.explicitOpenRequest(
                 chatID: session.id.uuidString.lowercased(),
+                workspaceID: workspaceID,
                 tabID: tabID,
                 generation: 4
             )
@@ -30,6 +33,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
                 session: session,
                 for: request,
                 currentGeneration: 4,
+                currentWorkspaceID: workspaceID,
                 currentTabID: tabID
             )
         )
@@ -38,14 +42,24 @@ final class AgentOraclePillRoutingTests: XCTestCase {
                 session: session,
                 for: request,
                 currentGeneration: 5,
+                currentWorkspaceID: workspaceID,
                 currentTabID: tabID
             )
         )
+        XCTAssertNil(AgentOraclePillLogic.reconciledPresentedSessionID(
+            currentSessionID: session.id,
+            isExplicit: true,
+            currentWorkspaceID: UUID(),
+            sameTabSessions: [session],
+            eligibleSessions: [session],
+            streamingSessionIDs: []
+        ))
         XCTAssertFalse(
             AgentOraclePillLogic.shouldPresent(
                 session: session,
                 for: request,
                 currentGeneration: 4,
+                currentWorkspaceID: workspaceID,
                 currentTabID: otherTabID
             )
         )
@@ -54,6 +68,16 @@ final class AgentOraclePillRoutingTests: XCTestCase {
                 session: otherSession,
                 for: request,
                 currentGeneration: 4,
+                currentWorkspaceID: workspaceID,
+                currentTabID: tabID
+            )
+        )
+        XCTAssertFalse(
+            AgentOraclePillLogic.shouldPresent(
+                session: session,
+                for: request,
+                currentGeneration: 4,
+                currentWorkspaceID: UUID(),
                 currentTabID: tabID
             )
         )
@@ -89,12 +113,14 @@ final class AgentOraclePillRoutingTests: XCTestCase {
 
         let byUUID = await fixture.oracleViewModel.resolveExactSessionForPopover(
             chatID: exact.id.uuidString.lowercased(),
+            workspaceID: fixture.workspace.id,
             tabID: fixture.tabID
         )
         XCTAssertEqual(byUUID?.id, exact.id)
 
         let byShortID = await fixture.oracleViewModel.resolveExactSessionForPopover(
             chatID: exact.shortID,
+            workspaceID: fixture.workspace.id,
             tabID: fixture.tabID
         )
         XCTAssertEqual(byShortID?.id, exact.id)
@@ -127,6 +153,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
 
         let byShortID = await fixture.oracleViewModel.resolveExactSessionForPopover(
             chatID: persisted.shortID,
+            workspaceID: fixture.workspace.id,
             tabID: fixture.tabID
         )
         XCTAssertEqual(byShortID?.id, persisted.id)
@@ -139,6 +166,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         fixture.oracleViewModel.sessions = [distractor]
         let byUUID = await fixture.oracleViewModel.resolveExactSessionForPopover(
             chatID: persisted.id.uuidString.lowercased(),
+            workspaceID: fixture.workspace.id,
             tabID: fixture.tabID
         )
         XCTAssertEqual(byUUID?.id, persisted.id)
@@ -167,6 +195,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
 
         let collisionResult = await fixture.oracleViewModel.resolveExactSessionForPopover(
             chatID: collidingShortID,
+            workspaceID: fixture.workspace.id,
             tabID: fixture.tabID
         )
         XCTAssertEqual(collisionResult?.id, persistedCollision.id)
@@ -198,12 +227,14 @@ final class AgentOraclePillRoutingTests: XCTestCase {
 
         let wrongTabResult = await fixture.oracleViewModel.resolveExactSessionForPopover(
             chatID: wrongTab.shortID,
+            workspaceID: fixture.workspace.id,
             tabID: fixture.tabID
         )
         XCTAssertNil(wrongTabResult)
 
         let unknownResult = await fixture.oracleViewModel.resolveExactSessionForPopover(
             chatID: UUID().uuidString,
+            workspaceID: fixture.workspace.id,
             tabID: fixture.tabID
         )
         XCTAssertNil(unknownResult)
@@ -225,6 +256,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
 
         let staleDiskResult = await fixture.oracleViewModel.resolveExactSessionForPopover(
             chatID: persistedBeforeReassignment.shortID,
+            workspaceID: fixture.workspace.id,
             tabID: fixture.tabID
         )
         XCTAssertNil(staleDiskResult)
@@ -234,15 +266,89 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         )
     }
 
+    func testExactResolutionRejectsSameTabShortIDCollisionsInMemoryAndOnDisk() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+
+        let sharedShortID = "same-tab-collision"
+        let first = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            name: "First Collision",
+            messages: [StoredMessage(isUser: false, rawText: "first", sequenceIndex: 0)],
+            shortID: sharedShortID
+        )
+        let second = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            name: "Second Collision",
+            messages: [StoredMessage(isUser: false, rawText: "second", sequenceIndex: 0)],
+            shortID: sharedShortID
+        )
+
+        fixture.oracleViewModel.sessions = [first, second]
+        let inMemoryCollision = await fixture.oracleViewModel.resolveExactSessionForPopover(
+            chatID: sharedShortID,
+            workspaceID: fixture.workspace.id,
+            tabID: fixture.tabID
+        )
+        XCTAssertNil(inMemoryCollision)
+
+        _ = try await fixture.oracleViewModel.chatData.saveChatSession(first, for: fixture.workspace)
+        _ = try await fixture.oracleViewModel.chatData.saveChatSession(second, for: fixture.workspace)
+        fixture.oracleViewModel.sessions = [first]
+        let mixedCollision = await fixture.oracleViewModel.resolveExactSessionForPopover(
+            chatID: sharedShortID,
+            workspaceID: fixture.workspace.id,
+            tabID: fixture.tabID
+        )
+        XCTAssertNil(mixedCollision)
+
+        fixture.oracleViewModel.sessions = []
+        let persistedCollision = await fixture.oracleViewModel.resolveExactSessionForPopover(
+            chatID: sharedShortID,
+            workspaceID: fixture.workspace.id,
+            tabID: fixture.tabID
+        )
+        XCTAssertNil(persistedCollision)
+    }
+
+    func testExactResolutionRejectsWorkspaceMismatch() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+
+        let session = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            name: "Workspace Bound",
+            messages: [StoredMessage(isUser: false, rawText: "workspace", sequenceIndex: 0)]
+        )
+        fixture.oracleViewModel.sessions = [session]
+
+        let wrongWorkspace = await fixture.oracleViewModel.resolveExactSessionForPopover(
+            chatID: session.shortID,
+            workspaceID: UUID(),
+            tabID: fixture.tabID
+        )
+        XCTAssertNil(wrongWorkspace)
+    }
+
+    private static var nextFixtureWindowID = -1200
+
+    private static func allocateFixtureWindowID() -> Int {
+        nextFixtureWindowID -= 1
+        return nextFixtureWindowID
+    }
+
     private func makeFixture() async throws -> Fixture {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
         let composition = WindowStateCompositionFactory.make(
-            windowID: -1200 - Int.random(in: 1 ... 99),
+            windowID: Self.allocateFixtureWindowID(),
             deferredInitialAgentSystemWorkspaceRefresh: true,
             sharedMCPService: MCPService()
         )
-        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         await composition.workspaceManager.awaitInitialized()
 
         let storageRoot = FileManager.default.temporaryDirectory
@@ -282,6 +388,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         }
 
         func cleanup() {
+            oracleViewModel.sessions = []
             try? FileManager.default.removeItem(at: storageRoot)
         }
     }

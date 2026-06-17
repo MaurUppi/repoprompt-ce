@@ -5,18 +5,10 @@ func oracleToolResultPopoverUserInfo(
     item: AgentChatItem,
     openContext: AgentOracleOpenContext?
 ) -> [AnyHashable: Any]? {
-    let chatID = AgentOracleToolRouting.stringValue(
-        from: item.toolResultJSON,
-        keys: ["chat_id", "chatID"]
-    )
-    let resultTabID = AgentOracleToolRouting.stringValue(
-        from: item.toolResultJSON,
-        keys: ["context_id", "tab_id", "tabID"]
-    ).flatMap(UUID.init(uuidString:))
+    let chatID = AgentOracleToolRouting.authoritativeChatID(from: item.toolResultJSON)
     return AgentOracleToolRouting.operationPopoverUserInfo(
         openContext: openContext,
-        chatID: chatID,
-        tabID: openContext?.tabID ?? resultTabID
+        chatID: chatID
     )
 }
 

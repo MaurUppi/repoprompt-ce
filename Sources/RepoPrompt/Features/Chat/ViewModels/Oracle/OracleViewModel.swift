@@ -612,16 +612,29 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
-    func resolveExactSessionForPopover(chatID rawID: String, tabID: UUID) async -> ChatSession? {
+    func resolveExactSessionForPopover(
+        chatID rawID: String,
+        workspaceID: UUID,
+        tabID: UUID
+    ) async -> ChatSession? {
         let trimmedID = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedID.isEmpty else { return nil }
+        guard !trimmedID.isEmpty,
+              workspaceManager.activeWorkspaceID == workspaceID,
+              let workspace = workspaceManager.activeWorkspace,
+              workspace.id == workspaceID
+        else { return nil }
 
         let targetUUID = UUID(uuidString: trimmedID)
         func matchesIdentity(_ session: ChatSession) -> Bool {
-            session.shortID == trimmedID || targetUUID.map { session.id == $0 } == true
+            if let targetUUID {
+                return session.id == targetUUID
+            }
+            return session.shortID == trimmedID
         }
         func matchesRequestedTab(_ session: ChatSession) -> Bool {
-            matchesIdentity(session) && session.composeTabID == tabID
+            matchesIdentity(session)
+                && session.workspaceID == workspaceID
+                && session.composeTabID == tabID
         }
         func registeredMatch(for sessionID: UUID) -> ChatSession? {
             sessions.first(where: { $0.id == sessionID }).flatMap { session in
@@ -629,41 +642,57 @@ class OracleViewModel: ObservableObject {
             }
         }
 
-        let inMemoryMatches = sessions.filter(matchesIdentity)
-        if let inMemory = inMemoryMatches.first(where: matchesRequestedTab) {
-            guard let loaded = await ensureSessionLoadedForBackground(inMemory), matchesRequestedTab(loaded) else {
-                return nil
-            }
+        let initialIdentityMatches = sessions.filter(matchesIdentity)
+        let initialScopedMatches = initialIdentityMatches.filter(matchesRequestedTab)
+        guard initialScopedMatches.count <= 1 else { return nil }
+        if targetUUID != nil, let inMemory = initialScopedMatches.first {
+            guard initialIdentityMatches.count == 1,
+                  let loaded = await ensureSessionLoadedForBackground(inMemory),
+                  matchesRequestedTab(loaded)
+            else { return nil }
             return registeredMatch(for: loaded.id)
         }
-        if targetUUID != nil {
-            guard inMemoryMatches.isEmpty else { return nil }
-        }
+        if targetUUID != nil, !initialIdentityMatches.isEmpty { return nil }
 
-        guard let workspace = workspaceManager.activeWorkspace else { return nil }
-        let workspaceID = workspace.id
-        guard let persisted = try? await chatData.findSession(
-            for: workspace,
-            id: trimmedID,
-            composeTabID: tabID
-        ) else {
+        let persistedLookup: ChatSessionLookupResult
+        do {
+            persistedLookup = try await chatData.findSessionResult(
+                for: workspace,
+                id: trimmedID,
+                composeTabID: tabID
+            )
+        } catch {
             return nil
         }
-        guard workspaceManager.activeWorkspaceID == workspaceID, matchesRequestedTab(persisted) else { return nil }
-
-        let refreshedInMemoryMatches = sessions.filter(matchesIdentity)
-        if refreshedInMemoryMatches.contains(where: { $0.id == persisted.id && !matchesRequestedTab($0) }) {
+        guard workspaceManager.activeWorkspaceID == workspaceID else { return nil }
+        let persisted: ChatSession?
+        switch persistedLookup {
+        case .notFound:
+            persisted = nil
+        case let .unique(session):
+            persisted = session
+        case .ambiguous:
             return nil
         }
-        if let inMemory = refreshedInMemoryMatches.first(where: matchesRequestedTab) {
-            guard let loaded = await ensureSessionLoadedForBackground(inMemory), matchesRequestedTab(loaded) else {
-                return nil
-            }
+        if let persisted, !matchesRequestedTab(persisted) { return nil }
+
+        let refreshedIdentityMatches = sessions.filter(matchesIdentity)
+        let refreshedScopedMatches = refreshedIdentityMatches.filter(matchesRequestedTab)
+        guard refreshedScopedMatches.count <= 1 else { return nil }
+        if let persisted,
+           refreshedIdentityMatches.contains(where: { $0.id == persisted.id && !matchesRequestedTab($0) })
+        {
+            return nil
+        }
+        if let inMemory = refreshedScopedMatches.first {
+            guard persisted.map({ $0.id == inMemory.id }) ?? true,
+                  let loaded = await ensureSessionLoadedForBackground(inMemory),
+                  matchesRequestedTab(loaded)
+            else { return nil }
             return registeredMatch(for: loaded.id)
         }
-        if targetUUID != nil {
-            guard refreshedInMemoryMatches.isEmpty else { return nil }
-        }
+        if targetUUID != nil, !refreshedIdentityMatches.isEmpty { return nil }
+        guard let persisted else { return nil }
 
         sessions.append(persisted)
         guard let loaded = await ensureSessionLoadedForBackground(persisted), matchesRequestedTab(loaded) else {

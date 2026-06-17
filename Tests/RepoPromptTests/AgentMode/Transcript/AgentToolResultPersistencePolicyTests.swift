@@ -56,6 +56,7 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
     func testContextBuilderPersistsOnlySelectedBoundedFollowUpRoutingMetadata() throws {
         let rows: [(responseType: String, selectedKey: String, chatID: String, mode: String)] = [
             ("plan", "plan", "plan-chat", "plan"),
+            ("question", "plan", "plan-chat", "plan"),
             ("review", "review", "review-chat", "review")
         ]
 
@@ -115,6 +116,87 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
                 row.responseType
             )
         }
+    }
+
+    func testCursorContextBuilderPersistenceReloadPreservesSelectedOracleIdentity() throws {
+        let rows: [(responseType: String, selectedKey: String, chatID: String, mode: String)] = [
+            ("plan", "plan", "cursor-plan-chat", "plan"),
+            ("question", "plan", "cursor-plan-chat", "plan"),
+            ("review", "review", "cursor-review-chat", "review")
+        ]
+
+        for row in rows {
+            let bulkyResponse = String(repeating: "cursor generated response ", count: 200)
+            let events = CursorACPEventNormalizer.normalize([
+                "sessionUpdate": "tool_call_update",
+                "status": "completed",
+                "toolCallId": "cursor-context-builder-\(row.responseType)",
+                "toolName": "context_builder",
+                "kind": "message",
+                "title": "Context builder result",
+                "rawOutput": [
+                    "status": "success",
+                    "context_id": "11111111-2222-3333-4444-555555555555",
+                    "response_type": row.responseType,
+                    "plan": [
+                        "chat_id": "cursor-plan-chat",
+                        "mode": "plan",
+                        "response": bulkyResponse
+                    ],
+                    "review": [
+                        "chat_id": "cursor-review-chat",
+                        "mode": "review",
+                        "response": bulkyResponse
+                    ]
+                ],
+                "content": [[
+                    "type": "text",
+                    "text": "cursor acp context builder payload"
+                ]]
+            ])
+            guard case let .stream(result) = try XCTUnwrap(events.first) else {
+                return XCTFail("Expected normalized Cursor ACP stream event for \(row.responseType)")
+            }
+            let raw = try XCTUnwrap(result.toolResultJSON)
+            let item = AgentChatItem.toolResult(
+                name: "context_builder",
+                resultJSON: raw,
+                isError: false
+            )
+            let persistedData = try JSONEncoder().encode(AgentChatItemPersist(from: item))
+            let restored = try JSONDecoder().decode(AgentChatItemPersist.self, from: persistedData).toItem()
+            let restoredJSON = try XCTUnwrap(restored.toolResultJSON)
+            let object = try decodedObject(restoredJSON)
+            let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: restoredJSON))
+            let selectedDTO = row.selectedKey == "plan" ? dto.plan : dto.review
+
+            XCTAssertEqual(dto.tabID, "11111111-2222-3333-4444-555555555555", row.responseType)
+            XCTAssertEqual(dto.responseType, row.responseType, row.responseType)
+            XCTAssertEqual(selectedDTO?.chatID, row.chatID, row.responseType)
+            XCTAssertEqual(selectedDTO?.mode, row.mode, row.responseType)
+            XCTAssertNil(object[row.selectedKey == "plan" ? "review" : "plan"], row.responseType)
+            XCTAssertFalse(restoredJSON.contains(bulkyResponse), row.responseType)
+            XCTAssertLessThanOrEqual(
+                restoredJSON.utf8.count,
+                AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes,
+                row.responseType
+            )
+        }
+    }
+
+    func testContextBuilderPersistenceRejectsMismatchedResponseBranch() throws {
+        let raw = jsonString([
+            "status": "success",
+            "response_type": "review",
+            "plan": ["chat_id": "wrong-plan-chat", "mode": "plan"]
+        ])
+
+        let summary = try XCTUnwrap(persistedSummary(toolName: "context_builder", rawResultJSON: raw))
+        let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: summary.resultJSON))
+
+        XCTAssertEqual(dto.responseType, "review")
+        XCTAssertNil(dto.plan)
+        XCTAssertNil(dto.review)
     }
 
     func testOversizedStructuredSummaryFallsBackToMinimalResultJSON() throws {
@@ -201,6 +283,38 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
                 AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes,
                 toolName
             )
+        }
+
+        let invalidRawOutputs: [[String: Any]] = [
+            ["result": ["chat_id": "nested-only"]],
+            ["chat_id": "authoritative", "result": ["chat_id": "conflict"]]
+        ]
+        for rawOutput in invalidRawOutputs {
+            let events = CursorACPEventNormalizer.normalize([
+                "sessionUpdate": "tool_call_update",
+                "status": "completed",
+                "toolCallId": "oracle-routing-invalid",
+                "toolName": "ask_oracle",
+                "kind": "message",
+                "rawOutput": rawOutput
+            ])
+            guard case let .stream(result) = try XCTUnwrap(events.first) else {
+                return XCTFail("Expected normalized Cursor ACP stream event")
+            }
+            let raw = try XCTUnwrap(result.toolResultJSON)
+            let item = AgentChatItem.toolResult(name: "ask_oracle", resultJSON: raw, isError: false)
+            let restored = AgentChatItemPersist(from: item).toItem()
+            let restoredObject = try decodedObject(XCTUnwrap(restored.toolResultJSON))
+
+            XCTAssertNil(restoredObject["chat_id"])
+            XCTAssertNil(oracleToolResultPopoverUserInfo(
+                item: restored,
+                openContext: AgentOracleOpenContext(
+                    windowID: 1,
+                    workspaceID: UUID(),
+                    tabID: UUID()
+                )
+            ))
         }
     }
 
