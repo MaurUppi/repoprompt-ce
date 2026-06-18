@@ -32,7 +32,12 @@ extension AgentModeViewModel {
         now: Date = Date()
     ) async -> Set<UUID> {
         guard ownerValidatedSessionListCacheReady, canRunSidebarAutoArchive, !isApplyingSidebarAutoArchive else { return [] }
-        guard let promptManager, workspaceManager?.activeWorkspace != nil else { return [] }
+        guard let promptManager,
+              let workspaceID = workspaceManager?.activeWorkspace?.id,
+              let owner = sidebarAutoArchiveOwner(workspaceID: workspaceID)
+        else {
+            return []
+        }
 
         let openTabs = promptManager.currentComposeTabs
         let sidebarRows = sidebarSessions(for: openTabs)
@@ -52,8 +57,14 @@ extension AgentModeViewModel {
         defer { isApplyingSidebarAutoArchive = false }
 
         let archivedTabIDs = await promptManager.autoArchiveComposeTabsForSidebarPolicy(
-            withIDs: decision.tabIDsToArchive
+            withIDs: decision.tabIDsToArchive,
+            expectedWorkspaceID: workspaceID,
+            isArchiveContextCurrent: { [weak self] in
+                guard !Task.isCancelled, let self else { return false }
+                return sidebarAutoArchiveOwner(workspaceID: workspaceID) == owner
+            }
         )
+        guard sidebarAutoArchiveOwner(workspaceID: workspaceID) == owner else { return [] }
         if !archivedTabIDs.isEmpty {
             syncSidebarUIState(refresh: true, reason: .sessionList)
         }

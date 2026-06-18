@@ -431,9 +431,12 @@ struct AgentModeSidebarSessionBuilder {
         liveSession: TabSession?,
         indexEntry: AgentSessionIndexEntry? = nil
     ) -> Date {
-        [tab.lastModified, liveSession?.lastActivityAt, indexEntry?.savedAt]
-            .compactMap(\.self)
-            .max() ?? tab.lastModified
+        if let liveSession {
+            return [tab.lastModified, liveSession.lastActivityAt, indexEntry?.savedAt]
+                .compactMap(\.self)
+                .max() ?? tab.lastModified
+        }
+        return indexEntry?.savedAt ?? tab.lastModified
     }
 
     private func finalizedSidebarRows(
@@ -578,11 +581,29 @@ struct AgentModeSidebarSessionBuilder {
             return priority
         }
 
+        var subtreeContainsPinnedByIndex: [Int: Bool] = [:]
+        func subtreeContainsPinned(_ index: Int) -> Bool {
+            if let cached = subtreeContainsPinnedByIndex[index] {
+                return cached
+            }
+            let containsPinned = flat[index].isPinned
+                || flat[index].sessionID
+                .flatMap { childrenByParent[$0] }?
+                .contains(where: subtreeContainsPinned) == true
+            subtreeContainsPinnedByIndex[index] = containsPinned
+            return containsPinned
+        }
+
         func emit(_ index: Int, depth: Int) {
             let session = flat[index]
             result.append(row(session, depth: depth))
             if let sid = session.sessionID, let children = childrenByParent[sid] {
                 let orderedChildren = children.sorted { lhs, rhs in
+                    let lhsContainsPinned = subtreeContainsPinned(lhs)
+                    let rhsContainsPinned = subtreeContainsPinned(rhs)
+                    if lhsContainsPinned != rhsContainsPinned {
+                        return lhsContainsPinned && !rhsContainsPinned
+                    }
                     let lhsIsActive = flat[lhs].tabID == activeTabID
                     let rhsIsActive = flat[rhs].tabID == activeTabID
                     if lhsIsActive != rhsIsActive {
@@ -598,10 +619,10 @@ struct AgentModeSidebarSessionBuilder {
 
         let rootIndices = flat.indices.filter { !isChild.contains($0) }
         for rootIndex in rootIndices.sorted(by: { lhs, rhs in
-            let lhsPinned = flat[lhs].isPinned
-            let rhsPinned = flat[rhs].isPinned
-            if lhsPinned != rhsPinned {
-                return lhsPinned && !rhsPinned
+            let lhsContainsPinned = subtreeContainsPinned(lhs)
+            let rhsContainsPinned = subtreeContainsPinned(rhs)
+            if lhsContainsPinned != rhsContainsPinned {
+                return lhsContainsPinned && !rhsContainsPinned
             }
             let lhsPriority = subtreePriority(for: lhs)
             let rhsPriority = subtreePriority(for: rhs)

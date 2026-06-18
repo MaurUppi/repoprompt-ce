@@ -652,6 +652,7 @@ final class AgentModeViewModel: ObservableObject {
     private var hasPreparedForWindowClose = false
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
     private static let sessionSidebarRestoreBatchSize = 32
+    private nonisolated static let sessionSidebarRestoreRetryLimit = 1
     nonisolated static let transcriptVisibleItemLimit = 50
     private nonisolated static let detachedTranscriptVisibleItemBuffer = 5
     private nonisolated static let detachedTranscriptEvictionChunkSize = 5
@@ -690,6 +691,18 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_setCurrentTabIDOverride(_ tabID: UUID?) {
             test_currentTabIDOverride = tabID
+        }
+
+        func test_setSidebarAutoArchiveDependencies(
+            promptManager: PromptViewModel,
+            workspaceManager: WorkspaceManagerViewModel
+        ) {
+            self.promptManager = promptManager
+            self.workspaceManager = workspaceManager
+        }
+
+        func test_setSidebarAutoArchiveActive(_ isActive: Bool) {
+            isAgentModeActive = isActive
         }
 
         func test_setAllowsScheduledDerivedTranscriptRefreshWithoutPromptManager(_ value: Bool) {
@@ -9291,6 +9304,17 @@ final class AgentModeViewModel: ObservableObject {
         return sessionListCacheReady
     }
 
+    func sidebarAutoArchiveOwner(workspaceID: UUID) -> SessionIndexOwner? {
+        guard sessionListCacheReady,
+              let owner = sessionListCacheReadyOwner,
+              owner.workspaceID == workspaceID,
+              isSessionIndexOwnerCurrent(owner)
+        else {
+            return nil
+        }
+        return owner
+    }
+
     var ownerValidatedSidebarRestoreFrozenOrderByTabID: [UUID: Int] {
         guard let owner = sidebarRestoreFrozenOrderOwner,
               isSessionIndexOwnerCurrent(owner)
@@ -9907,30 +9931,52 @@ final class AgentModeViewModel: ObservableObject {
                     return
                 }
 
-                #if DEBUG
-                    let streamStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-                #endif
-                let stream = await streamBuilder(fullRequest, restoreBatchSize)
-                for try await batch in stream {
-                    #if DEBUG
-                        streamBatchCount += 1
-                        streamEntryCount += batch.entriesBySessionID.count
-                    #endif
-                    guard !Task.isCancelled else { return }
-                    await applySidebarIndexBatch(
-                        batch,
-                        token: token,
-                        isFullRefresh: true
-                    )
-                }
-                guard !Task.isCancelled else { return }
-                #if DEBUG
-                    if let streamStartMS {
-                        streamDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: streamStartMS)
+                var streamRetryCount = 0
+                while true {
+                    do {
+                        #if DEBUG
+                            let streamStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                        #endif
+                        let stream = await streamBuilder(fullRequest, restoreBatchSize)
+                        for try await batch in stream {
+                            #if DEBUG
+                                streamBatchCount += 1
+                                streamEntryCount += batch.entriesBySessionID.count
+                            #endif
+                            guard !Task.isCancelled else { return }
+                            await applySidebarIndexBatch(
+                                batch,
+                                token: token,
+                                isFullRefresh: true
+                            )
+                        }
+                        guard !Task.isCancelled else { return }
+                        #if DEBUG
+                            if let streamStartMS {
+                                streamDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: streamStartMS)
+                            }
+                        #endif
+                        break
+                    } catch {
+                        guard !Task.isCancelled else { return }
+                        guard streamRetryCount < Self.sessionSidebarRestoreRetryLimit,
+                              await prepareSidebarIndexStreamRetry(token: token)
+                        else {
+                            throw error
+                        }
+                        streamRetryCount += 1
+                        #if DEBUG
+                            WorkspaceRestorePerfLog.log(
+                                "agentSessionIndex.refreshRetry windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) activationEpoch=\(owner.activationEpoch) generation=\(token.generation) retry=\(streamRetryCount) error=\(String(describing: error))"
+                            )
+                        #endif
+                        await Task.yield()
                     }
+                }
+                #if DEBUG
                     if let taskStartMS {
                         WorkspaceRestorePerfLog.log(
-                            "agentSessionIndex.refreshComplete windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) activationEpoch=\(owner.activationEpoch) generation=\(token.generation) batches=\(streamBatchCount) streamEntries=\(streamEntryCount) prioritized=\(prioritizedDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notRun") stream=\(streamDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notMeasured") total=\(WorkspaceRestorePerfLog.formatElapsedMS(since: taskStartMS))"
+                            "agentSessionIndex.refreshComplete windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) activationEpoch=\(owner.activationEpoch) generation=\(token.generation) batches=\(streamBatchCount) streamEntries=\(streamEntryCount) retries=\(streamRetryCount) prioritized=\(prioritizedDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notRun") stream=\(streamDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notMeasured") total=\(WorkspaceRestorePerfLog.formatElapsedMS(since: taskStartMS))"
                         )
                     }
                 #endif
@@ -10095,6 +10141,21 @@ final class AgentModeViewModel: ObservableObject {
         }
         lastProcessedTabID = nil
         onTabChanged(targetTabID)
+        return true
+    }
+
+    private func prepareSidebarIndexStreamRetry(token: SessionIndexRefreshToken) -> Bool {
+        guard activeSessionIndexRefreshToken == token,
+              isSessionIndexOwnerCurrent(token.owner)
+        else {
+            return false
+        }
+
+        activeSessionIndexRefreshFullEntries.removeAll()
+        activeSessionIndexRefreshHasPublishedFullBatch = false
+        var provisional = activeSessionIndexRefreshBaselineEntries
+        provisional.merge(activeSessionIndexRefreshPrioritizedEntries) { _, new in new }
+        publishSessionIndexReplacement(provisional, token: token)
         return true
     }
 

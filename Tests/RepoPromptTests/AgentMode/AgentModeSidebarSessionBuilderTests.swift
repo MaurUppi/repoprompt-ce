@@ -167,6 +167,36 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
         XCTAssertEqual(continuedRow.activityDate, date(300))
     }
 
+    func testUnhydratedPersistedRowUsesIndexSavedAtInsteadOfTabLastModified() throws {
+        let staleTabID = id(23)
+        let newerTabID = id(24)
+        let staleSessionID = id(123)
+        let newerSessionID = id(124)
+        let tabs = [
+            tab(staleTabID, sessionID: staleSessionID, lastModified: date(1000)),
+            tab(newerTabID, sessionID: newerSessionID, lastModified: date(1))
+        ]
+        let index = sessionIndex([
+            entry(
+                staleSessionID,
+                tabID: staleTabID,
+                lastUserMessageAt: nil,
+                savedAt: date(100)
+            ),
+            entry(
+                newerSessionID,
+                tabID: newerTabID,
+                lastUserMessageAt: nil,
+                savedAt: date(200)
+            )
+        ])
+
+        let rows = build(tabs: tabs, sessionIndex: index)
+
+        XCTAssertEqual(rows.map(\.tabID), [newerTabID, staleTabID])
+        XCTAssertEqual(try row(for: staleTabID, in: rows).activityDate, date(100))
+    }
+
     func testActiveChildPromotesAmongSiblingsWithoutChangingActivityDates() throws {
         let parentTabID = id(30)
         let newerChildTabID = id(31)
@@ -210,6 +240,85 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
             try XCTUnwrap(rows.first(where: { $0.tabID == newerChildTabID })).activityDate,
             date(300)
         )
+    }
+
+    func testPinnedChildPrecedesNewerUnpinnedSibling() {
+        let rootTabID = id(33)
+        let pinnedChildTabID = id(34)
+        let newerChildTabID = id(35)
+        let rootSessionID = id(133)
+        let pinnedChildSessionID = id(134)
+        let newerChildSessionID = id(135)
+        let tabs = [
+            tab(rootTabID, sessionID: rootSessionID),
+            tab(pinnedChildTabID, sessionID: pinnedChildSessionID, isPinned: true),
+            tab(newerChildTabID, sessionID: newerChildSessionID)
+        ]
+        let index = sessionIndex([
+            entry(rootSessionID, tabID: rootTabID, lastUserMessageAt: date(1)),
+            entry(
+                pinnedChildSessionID,
+                tabID: pinnedChildTabID,
+                parentSessionID: rootSessionID,
+                lastUserMessageAt: date(10)
+            ),
+            entry(
+                newerChildSessionID,
+                tabID: newerChildTabID,
+                parentSessionID: rootSessionID,
+                lastUserMessageAt: date(100)
+            )
+        ])
+
+        let rows = build(tabs: tabs, sessionIndex: index)
+
+        XCTAssertEqual(rows.map(\.tabID), [rootTabID, pinnedChildTabID, newerChildTabID])
+        XCTAssertEqual(rows.map(\.depth), [0, 1, 1])
+    }
+
+    func testPinnedDescendantElevatesContainingRootSubtree() {
+        let pinnedSubtreeRootTabID = id(36)
+        let branchTabID = id(37)
+        let pinnedGrandchildTabID = id(38)
+        let newerRootTabID = id(39)
+        let pinnedSubtreeRootSessionID = id(136)
+        let branchSessionID = id(137)
+        let pinnedGrandchildSessionID = id(138)
+        let newerRootSessionID = id(139)
+        let tabs = [
+            tab(pinnedSubtreeRootTabID, sessionID: pinnedSubtreeRootSessionID),
+            tab(branchTabID, sessionID: branchSessionID),
+            tab(pinnedGrandchildTabID, sessionID: pinnedGrandchildSessionID, isPinned: true),
+            tab(newerRootTabID, sessionID: newerRootSessionID)
+        ]
+        let index = sessionIndex([
+            entry(
+                pinnedSubtreeRootSessionID,
+                tabID: pinnedSubtreeRootTabID,
+                lastUserMessageAt: date(1)
+            ),
+            entry(
+                branchSessionID,
+                tabID: branchTabID,
+                parentSessionID: pinnedSubtreeRootSessionID,
+                lastUserMessageAt: date(5)
+            ),
+            entry(
+                pinnedGrandchildSessionID,
+                tabID: pinnedGrandchildTabID,
+                parentSessionID: branchSessionID,
+                lastUserMessageAt: date(10)
+            ),
+            entry(newerRootSessionID, tabID: newerRootTabID, lastUserMessageAt: date(100))
+        ])
+
+        let rows = build(tabs: tabs, sessionIndex: index)
+
+        XCTAssertEqual(
+            rows.map(\.tabID),
+            [pinnedSubtreeRootTabID, branchTabID, pinnedGrandchildTabID, newerRootTabID]
+        )
+        XCTAssertEqual(rows.map(\.depth), [0, 1, 2, 0])
     }
 
     func testPinnedRootsAndRootSubtreeRecencyRemainStable() {
@@ -388,12 +497,13 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
     private func tab(
         _ tabID: UUID,
         sessionID: UUID,
-        isPinned: Bool = false
+        isPinned: Bool = false,
+        lastModified: Date? = nil
     ) -> ComposeTabState {
         ComposeTabState(
             id: tabID,
             name: "Tab \(tabID.uuidString.suffix(4))",
-            lastModified: date(1),
+            lastModified: lastModified ?? date(1),
             isPinned: isPinned,
             activeAgentSessionID: sessionID
         )

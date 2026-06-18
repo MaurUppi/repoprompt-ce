@@ -816,6 +816,70 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(requestCountAfterStaleHandler, requestCountBeforeStaleHandler)
     }
 
+    func testAutoArchiveSkipsMutationAfterSameWorkspaceReactivation() async {
+        let tabs = (0 ... AgentModeViewModel.sessionSidebarPageSize + 10).map { offset in
+            ComposeTabState(
+                id: UUID(),
+                name: "Inactive \(offset)",
+                lastModified: Date(timeIntervalSince1970: 1),
+                activeAgentSessionID: UUID()
+            )
+        }
+        let activeTabID = tabs.last?.id
+        let workspace = makeWorkspace(
+            name: "Same workspace reactivation",
+            tabs: tabs,
+            activeTabID: activeTabID
+        )
+        let fixture = makeWorkspaceFixture(workspaces: [workspace])
+        fixture.manager.activeWorkspace = workspace
+        fixture.prompt.loadComposeTabsFromWorkspace(workspace)
+        let viewModel = makeViewModel()
+        viewModel.test_setSidebarAutoArchiveDependencies(
+            promptManager: fixture.prompt,
+            workspaceManager: fixture.manager
+        )
+        viewModel.test_setSidebarAutoArchiveActive(true)
+
+        let initialOwner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+        viewModel.test_installSessionIndexSnapshot(
+            [:],
+            owner: initialOwner,
+            latestOwner: initialOwner,
+            activeWorkspace: workspace
+        )
+
+        let closeGate = SidebarIndexStreamGate()
+        let closeListenerToken = fixture.prompt.addComposeTabsWillCloseListener { _, reason in
+            guard reason == .stash else { return }
+            await closeGate.wait()
+        }
+        defer {
+            fixture.prompt.removeComposeTabsWillCloseListener(closeListenerToken)
+        }
+        let archiveTask = Task {
+            await viewModel.performSidebarAutoArchiveIfNeeded(
+                reason: .explicitTest,
+                now: Date()
+            )
+        }
+        await closeGate.waitForWaiter()
+
+        let reactivatedOwner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+        viewModel.test_installSessionIndexSnapshot(
+            [:],
+            owner: reactivatedOwner,
+            latestOwner: reactivatedOwner,
+            activeWorkspace: workspace
+        )
+        await closeGate.release()
+        let archivedTabIDs = await archiveTask.value
+
+        XCTAssertTrue(archivedTabIDs.isEmpty)
+        XCTAssertEqual(Set(fixture.manager.activeWorkspace?.composeTabs.map(\.id) ?? []), Set(tabs.map(\.id)))
+        XCTAssertTrue(fixture.manager.activeWorkspace?.stashedTabs.isEmpty == true)
+    }
+
     func testRestoredMatchingBindingPreservesRefreshAndRestoresIndexOnlyHierarchy() async throws {
         let viewModel = makeViewModel()
         let rootTabID = UUID()
@@ -939,17 +1003,11 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             savedAt: Date(timeIntervalSince1970: 1)
         )
         let completionGate = SidebarIndexStreamGate()
-        let failureGate = SidebarIndexStreamGate()
         let harness = SidebarIndexStreamHarness(plans: [
             .init(batches: [makeBatch([rootEntry, childEntry])]),
             .init(
                 batches: [makeBatch([updatedRootEntry])],
                 gateAfterBatches: completionGate
-            ),
-            .init(
-                batches: [makeBatch([childEntry])],
-                gateAfterBatches: failureGate,
-                failsAfterBatches: true
             )
         ])
         installSidebarIndexHarness(harness, on: viewModel)
@@ -982,24 +1040,47 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
 
         XCTAssertEqual(Set(viewModel.test_ownerValidatedSessionIndex.keys), [rootSessionID])
         XCTAssertTrue(viewModel.test_ownerValidatedSessionListCacheReady)
+        let replacementRequestCount = await harness.currentRequestCount()
+        XCTAssertEqual(replacementRequestCount, 2)
+    }
 
-        viewModel.test_refreshSessionListCache(for: workspace)
-        await harness.waitForRequestCount(3)
-        try await waitUntil {
-            viewModel.test_ownerValidatedSessionIndex[childSessionID] != nil
-        }
-        XCTAssertEqual(
-            Set(viewModel.test_ownerValidatedSessionIndex.keys),
-            [rootSessionID, childSessionID]
+    func testSidebarIndexStreamRetriesTransientFailureAndBecomesReady() async {
+        let viewModel = makeViewModel()
+        let rootTabID = UUID()
+        let partialChildTabID = UUID()
+        let rootSessionID = UUID()
+        let partialChildSessionID = UUID()
+        let rootEntry = makeIndexEntry(id: rootSessionID, tabID: rootTabID)
+        let partialChildEntry = makeIndexEntry(
+            id: partialChildSessionID,
+            tabID: partialChildTabID,
+            parentSessionID: rootSessionID
+        )
+        let harness = SidebarIndexStreamHarness(plans: [
+            .init(
+                batches: [makeBatch([partialChildEntry])],
+                failsAfterBatches: true
+            ),
+            .init(batches: [makeBatch([rootEntry])])
+        ])
+        installSidebarIndexHarness(harness, on: viewModel)
+        let workspace = makeWorkspace(
+            name: "Transient stream failure",
+            tabs: [
+                ComposeTabState(id: rootTabID, activeAgentSessionID: rootSessionID),
+                ComposeTabState(id: partialChildTabID, activeAgentSessionID: partialChildSessionID)
+            ],
+            activeTabID: rootTabID
         )
 
-        await failureGate.release()
+        await viewModel.handleWorkspaceSwitch(workspace)
         await viewModel.test_waitForSessionListCacheRefresh()
 
+        let requestCount = await harness.currentRequestCount()
+        XCTAssertEqual(requestCount, 2)
         XCTAssertEqual(Set(viewModel.test_ownerValidatedSessionIndex.keys), [rootSessionID])
-        XCTAssertFalse(viewModel.test_ownerValidatedSessionListCacheReady)
-        let replacementRequestCount = await harness.currentRequestCount()
-        XCTAssertEqual(replacementRequestCount, 3)
+        XCTAssertTrue(viewModel.test_ownerValidatedSessionListCacheReady)
+        XCTAssertEqual(viewModel.test_ownerValidatedSidebarRestoreFrozenOrderCount, 0)
     }
 
     func testLocalRemovalTombstoneWinsOverLaterFullBatch() async {
@@ -1334,6 +1415,12 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
     private func makeWorkspaceManager(
         workspaces: [WorkspaceModel]
     ) -> WorkspaceManagerViewModel {
+        makeWorkspaceFixture(workspaces: workspaces).manager
+    }
+
+    private func makeWorkspaceFixture(
+        workspaces: [WorkspaceModel]
+    ) -> (manager: WorkspaceManagerViewModel, prompt: PromptViewModel) {
         let fileManager = WorkspaceFilesViewModel()
         let keyManager = KeyManager(
             secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
@@ -1355,7 +1442,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             performInitialWorkspaceActivation: false
         )
         manager.workspaces = workspaces
-        return manager
+        return (manager, prompt)
     }
 
     private func waitUntil(
@@ -1405,6 +1492,12 @@ private actor SidebarIndexStreamGate {
         guard !released else { return }
         await withCheckedContinuation { continuation in
             waiters.append(continuation)
+        }
+    }
+
+    func waitForWaiter() async {
+        while waiters.isEmpty, !released {
+            await Task.yield()
         }
     }
 
