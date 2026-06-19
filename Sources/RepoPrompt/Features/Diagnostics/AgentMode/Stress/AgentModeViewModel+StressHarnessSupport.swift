@@ -75,8 +75,7 @@
             session.codexControllerPermissionProfile = nil
             session.codexControllerTaskLabelKind = nil
             session.claudeController = nil
-            session.claudeControllerRuntimeVariant = nil
-            session.claudeControllerPermissionMode = nil
+            claudeCoordinator.discardControllerLaunchSettings(for: session)
             session.codexEventTask?.cancel()
             session.codexEventTask = nil
             session.codexEventTaskRunID = nil

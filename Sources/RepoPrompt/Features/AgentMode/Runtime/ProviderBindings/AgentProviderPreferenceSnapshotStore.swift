@@ -122,9 +122,11 @@ final class AgentProviderPreferenceSnapshotStore {
             }
             let runtimeTools = claudeRuntimeToolSettings(profile: profile)
             return AgentProviderRuntimePermissionBinding(
-                claudePermissionMode: permissionMode,
-                claudeAllowNativeBashTool: runtimeTools.allowNativeBashTool,
-                claudeMCPStrictMode: runtimeTools.mcpStrictMode
+                claudeLaunchPolicy: ClaudeControllerLaunchPolicy(
+                    permissionMode: permissionMode,
+                    allowNativeBashTool: runtimeTools.allowNativeBashTool,
+                    mcpStrictMode: runtimeTools.mcpStrictMode
+                )
             )
         case .openCode:
             let level = effectiveOpenCodePermissionLevel(profile: profile)

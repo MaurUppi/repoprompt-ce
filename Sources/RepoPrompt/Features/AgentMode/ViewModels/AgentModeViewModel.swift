@@ -316,8 +316,13 @@ final class AgentModeViewModel: ObservableObject {
                     if previousAgent.usesClaudeNativeRuntime,
                        !selectedAgent.usesClaudeNativeRuntime || previousAgent != selectedAgent
                     {
-                        session.providerSessionID = nil
-                        Task { await claudeCoordinator.shutdownClaudeSession(session) }
+                        let detachedController = claudeCoordinator.prepareClaudeProviderIdentityResetSync(session)
+                        Task {
+                            await claudeCoordinator.cancelClaudeRun(
+                                session,
+                                oldController: detachedController
+                            )
+                        }
                     }
                 }
                 session.selectedAgent = selectedAgent
@@ -5748,7 +5753,7 @@ final class AgentModeViewModel: ObservableObject {
             await codexCoordinator.shutdownCodexSession(session)
             codexCoordinator.clearCodexSessionState(session)
         }
-        if session.claudeController != nil || session.pendingClaudeResumeTransferTask != nil || session.selectedAgent.usesClaudeNativeRuntime {
+        if session.claudeController != nil || claudeCoordinator.hasPendingResumeTransfer(for: session) || session.selectedAgent.usesClaudeNativeRuntime {
             await claudeCoordinator.shutdownClaudeSession(session)
         }
         session.providerSessionID = nil
@@ -5975,8 +5980,11 @@ final class AgentModeViewModel: ObservableObject {
             if previousAgent.usesClaudeNativeRuntime,
                !normalized.agent.usesClaudeNativeRuntime || previousAgent != normalized.agent
             {
-                session.providerSessionID = nil
-                await claudeCoordinator.shutdownClaudeSession(session)
+                let detachedController = claudeCoordinator.prepareClaudeProviderIdentityResetSync(session)
+                await claudeCoordinator.cancelClaudeRun(
+                    session,
+                    oldController: detachedController
+                )
             }
         }
 
@@ -15103,8 +15111,9 @@ final class AgentModeViewModel: ObservableObject {
         invalidateSidebarRestoreOrdering()
         sessionListSortDates.removeValue(forKey: tabID)
 
-        // Clear provider session ID so new conversation doesn't resume old CLI session
-        session.providerSessionID = nil
+        // Detach before clearing the provider session ID so async cleanup cannot
+        // restore the old conversation or affect a replacement controller.
+        let detachedClaudeController = claudeCoordinator.prepareClaudeProviderIdentityResetSync(session)
         session.providerTokenUsageByTurn.removeAll()
         session.pendingNonCodexUserInputTokenQueue.removeAll()
         session.activeNonCodexTurnTokenAccumulator = nil
@@ -15120,8 +15129,13 @@ final class AgentModeViewModel: ObservableObject {
 
         // Clear Codex-native identifiers and usage
         codexCoordinator.clearCodexSessionState(session)
-        if session.claudeController != nil {
-            Task { await claudeCoordinator.shutdownClaudeSession(session) }
+        if detachedClaudeController != nil {
+            Task {
+                await claudeCoordinator.cancelClaudeRun(
+                    session,
+                    oldController: detachedClaudeController
+                )
+            }
         }
 
         applyTranscriptViewportBindingState(

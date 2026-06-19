@@ -424,7 +424,7 @@ actor MCPCommandRunner {
     }
 
     private func snapshotTools(to path: String) async throws {
-        let tools = try await session.cachedToolsOrRefresh()
+        let tools = try await session.refreshTools()
 
         let snapshot = await ToolSnapshot(
             generatedAt: Date(),

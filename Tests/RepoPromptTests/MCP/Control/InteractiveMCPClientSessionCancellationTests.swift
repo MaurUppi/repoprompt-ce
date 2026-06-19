@@ -125,7 +125,7 @@ import XCTest
 
         func testCachedToolsOrRefreshReusesCatalogUntilDirty() async throws {
             let fixture = try await makeToolCatalogFixture()
-            defer { Task { await fixture.cleanup() } }
+            addTeardownBlock { await fixture.cleanup() }
 
             let first = try await fixture.session.cachedToolsOrRefresh()
             let second = try await fixture.session.cachedToolsOrRefresh()
@@ -152,7 +152,7 @@ import XCTest
         func testRefreshToolsRetriesWhenInvalidatedDuringListRequest() async throws {
             let controller = CLIToolListRaceController()
             let fixture = try await makeToolCatalogRaceFixture(controller: controller)
-            defer { Task { await fixture.cleanup() } }
+            addTeardownBlock { await fixture.cleanup() }
 
             let refresh = Task {
                 try await fixture.session.refreshTools()
@@ -174,28 +174,75 @@ import XCTest
             XCTAssertEqual(requestCount, 2)
         }
 
-        func testOverlappingRefreshDoesNotLetOlderResponseOverwriteNewerCatalog() async throws {
+        func testOverlappingRefreshesCoalesceOntoNewestSuccessfulCatalog() async throws {
             let controller = CLIToolListRaceController()
-            let fixture = try await makeToolCatalogRaceFixture(controller: controller)
-            defer { Task { await fixture.cleanup() } }
+            let awaitCounter = CLIAsyncCounter()
+            let fixture = try await makeToolCatalogRaceFixture(
+                controller: controller,
+                toolListRefreshWillAwait: { await awaitCounter.record() }
+            )
+            addTeardownBlock { await fixture.cleanup() }
 
             let olderRefresh = Task {
                 try await fixture.session.refreshTools()
             }
             await controller.waitUntilFirstRequestStarted()
+            let newerRefresh = Task {
+                try await fixture.session.refreshTools()
+            }
+            await awaitCounter.wait(until: 2)
 
-            let newerTools = try await fixture.session.refreshTools()
+            var requestCount = await controller.count()
+            XCTAssertEqual(requestCount, 1)
             await controller.releaseFirstRequest()
             let olderTools = try await olderRefresh.value
+            let newerTools = try await newerRefresh.value
 
-            XCTAssertEqual(newerTools.map(\.name), ["tool_2"])
-            XCTAssertEqual(olderTools.map(\.name), ["tool_2"])
+            XCTAssertEqual(olderTools.map(\.name), ["tool_1"])
+            XCTAssertEqual(newerTools.map(\.name), ["tool_1"])
             let cachedToolNames = await fixture.session.tools().map(\.name)
             let toolsDirty = await fixture.session.toolsDirty
-            let requestCount = await controller.count()
-            XCTAssertEqual(cachedToolNames, ["tool_2"])
+            XCTAssertEqual(cachedToolNames, ["tool_1"])
             XCTAssertFalse(toolsDirty)
-            XCTAssertEqual(requestCount, 2)
+            requestCount = await controller.count()
+            XCTAssertEqual(requestCount, 1)
+        }
+
+        func testCancelledRefreshWaiterLeavesSharedFlightRunning() async throws {
+            let controller = CLIToolListRaceController()
+            let awaitCounter = CLIAsyncCounter()
+            let fixture = try await makeToolCatalogRaceFixture(
+                controller: controller,
+                toolListRefreshWillAwait: { await awaitCounter.record() }
+            )
+            addTeardownBlock { await fixture.cleanup() }
+
+            let survivingRefresh = Task {
+                try await fixture.session.refreshTools()
+            }
+            await controller.waitUntilFirstRequestStarted()
+            let cancelledRefresh = Task {
+                try await fixture.session.refreshTools()
+            }
+            await awaitCounter.wait(until: 2)
+            cancelledRefresh.cancel()
+
+            do {
+                _ = try await cancelledRefresh.value
+                XCTFail("Expected cancelled refresh waiter")
+            } catch is CancellationError {
+                // Expected. The shared request must remain available to the other waiter.
+            } catch {
+                XCTFail("Expected CancellationError, got \(error)")
+            }
+
+            var requestCount = await controller.count()
+            XCTAssertEqual(requestCount, 1)
+            await controller.releaseFirstRequest()
+            let tools = try await survivingRefresh.value
+            XCTAssertEqual(tools.map(\.name), ["tool_1"])
+            requestCount = await controller.count()
+            XCTAssertEqual(requestCount, 1)
         }
 
         func testRefreshToolsIgnoresResponseFromPreviousConnectionEpoch() async throws {
@@ -203,11 +250,9 @@ import XCTest
             let oldFixture = try await makeToolCatalogRaceFixture(controller: oldController)
             let newController = CLIToolListRaceController(toolPrefix: "new_tool", blocksFirstRequest: false)
             let newFixture = try await makeToolCatalogRaceFixture(controller: newController)
-            defer {
-                Task {
-                    await oldFixture.cleanup()
-                    await newFixture.cleanup()
-                }
+            addTeardownBlock {
+                await oldFixture.cleanup()
+                await newFixture.cleanup()
             }
 
             let oldRefresh = Task {
@@ -233,44 +278,6 @@ import XCTest
             XCTAssertEqual(newRequestCount, 1)
         }
 
-        func testInteractiveREPLCatalogCommandsRefreshAcknowledgedDirtyCatalog() async throws {
-            let fixture = try await makeToolCatalogFixture()
-            defer { Task { await fixture.cleanup() } }
-            let repl = InteractiveREPL(session: fixture.session, options: InteractiveOptions())
-
-            _ = try await fixture.session.cachedToolsOrRefresh()
-
-            await fixture.session.test_markToolsDirty()
-            await fixture.session.acknowledgeToolsChanged()
-            try await repl.test_printToolList()
-            var toolsDirty = await fixture.session.toolsDirty
-            var noticePending = await fixture.session.toolsChangeNoticePending
-            var requestCount = await fixture.listCounter.count()
-            XCTAssertFalse(toolsDirty)
-            XCTAssertFalse(noticePending)
-            XCTAssertEqual(requestCount, 2)
-
-            await fixture.session.test_markToolsDirty()
-            await fixture.session.acknowledgeToolsChanged()
-            try await repl.test_printToolsSchemaJSON()
-            toolsDirty = await fixture.session.toolsDirty
-            noticePending = await fixture.session.toolsChangeNoticePending
-            requestCount = await fixture.listCounter.count()
-            XCTAssertFalse(toolsDirty)
-            XCTAssertFalse(noticePending)
-            XCTAssertEqual(requestCount, 3)
-
-            await fixture.session.test_markToolsDirty()
-            await fixture.session.acknowledgeToolsChanged()
-            try await repl.test_describeTool("tool_4")
-            toolsDirty = await fixture.session.toolsDirty
-            noticePending = await fixture.session.toolsChangeNoticePending
-            requestCount = await fixture.listCounter.count()
-            XCTAssertFalse(toolsDirty)
-            XCTAssertFalse(noticePending)
-            XCTAssertEqual(requestCount, 4)
-        }
-
         private func makeUnconnectedSession() -> InteractiveMCPClientSession {
             InteractiveMCPClientSession(
                 sessionToken: "timeout-contract-test",
@@ -279,7 +286,8 @@ import XCTest
         }
 
         private func makeToolCatalogRaceFixture(
-            controller: CLIToolListRaceController
+            controller: CLIToolListRaceController,
+            toolListRefreshWillAwait: (@Sendable () async -> Void)? = nil
         ) async throws -> CLIToolCatalogRaceFixture {
             let transports = await InMemoryTransport.createConnectedPair()
             let server = Server(
@@ -302,7 +310,8 @@ import XCTest
             _ = try await client.connect(transport: clientTransport)
             let session = InteractiveMCPClientSession(
                 connectedClientForTesting: client,
-                requestSendBarrier: requestSendBarrier
+                requestSendBarrier: requestSendBarrier,
+                toolListRefreshWillAwait: toolListRefreshWillAwait
             )
             return CLIToolCatalogRaceFixture(
                 client: client,
@@ -349,9 +358,14 @@ import XCTest
             )
         }
 
-        func testImmediateTimeoutRegistersAndSendsBeforeCancellationWithoutWaitingForHandlerStartup() async throws {
+        func testImmediateTimeoutWaitsForCancellationAttemptToFinish() async throws {
+            let cancellationDeliveryFinished = CLIAsyncSignal()
             let fixture = try await makeFixture(
                 cancellationBehavior: .ignoreUntilReleased,
+                cancellationDeliveryOverride: { client, requestID, reason in
+                    try? await client.cancelRequest(requestID, reason: reason)
+                    await cancellationDeliveryFinished.signal()
+                },
                 timeoutSleep: { _ in }
             )
             do {
@@ -375,8 +389,9 @@ import XCTest
                     XCTAssertEqual(seconds, 42)
                 }
 
+                let cancellationDelivered = await cancellationDeliveryFinished.isSignalled()
+                XCTAssertTrue(cancellationDelivered)
                 await fixture.handlerCancelled.wait()
-                await fixture.ignoredCancellationRelease.signal()
                 await fixture.cleanup()
             } catch {
                 await fixture.cleanup()
@@ -384,7 +399,54 @@ import XCTest
             }
         }
 
-        func testCallerCancellationBeforeRequestTaskStartupStillSendsThenCancels() async throws {
+        func testTimeoutCancellationDrainIsBoundedWhenAttemptStalls() async throws {
+            let cancellationStartGate = CLIAsyncGate()
+            let cancellationDeliveryFinished = CLIAsyncSignal()
+            let fixture = try await makeFixture(
+                cancellationDeliveryOverride: { client, requestID, reason in
+                    await cancellationStartGate.arriveAndWait()
+                    try? await client.cancelRequest(requestID, reason: reason)
+                    await cancellationDeliveryFinished.signal()
+                },
+                timeoutSleep: { _ in },
+                cancellationDeliveryDrainTimeoutNanoseconds: 42,
+                cancellationDeliveryDrainSleep: { _ in }
+            )
+            do {
+                let call = Task {
+                    try await fixture.session.callTool(
+                        name: "slow_tool",
+                        arguments: nil,
+                        timeout: .seconds(42)
+                    )
+                }
+                await cancellationStartGate.waitUntilArrived()
+
+                do {
+                    _ = try await call.value
+                    XCTFail("Expected tool timeout")
+                } catch let error as InteractiveSessionError {
+                    guard case .toolCallTimeout = error else {
+                        XCTFail("Expected tool timeout, got \(error)")
+                        await cancellationStartGate.release()
+                        await fixture.cleanup()
+                        return
+                    }
+                }
+
+                let didFinishBeforeRelease = await cancellationDeliveryFinished.isSignalled()
+                XCTAssertFalse(didFinishBeforeRelease)
+                await cancellationStartGate.release()
+                await cancellationDeliveryFinished.wait()
+                await fixture.cleanup()
+            } catch {
+                await cancellationStartGate.release()
+                await fixture.cleanup()
+                throw error
+            }
+        }
+
+        func testCallerCancellationBeforeRequestTaskStartupDoesNotSend() async throws {
             let requestStartGate = CLIAsyncGate()
             let fixture = try await makeFixture(
                 requestSendWillStart: {
@@ -410,7 +472,8 @@ import XCTest
                     // Expected.
                 }
 
-                await fixture.handlerCancelled.wait()
+                let handlerStarted = await fixture.handlerStarted.isSignalled()
+                XCTAssertFalse(handlerStarted)
                 await fixture.cleanup()
             } catch {
                 await fixture.cleanup()
@@ -421,11 +484,17 @@ import XCTest
         private func makeFixture(
             cancellationBehavior: CLICancellationBehavior = .cooperative,
             requestSendWillStart: (@Sendable () async -> Void)? = nil,
+            cancellationDeliveryOverride: InteractiveMCPClientSession.CancellationDeliveryOverride? = nil,
             timeoutSleep: @escaping @Sendable (UInt64) async throws -> Void = { nanoseconds in
+                try await Task.sleep(nanoseconds: nanoseconds)
+            },
+            cancellationDeliveryDrainTimeoutNanoseconds: UInt64 = 2_000_000_000,
+            cancellationDeliveryDrainSleep: @escaping @Sendable (UInt64) async throws -> Void = { nanoseconds in
                 try await Task.sleep(nanoseconds: nanoseconds)
             }
         ) async throws -> CLISessionCancellationFixture {
             let transports = await InMemoryTransport.createConnectedPair()
+            let handlerStarted = CLIAsyncSignal()
             let handlerCancelled = CLIAsyncSignal()
             let ignoredCancellationRelease = CLIAsyncSignal()
             let cancellationSuspension = CLICancellationSuspension()
@@ -435,6 +504,7 @@ import XCTest
                 capabilities: .init(tools: .init())
             )
             await server.withMethodHandler(CallTool.self) { _ in
+                await handlerStarted.signal()
                 do {
                     try await cancellationSuspension.wait()
                     return .init(
@@ -469,12 +539,16 @@ import XCTest
                 connectedClientForTesting: client,
                 requestSendBarrier: requestSendBarrier,
                 requestSendWillStart: requestSendWillStart,
-                timeoutSleep: timeoutSleep
+                cancellationDeliveryOverride: cancellationDeliveryOverride,
+                timeoutSleep: timeoutSleep,
+                cancellationDeliveryDrainTimeoutNanoseconds: cancellationDeliveryDrainTimeoutNanoseconds,
+                cancellationDeliveryDrainSleep: cancellationDeliveryDrainSleep
             )
             return CLISessionCancellationFixture(
                 client: client,
                 server: server,
                 session: session,
+                handlerStarted: handlerStarted,
                 handlerCancelled: handlerCancelled,
                 ignoredCancellationRelease: ignoredCancellationRelease
             )
@@ -490,6 +564,7 @@ import XCTest
         let client: Client
         let server: Server
         let session: InteractiveMCPClientSession
+        let handlerStarted: CLIAsyncSignal
         let handlerCancelled: CLIAsyncSignal
         let ignoredCancellationRelease: CLIAsyncSignal
 
@@ -523,6 +598,27 @@ import XCTest
             await controller.releaseFirstRequest()
             await client.disconnect()
             await server.stop()
+        }
+    }
+
+    private actor CLIAsyncCounter {
+        private var value = 0
+        private var waiters: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+        func record() {
+            value += 1
+            let ready = waiters.filter { value >= $0.target }
+            waiters.removeAll { value >= $0.target }
+            for waiter in ready {
+                waiter.continuation.resume()
+            }
+        }
+
+        func wait(until target: Int) async {
+            guard value < target else { return }
+            await withCheckedContinuation { continuation in
+                waiters.append((target, continuation))
+            }
         }
     }
 
@@ -650,6 +746,10 @@ import XCTest
             await withCheckedContinuation { continuation in
                 waiters.append(continuation)
             }
+        }
+
+        func isSignalled() -> Bool {
+            signalled
         }
     }
 

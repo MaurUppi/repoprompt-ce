@@ -437,11 +437,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
         let session = makeRunningClaudeSession(controller: oldController)
         session.permissionProfile = .mcpSafeDefaults
-        session.claudeControllerRuntimeVariant = .standard
-        session.claudeControllerWorkspacePath = FileManager.default.currentDirectoryPath
-        session.claudeControllerPermissionMode = ClaudeAgentToolPreferences.PermissionLevel.fullAccess.permissionMode
-        session.claudeControllerAllowNativeBashTool = true
-        session.claudeControllerMCPStrictMode = false
+        setClaudeControllerLaunchSettings(
+            for: session,
+            coordinator: harness.host.claudeCoordinator,
+            permissionMode: ClaudeAgentToolPreferences.PermissionLevel.fullAccess.permissionMode,
+            allowNativeBashTool: true,
+            mcpStrictMode: false
+        )
         session.pendingClaudeSteeringInstructions = [makeClaudeSteeringInstruction(session: session, text: "tighten before send")]
 
         let queueStarted = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
@@ -449,9 +451,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         await session.claudeSteeringFlushTask?.value
 
         XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
-        XCTAssertEqual(session.claudeControllerPermissionMode, ClaudeAgentToolPreferences.PermissionLevel.requireApproval.permissionMode)
-        XCTAssertEqual(session.claudeControllerAllowNativeBashTool, false)
-        XCTAssertEqual(session.claudeControllerMCPStrictMode, true)
+        let launchSettings = harness.host.claudeCoordinator.test_controllerLaunchSettings(for: session)
+        XCTAssertEqual(
+            launchSettings?.permissionMode,
+            ClaudeAgentToolPreferences.PermissionLevel.requireApproval.permissionMode
+        )
+        XCTAssertEqual(launchSettings?.allowNativeBashTool, false)
+        XCTAssertEqual(launchSettings?.mcpStrictMode, true)
         XCTAssertFalse(recorder.contains("old:send"))
         assertOrderedEvents([
             "idle",
@@ -460,6 +466,131 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             "factory:claude:default:Optional(false):Optional(true)",
             "new:start",
             "new:send",
+            "delivered"
+        ], in: recorder)
+    }
+
+    func testQueuedClaudeSteeringRevalidatesPermissionsImmediatelyBeforeDispatch() async {
+        let recorder = LifecycleRecorder()
+        let eventsReadyGate = LifecycleAsyncGate()
+        let oldController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "old",
+            hasTurnInFlight: false,
+            eventsStreamReadyGate: eventsReadyGate
+        )
+        let newController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "new",
+            hasTurnInFlight: false
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            idleWaiter: { _ in recorder.record("idle") },
+            claudeControllerFactory: { _, _, _, _, _, allowNativeBashTool, permissionMode, mcpStrictMode in
+                recorder.record("factory:claude:\(permissionMode ?? "nil"):\(String(describing: allowNativeBashTool)):\(String(describing: mcpStrictMode))")
+                return newController
+            }
+        )
+        let session = makeRunningClaudeSession(controller: oldController)
+        let initialProfile = AgentProviderPermissionProfile.providerOverride(.claude(.fullAccess))
+        let initialRuntime = harness.host.providerBindingService.runtimePermission(
+            for: .claudeCode,
+            profile: initialProfile
+        ).claudeLaunchPolicy
+        session.permissionProfile = initialProfile
+        setClaudeControllerLaunchSettings(
+            for: session,
+            coordinator: harness.host.claudeCoordinator,
+            permissionMode: initialRuntime?.permissionMode,
+            allowNativeBashTool: initialRuntime?.allowNativeBashTool,
+            mcpStrictMode: initialRuntime?.mcpStrictMode
+        )
+        session.pendingClaudeSteeringInstructions = [makeClaudeSteeringInstruction(session: session, text: "tighten at dispatch")]
+
+        let queueStarted = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(queueStarted)
+        await eventsReadyGate.waitUntilArrived()
+        session.permissionProfile = .mcpSafeDefaults
+        await eventsReadyGate.release()
+        await session.claudeSteeringFlushTask?.value
+
+        XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+        let launchSettings = harness.host.claudeCoordinator.test_controllerLaunchSettings(for: session)
+        XCTAssertEqual(
+            launchSettings?.permissionMode,
+            ClaudeAgentToolPreferences.PermissionLevel.requireApproval.permissionMode
+        )
+        XCTAssertEqual(launchSettings?.allowNativeBashTool, false)
+        XCTAssertEqual(launchSettings?.mcpStrictMode, true)
+        XCTAssertFalse(recorder.contains("old:send"))
+        assertOrderedEvents([
+            "old:start",
+            "old:events-ready",
+            "old:shutdown",
+            "factory:claude:default:Optional(false):Optional(true)",
+            "new:start",
+            "new:send",
+            "delivered"
+        ], in: recorder)
+    }
+
+    func testQueuedClaudeSteeringRevalidatesWorkspaceImmediatelyBeforeDispatch() async {
+        let recorder = LifecycleRecorder()
+        let eventsReadyGate = LifecycleAsyncGate()
+        let oldController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "old-workspace-dispatch",
+            eventsStreamReadyGate: eventsReadyGate
+        )
+        let newController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "new-workspace-dispatch"
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeControllerFactory: { _, _, _, _, _, _, _, _ in
+                recorder.record("factory:workspace-dispatch")
+                return newController
+            }
+        )
+        let session = makeRunningClaudeSession(controller: oldController)
+        let runtime = harness.host.providerBindingService.runtimePermission(
+            for: .claudeCode,
+            profile: .mcpSafeDefaults
+        ).claudeLaunchPolicy
+        session.permissionProfile = .mcpSafeDefaults
+        setClaudeControllerLaunchSettings(
+            for: session,
+            coordinator: harness.host.claudeCoordinator,
+            permissionMode: runtime?.permissionMode,
+            allowNativeBashTool: runtime?.allowNativeBashTool,
+            mcpStrictMode: runtime?.mcpStrictMode
+        )
+        session.pendingClaudeSteeringInstructions = [makeClaudeSteeringInstruction(session: session, text: "workspace at dispatch")]
+
+        let queueStarted = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(queueStarted)
+        await eventsReadyGate.waitUntilArrived()
+        setClaudeControllerLaunchSettings(
+            for: session,
+            coordinator: harness.host.claudeCoordinator,
+            workspacePath: "/stale/workspace",
+            permissionMode: runtime?.permissionMode,
+            allowNativeBashTool: runtime?.allowNativeBashTool,
+            mcpStrictMode: runtime?.mcpStrictMode
+        )
+        await eventsReadyGate.release()
+        await session.claudeSteeringFlushTask?.value
+
+        XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
+        XCTAssertFalse(recorder.contains("old-workspace-dispatch:send"))
+        assertOrderedEvents([
+            "old-workspace-dispatch:events-ready",
+            "old-workspace-dispatch:shutdown",
+            "factory:workspace-dispatch",
+            "new-workspace-dispatch:start",
+            "new-workspace-dispatch:send",
             "delivered"
         ], in: recorder)
     }
@@ -493,22 +624,26 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
         let session = makeRunningClaudeSession(controller: oldController)
         session.permissionProfile = .mcpSafeDefaults
-        session.claudeControllerRuntimeVariant = .standard
-        session.claudeControllerWorkspacePath = FileManager.default.currentDirectoryPath
-        session.claudeControllerPermissionMode = ClaudeAgentToolPreferences.PermissionLevel.fullAccess.permissionMode
-        session.claudeControllerAllowNativeBashTool = true
-        session.claudeControllerMCPStrictMode = false
+        setClaudeControllerLaunchSettings(
+            for: session,
+            coordinator: harness.host.claudeCoordinator,
+            permissionMode: ClaudeAgentToolPreferences.PermissionLevel.fullAccess.permissionMode,
+            allowNativeBashTool: true,
+            mcpStrictMode: false
+        )
         session.pendingClaudeSteeringInstructions = [makeClaudeSteeringInstruction(session: session, text: "replace while recycling")]
 
         let queueStarted = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
         XCTAssertTrue(queueStarted)
         await currentSessionRefGate.waitUntilArrived()
         session.claudeController = replacementController
-        session.claudeControllerRuntimeVariant = .standard
-        session.claudeControllerWorkspacePath = FileManager.default.currentDirectoryPath
-        session.claudeControllerPermissionMode = ClaudeAgentToolPreferences.PermissionLevel.requireApproval.permissionMode
-        session.claudeControllerAllowNativeBashTool = false
-        session.claudeControllerMCPStrictMode = true
+        setClaudeControllerLaunchSettings(
+            for: session,
+            coordinator: harness.host.claudeCoordinator,
+            permissionMode: ClaudeAgentToolPreferences.PermissionLevel.requireApproval.permissionMode,
+            allowNativeBashTool: false,
+            mcpStrictMode: true
+        )
         await currentSessionRefGate.release()
         await session.claudeSteeringFlushTask?.value
 
@@ -532,6 +667,162 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             "replacement:send",
             "delivered"
         ], in: recorder)
+    }
+
+    func testClaudeWorkspaceRecycleDoesNotClearReplacementAfterCurrentSessionAwait() async {
+        let recorder = LifecycleRecorder()
+        let currentSessionRefGate = LifecycleAsyncGate()
+        let oldController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "old-workspace",
+            currentSessionRefGate: currentSessionRefGate
+        )
+        let replacementController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "replacement-workspace"
+        )
+        let fallbackController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "fallback-workspace"
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeControllerFactory: { _, _, _, _, _, _, _, _ in
+                recorder.record("factory:workspace-unexpected")
+                return fallbackController
+            }
+        )
+        let session = makeRunningClaudeSession(controller: oldController)
+        let runtime = harness.host.providerBindingService.runtimePermission(
+            for: .claudeCode,
+            profile: .mcpSafeDefaults
+        ).claudeLaunchPolicy
+        let currentWorkspacePath = URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath
+        ).standardizedFileURL.path
+        session.permissionProfile = .mcpSafeDefaults
+        setClaudeControllerLaunchSettings(
+            for: session,
+            coordinator: harness.host.claudeCoordinator,
+            workspacePath: "/stale/workspace",
+            permissionMode: runtime?.permissionMode,
+            allowNativeBashTool: runtime?.allowNativeBashTool,
+            mcpStrictMode: runtime?.mcpStrictMode
+        )
+
+        let ensureTask = Task {
+            await harness.host.claudeCoordinator.ensureClaudeNativeSession(session: session)
+        }
+        await currentSessionRefGate.waitUntilArrived()
+        session.claudeController = replacementController
+        setClaudeControllerLaunchSettings(
+            for: session,
+            coordinator: harness.host.claudeCoordinator,
+            workspacePath: currentWorkspacePath,
+            permissionMode: runtime?.permissionMode,
+            allowNativeBashTool: runtime?.allowNativeBashTool,
+            mcpStrictMode: runtime?.mcpStrictMode
+        )
+        await currentSessionRefGate.release()
+        await ensureTask.value
+
+        guard let finalController = session.claudeController else {
+            XCTFail("Expected replacement workspace controller to remain installed")
+            return
+        }
+        XCTAssertEqual(
+            ObjectIdentifier(finalController as AnyObject),
+            ObjectIdentifier(replacementController as AnyObject)
+        )
+        XCTAssertFalse(recorder.contains("factory:workspace-unexpected"))
+        assertOrderedEvents([
+            "old-workspace:current-ref",
+            "old-workspace:shutdown"
+        ], in: recorder)
+    }
+
+    func testClaudeSendCompletionDoesNotFailReplacementController() async {
+        let recorder = LifecycleRecorder()
+        let sendGate = LifecycleAsyncGate()
+        let oldController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "stale-send",
+            sendUserMessageGate: sendGate
+        )
+        let replacementController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "replacement-send"
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: oldController
+        )
+        let session = makeRunningClaudeSession(controller: oldController)
+        let runtime = harness.host.providerBindingService.runtimePermission(
+            for: .claudeCode,
+            profile: session.permissionProfile
+        ).claudeLaunchPolicy
+        setClaudeControllerLaunchSettings(
+            for: session,
+            coordinator: harness.host.claudeCoordinator,
+            permissionMode: runtime?.permissionMode,
+            allowNativeBashTool: runtime?.allowNativeBashTool,
+            mcpStrictMode: runtime?.mcpStrictMode
+        )
+
+        let sendTask = Task {
+            await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+                session: session,
+                text: "do not fail replacement",
+                attachments: []
+            )
+        }
+        await sendGate.waitUntilArrived()
+        session.claudeController = replacementController
+        await sendGate.release()
+
+        let didSend = await sendTask.value
+        XCTAssertFalse(didSend)
+        guard let finalController = session.claudeController else {
+            XCTFail("Expected replacement controller to remain installed")
+            return
+        }
+        XCTAssertEqual(
+            ObjectIdentifier(finalController as AnyObject),
+            ObjectIdentifier(replacementController as AnyObject)
+        )
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(session.items.filter { $0.kind == .error }.isEmpty)
+        XCTAssertTrue(recorder.contains("stale-send:shutdown"))
+    }
+
+    func testInvalidatedClaudeResumeTransferCannotRestoreClearedSessionID() async {
+        let recorder = LifecycleRecorder()
+        let sessionRefGate = LifecycleAsyncGate()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            currentSessionRefGate: sessionRefGate
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let session = makeRunningClaudeSession(controller: controller)
+        session.providerSessionID = "session-to-clear"
+
+        let detached = harness.host.claudeCoordinator.prepareClaudeCancelSync(session)
+        harness.host.claudeCoordinator.beginClaudeResumeTransferIfNeeded(
+            for: session,
+            oldController: detached
+        )
+        await sessionRefGate.waitUntilArrived()
+        harness.host.claudeCoordinator.invalidatePendingClaudeResumeTransfer(for: session)
+        session.providerSessionID = nil
+        await sessionRefGate.release()
+        await harness.host.claudeCoordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
+
+        XCTAssertNil(session.providerSessionID)
+        XCTAssertFalse(
+            harness.host.claudeCoordinator.test_hasPendingOrRetiredResumeTransfers(for: session)
+        )
+        XCTAssertTrue(recorder.contains("claude:shutdown"))
     }
 
     func testQueuedACPSteeringWaitsForMCPIdleThenInterruptsPromptsOrRestoresFollowUp() async throws {
@@ -1657,6 +1948,28 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
     }
 
+    private func setClaudeControllerLaunchSettings(
+        for session: AgentModeViewModel.TabSession,
+        coordinator: ClaudeAgentModeCoordinator,
+        workspacePath: String? = URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath
+        ).standardizedFileURL.path,
+        permissionMode: String?,
+        allowNativeBashTool: Bool?,
+        mcpStrictMode: Bool?
+    ) {
+        coordinator.test_setControllerLaunchSettings(
+            .init(
+                runtimeVariant: .standard,
+                workspacePath: workspacePath,
+                permissionMode: permissionMode,
+                allowNativeBashTool: allowNativeBashTool,
+                mcpStrictMode: mcpStrictMode
+            ),
+            for: session
+        )
+    }
+
     private func makeRunningClaudeSession(controller: LifecycleFakeNativeController) -> AgentModeViewModel.TabSession {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
@@ -2342,6 +2655,8 @@ private actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private let turnInFlight: Bool
     private let failSend: Bool
     private let currentSessionRefGate: LifecycleAsyncGate?
+    private let eventsStreamReadyGate: LifecycleAsyncGate?
+    private let sendUserMessageGate: LifecycleAsyncGate?
     private let sessionRef = NativeAgentRuntimeSessionRef(sessionID: "lifecycle-claude-session")
     private let stream: AsyncStream<NativeAgentRuntimeEvent>
 
@@ -2350,13 +2665,17 @@ private actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         label: String = "claude",
         hasTurnInFlight: Bool = false,
         failSend: Bool = false,
-        currentSessionRefGate: LifecycleAsyncGate? = nil
+        currentSessionRefGate: LifecycleAsyncGate? = nil,
+        eventsStreamReadyGate: LifecycleAsyncGate? = nil,
+        sendUserMessageGate: LifecycleAsyncGate? = nil
     ) {
         self.recorder = recorder
         self.label = label
         turnInFlight = hasTurnInFlight
         self.failSend = failSend
         self.currentSessionRefGate = currentSessionRefGate
+        self.eventsStreamReadyGate = eventsStreamReadyGate
+        self.sendUserMessageGate = sendUserMessageGate
         stream = AsyncStream { _ in }
     }
 
@@ -2372,7 +2691,13 @@ private actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         stream
     }
 
-    func ensureEventsStreamReady() async {}
+    func ensureEventsStreamReady() async {
+        if let eventsStreamReadyGate {
+            recorder.record("\(label):events-ready")
+            await eventsStreamReadyGate.arriveAndWait()
+        }
+    }
+
     func resetEventsStreamForNewRun() async {}
 
     func startOrResume(
@@ -2397,6 +2722,9 @@ private actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
 
     func sendUserMessage(_ text: String) async throws -> UUID {
         recorder.record("\(label):send")
+        if let sendUserMessageGate {
+            await sendUserMessageGate.arriveAndWait()
+        }
         if failSend {
             throw LifecycleTestError.expectedClaudeSendFailure
         }

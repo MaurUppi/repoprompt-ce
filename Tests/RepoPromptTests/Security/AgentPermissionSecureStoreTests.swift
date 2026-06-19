@@ -167,11 +167,11 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            binding.runtimePermission.claudePermissionMode,
+            binding.runtimePermission.claudeLaunchPolicy?.permissionMode,
             ClaudeAgentToolPreferences.PermissionLevel.requireApproval.permissionMode
         )
-        XCTAssertEqual(binding.runtimePermission.claudeAllowNativeBashTool, false)
-        XCTAssertEqual(binding.runtimePermission.claudeMCPStrictMode, true)
+        XCTAssertEqual(binding.runtimePermission.claudeLaunchPolicy?.allowNativeBashTool, false)
+        XCTAssertEqual(binding.runtimePermission.claudeLaunchPolicy?.mcpStrictMode, true)
         XCTAssertEqual(binding.claudeTools?.bashToolEnabled, false)
         XCTAssertEqual(binding.claudeTools?.mcpStrictModeEnabled, true)
     }

@@ -3,6 +3,12 @@ import Foundation
 actor AgentRunSessionStore {
     static let shared = AgentRunSessionStore()
 
+    private static func timeoutNanoseconds(_ timeoutSeconds: TimeInterval) -> UInt64 {
+        guard timeoutSeconds.isFinite, timeoutSeconds > 0 else { return 0 }
+        let maxSeconds = Double(UInt64.max) / 1_000_000_000
+        return UInt64((min(timeoutSeconds, maxSeconds) * 1_000_000_000).rounded(.up))
+    }
+
     struct Registration: Equatable, Hashable {
         let sessionID: UUID
         let generation: UInt64
@@ -417,7 +423,7 @@ actor AgentRunSessionStore {
                     Task { [weak self] in
                         do {
                             try await Task.sleep(
-                                nanoseconds: AgentMCPToolHelpers.timeoutNanosecondsClamped(timeout)
+                                nanoseconds: Self.timeoutNanoseconds(timeout)
                             )
                             await self?.timeoutWaiter(sessionID: cursor.registration.sessionID, waiterID: waiterID)
                         } catch {}

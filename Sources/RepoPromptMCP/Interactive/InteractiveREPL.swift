@@ -620,7 +620,7 @@ actor InteractiveREPL {
     }
 
     private func snapshotTools(to path: String) async throws {
-        let tools = try await session.cachedToolsOrRefresh()
+        let tools = try await session.refreshTools()
 
         let snapshot = await ToolSnapshot(
             generatedAt: Date(),
@@ -799,7 +799,7 @@ actor InteractiveREPL {
     }
 
     private func snapshotToolsSingleShot(to path: String) async throws {
-        let tools = try await session.cachedToolsOrRefresh()
+        let tools = try await session.refreshTools()
 
         let snapshot = await ToolSnapshot(
             generatedAt: Date(),
@@ -820,20 +820,6 @@ actor InteractiveREPL {
         print("Snapshot written to: \(url.path)")
         print("Contains \(tools.count) tools")
     }
-
-    #if DEBUG
-        func test_printToolList(mode: ToolListMode = .all) async throws {
-            try await printToolList(mode: mode)
-        }
-
-        func test_printToolsSchemaJSON(mode: ToolListMode = .all) async throws {
-            try await printToolsSchemaJSON(mode: mode)
-        }
-
-        func test_describeTool(_ name: String) async throws {
-            try await describeTool(name)
-        }
-    #endif
 
     // MARK: - Status
 

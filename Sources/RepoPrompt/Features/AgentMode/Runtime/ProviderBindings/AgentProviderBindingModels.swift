@@ -165,9 +165,7 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
     let codexSandboxMode: CodexAgentToolPreferences.SandboxMode?
     let codexApprovalPolicy: CodexAgentToolPreferences.ApprovalPolicy?
     let codexApprovalReviewer: CodexAgentToolPreferences.ApprovalReviewer?
-    let claudePermissionMode: String?
-    let claudeAllowNativeBashTool: Bool?
-    let claudeMCPStrictMode: Bool?
+    let claudeLaunchPolicy: ClaudeControllerLaunchPolicy?
     let acpSessionModeID: String?
     let autoApproveAllACPToolPermissions: Bool
     let acceptsPendingACPApprovalWhenActivated: Bool
@@ -176,9 +174,7 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
         codexSandboxMode: CodexAgentToolPreferences.SandboxMode? = nil,
         codexApprovalPolicy: CodexAgentToolPreferences.ApprovalPolicy? = nil,
         codexApprovalReviewer: CodexAgentToolPreferences.ApprovalReviewer? = nil,
-        claudePermissionMode: String? = nil,
-        claudeAllowNativeBashTool: Bool? = nil,
-        claudeMCPStrictMode: Bool? = nil,
+        claudeLaunchPolicy: ClaudeControllerLaunchPolicy? = nil,
         acpSessionModeID: String? = nil,
         autoApproveAllACPToolPermissions: Bool = false,
         acceptsPendingACPApprovalWhenActivated: Bool = false
@@ -186,9 +182,7 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
         self.codexSandboxMode = codexSandboxMode
         self.codexApprovalPolicy = codexApprovalPolicy
         self.codexApprovalReviewer = codexApprovalReviewer
-        self.claudePermissionMode = claudePermissionMode
-        self.claudeAllowNativeBashTool = claudeAllowNativeBashTool
-        self.claudeMCPStrictMode = claudeMCPStrictMode
+        self.claudeLaunchPolicy = claudeLaunchPolicy
         self.acpSessionModeID = acpSessionModeID
         self.autoApproveAllACPToolPermissions = autoApproveAllACPToolPermissions
         self.acceptsPendingACPApprovalWhenActivated = acceptsPendingACPApprovalWhenActivated

@@ -88,13 +88,6 @@ enum AgentMCPToolHelpers {
         return seconds
     }
 
-    static func timeoutNanosecondsClamped(_ timeoutSeconds: TimeInterval) -> UInt64 {
-        guard timeoutSeconds.isFinite, timeoutSeconds > 0 else { return 0 }
-        let maxSeconds = Double(UInt64.max) / 1_000_000_000
-        let boundedSeconds = min(timeoutSeconds, maxSeconds)
-        return UInt64((boundedSeconds * 1_000_000_000).rounded(.up))
-    }
-
     private static func renderTimeout(_ seconds: TimeInterval) -> String {
         seconds.rounded(.down) == seconds ? String(Int(seconds)) : String(seconds)
     }
