@@ -95,6 +95,94 @@ import XCTest
             )
             XCTAssertEqual(result.results, authoritative)
             XCTAssertEqual(result.results.map(\.rootID), [loadedLater.id])
+
+            let precomposedRoot = try WorkspaceRootRecord(
+                id: XCTUnwrap(UUID(uuidString: "30000000-0000-0000-0000-000000000001")),
+                name: "Precomposed",
+                fullPath: "/virtual/precomposed"
+            )
+            let decomposedRoot = try WorkspaceRootRecord(
+                id: XCTUnwrap(UUID(uuidString: "30000000-0000-0000-0000-000000000002")),
+                name: "Decomposed",
+                fullPath: "/virtual/decomposed"
+            )
+            let precomposedID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+            let decomposedID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000002"))
+            let sharedFullPath = "/virtual/shared/Target.swift"
+            let precomposedFile = WorkspaceFileRecord(
+                id: precomposedID,
+                rootID: precomposedRoot.id,
+                name: "Target.swift",
+                relativePath: "Target.swift",
+                fullPath: sharedFullPath,
+                parentFolderID: nil
+            )
+            let decomposedFile = WorkspaceFileRecord(
+                id: decomposedID,
+                rootID: decomposedRoot.id,
+                name: "Target.swift",
+                relativePath: "Target.swift",
+                fullPath: sharedFullPath,
+                parentFolderID: nil
+            )
+            let precomposedEntry = WorkspaceSearchCatalogEntry(
+                file: precomposedFile,
+                root: precomposedRoot,
+                displayPath: "ÉTarget.swift"
+            )
+            let decomposedEntry = WorkspaceSearchCatalogEntry(
+                file: decomposedFile,
+                root: decomposedRoot,
+                displayPath: "E\u{301}Target.swift"
+            )
+            XCTAssertEqual(precomposedEntry.pathSearchIndexKey, decomposedEntry.pathSearchIndexKey)
+            XCTAssertNotEqual(
+                Array(precomposedEntry.pathSearchIndexKey.utf8),
+                Array(decomposedEntry.pathSearchIndexKey.utf8)
+            )
+
+            let precomposedIndex = try WorkspaceSearchRootPathIndex(
+                identity: WorkspaceSearchRootPathIndexIdentity(
+                    rootID: precomposedRoot.id,
+                    lifetimeID: XCTUnwrap(UUID(uuidString: "40000000-0000-0000-0000-000000000001")),
+                    topologyGeneration: 1
+                ),
+                rootPath: precomposedRoot.standardizedFullPath,
+                entries: [precomposedEntry]
+            )
+            let decomposedIndex = try WorkspaceSearchRootPathIndex(
+                identity: WorkspaceSearchRootPathIndexIdentity(
+                    rootID: decomposedRoot.id,
+                    lifetimeID: XCTUnwrap(UUID(uuidString: "40000000-0000-0000-0000-000000000002")),
+                    topologyGeneration: 1
+                ),
+                rootPath: decomposedRoot.standardizedFullPath,
+                entries: [decomposedEntry]
+            )
+            let unicodeSnapshot = WorkspaceSearchCatalogSnapshot(
+                generation: 1,
+                rootScope: .visibleWorkspace,
+                roots: [precomposedRoot, decomposedRoot],
+                files: [precomposedFile, decomposedFile],
+                entries: [precomposedEntry, decomposedEntry],
+                rootPathIndexes: [precomposedIndex, decomposedIndex],
+                diagnostics: WorkspaceCatalogDiagnostics(
+                    generation: 1,
+                    rootScope: .visibleWorkspace,
+                    rootCount: 2,
+                    folderCount: 0,
+                    fileCount: 2
+                )
+            )
+            let unicodeAuthoritative = WorkspaceSearchService.authoritativeGlobalResultsForTesting(
+                from: unicodeSnapshot,
+                query: "Target",
+                limit: 1
+            )
+            XCTAssertEqual(unicodeAuthoritative.map(\.id), [decomposedID])
+            await service.prepareIndex(from: unicodeSnapshot)
+            let unicodeResult = await service.search("Target", limit: 1)
+            XCTAssertEqual(unicodeResult.results, unicodeAuthoritative)
         }
 
         func testChangedRootOnlyRebuildsItsPathIndexAndUnloadReloadResetsLifetime() async throws {
@@ -190,6 +278,96 @@ import XCTest
                 afterFolderPatch.overlayPathIndexBuildCount,
                 beforeFolderPatch.overlayPathIndexBuildCount
             )
+
+            let virtualRoot = try WorkspaceRootRecord(
+                id: XCTUnwrap(UUID(uuidString: "10000000-0000-0000-0000-000000000000")),
+                name: "Virtual",
+                fullPath: "/virtual"
+            )
+            let precomposedID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+            let decomposedID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000002"))
+            let sharedRelativePath = "Target.swift"
+            let sharedFullPath = "/virtual/Target.swift"
+            let precomposedFile = WorkspaceFileRecord(
+                id: precomposedID,
+                rootID: virtualRoot.id,
+                name: sharedRelativePath,
+                relativePath: sharedRelativePath,
+                fullPath: sharedFullPath,
+                parentFolderID: nil
+            )
+            let decomposedFile = WorkspaceFileRecord(
+                id: decomposedID,
+                rootID: virtualRoot.id,
+                name: sharedRelativePath,
+                relativePath: sharedRelativePath,
+                fullPath: sharedFullPath,
+                parentFolderID: nil
+            )
+            let precomposedEntry = WorkspaceSearchCatalogEntry(
+                file: precomposedFile,
+                root: virtualRoot,
+                displayPath: "Virtual/ÉTarget.swift"
+            )
+            let decomposedEntry = WorkspaceSearchCatalogEntry(
+                file: decomposedFile,
+                root: virtualRoot,
+                displayPath: "Virtual/E\u{301}Target.swift"
+            )
+            XCTAssertEqual(precomposedEntry.pathSearchIndexKey, decomposedEntry.pathSearchIndexKey)
+            XCTAssertNotEqual(
+                Array(precomposedEntry.pathSearchIndexKey.utf8),
+                Array(decomposedEntry.pathSearchIndexKey.utf8)
+            )
+
+            let lifetimeID = try XCTUnwrap(UUID(uuidString: "20000000-0000-0000-0000-000000000000"))
+            let baseIndex = WorkspaceSearchRootPathIndex(
+                identity: WorkspaceSearchRootPathIndexIdentity(
+                    rootID: virtualRoot.id,
+                    lifetimeID: lifetimeID,
+                    topologyGeneration: 1
+                ),
+                rootPath: virtualRoot.standardizedFullPath,
+                entries: [precomposedEntry]
+            )
+            let overlayIndex = baseIndex.applyingPatch(
+                identity: WorkspaceSearchRootPathIndexIdentity(
+                    rootID: virtualRoot.id,
+                    lifetimeID: lifetimeID,
+                    topologyGeneration: 2
+                ),
+                entries: [precomposedEntry, decomposedEntry],
+                changedFileIDs: [decomposedID]
+            )
+            XCTAssertEqual(
+                overlayIndex.search("Target", limit: 1).map(\.entry.id),
+                [decomposedID]
+            )
+
+            let unicodeSnapshot = WorkspaceSearchCatalogSnapshot(
+                generation: 2,
+                rootScope: .visibleWorkspace,
+                roots: [virtualRoot],
+                files: [precomposedFile, decomposedFile],
+                entries: [precomposedEntry, decomposedEntry],
+                rootPathIndexes: [overlayIndex],
+                diagnostics: WorkspaceCatalogDiagnostics(
+                    generation: 2,
+                    rootScope: .visibleWorkspace,
+                    rootCount: 1,
+                    folderCount: 0,
+                    fileCount: 2
+                )
+            )
+            let authoritative = WorkspaceSearchService.authoritativeGlobalResultsForTesting(
+                from: unicodeSnapshot,
+                query: "Target",
+                limit: 1
+            )
+            XCTAssertEqual(authoritative.map(\.id), [decomposedID])
+            await service.prepareIndex(from: unicodeSnapshot)
+            let indexed = await service.search("Target", limit: 1)
+            XCTAssertEqual(indexed.results, authoritative)
         }
 
         func testOverlayCompactsAtBoundWhileRetainedReadersStayImmutable() async throws {

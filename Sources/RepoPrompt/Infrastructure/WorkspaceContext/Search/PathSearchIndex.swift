@@ -140,7 +140,22 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
 
         init(entries: [WorkspaceSearchCatalogEntry]) {
             self.entries = entries
-            index = PathSearchIndex(paths: entries.map(\.pathSearchIndexKey))
+            #if DEBUG
+                let keyStart = WorkspaceFileSearchDebugTiming.now()
+                let keys = entries.map(\.pathSearchIndexKey)
+                let keyEnd = WorkspaceFileSearchDebugTiming.now()
+                WorkspaceFileSearchDebugContext.catalogBuildObserver?.recordPathIndexKey(
+                    nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(since: keyStart, through: keyEnd)
+                )
+                let indexStart = WorkspaceFileSearchDebugTiming.now()
+                index = PathSearchIndex(paths: keys)
+                let indexEnd = WorkspaceFileSearchDebugTiming.now()
+                WorkspaceFileSearchDebugContext.catalogBuildObserver?.recordPathIndexConstruction(
+                    nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(since: indexStart, through: indexEnd)
+                )
+            #else
+                index = PathSearchIndex(paths: entries.map(\.pathSearchIndexKey))
+            #endif
         }
     }
 
@@ -328,8 +343,13 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
 
     private static func candidatePrecedes(_ lhs: Candidate, _ rhs: Candidate) -> Bool {
         if lhs.score != rhs.score { return lhs.score > rhs.score }
-        if lhs.tieBreakKey != rhs.tieBreakKey {
-            return lhs.tieBreakKey.utf8.lexicographicallyPrecedes(rhs.tieBreakKey.utf8)
+        switch WorkspaceFileContextStore.compareUTF8Binary(lhs.tieBreakKey, rhs.tieBreakKey) {
+        case .orderedAscending:
+            return true
+        case .orderedDescending:
+            return false
+        case .orderedSame:
+            break
         }
         if lhs.entry.rootPath != rhs.entry.rootPath {
             return lhs.entry.rootPath < rhs.entry.rootPath

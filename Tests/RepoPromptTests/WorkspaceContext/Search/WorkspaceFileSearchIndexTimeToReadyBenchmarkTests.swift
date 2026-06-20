@@ -58,9 +58,17 @@ import XCTest
         }
 
         func testLargeRepositoryTimeToReadyBenchmark() async throws {
+            let metricsEnabled = WorkspaceFileSearchIndexBenchmarkRuntimeConfiguration.isEnabled(
+                environmentKey: "RP_RUN_FILE_SEARCH_INDEX_METRICS",
+                configurationKey: "metricsEnabled"
+            )
+            let sortDiagnosticsEnabled = WorkspaceFileSearchIndexBenchmarkRuntimeConfiguration.isEnabled(
+                environmentKey: "RP_RUN_FILE_SEARCH_INDEX_SORT_DIAGNOSTICS",
+                configurationKey: "sortDiagnosticsEnabled"
+            )
             try XCTSkipUnless(
-                ProcessInfo.processInfo.environment["RP_RUN_FILE_SEARCH_INDEX_METRICS"] == "1"
-                    || ProcessInfo.processInfo.environment["RP_CE_FILE_SEARCH_INDEX_REPORT_PATH"] != nil
+                metricsEnabled
+                    || WorkspaceFileSearchIndexBenchmarkRun.reportURLFromEnvironment != nil
                     || FileManager.default.fileExists(atPath: "/tmp/RepoPromptCE-file-search-index-opt-in"),
                 "CE file-search index benchmark is opt-in. Set RP_RUN_FILE_SEARCH_INDEX_METRICS=1, RP_CE_FILE_SEARCH_INDEX_REPORT_PATH, or create /tmp/RepoPromptCE-file-search-index-opt-in."
             )
@@ -70,10 +78,16 @@ import XCTest
             let environment = WorkspaceFileSearchIndexBenchmarkEnvironment.capture()
             let coldWorktree = try await runColdWorktreeScenario(fixture: fixture)
             let incrementalRebuild = try await runIncrementalRebuildScenario(fixture: fixture)
+            let sortDiagnostic: WorkspaceFileSearchIndexSortDiagnostic? = if metricsEnabled, sortDiagnosticsEnabled {
+                try await runSortAttributionProbe()
+            } else {
+                nil
+            }
             let run = WorkspaceFileSearchIndexBenchmarkRun(
                 environment: environment,
                 coldWorktree: coldWorktree,
-                incrementalRebuild: incrementalRebuild
+                incrementalRebuild: incrementalRebuild,
+                sortDiagnostic: sortDiagnostic
             )
             try print(run.consoleReport())
             if let reportURL = WorkspaceFileSearchIndexBenchmarkRun.reportURLFromEnvironment {
@@ -152,17 +166,26 @@ import XCTest
                 let committedProjection = try await materializer.commit(preparation)
                 let projection = try XCTUnwrap(committedProjection)
                 let materialized = DispatchTime.now()
-                let result = try await StoreBackedWorkspaceSearch.search(
-                    pattern: "FirstScopedNeedle",
-                    mode: .path,
-                    maxPaths: 1,
-                    rootScope: projection.lookupRootScope,
-                    store: store,
-                    workspaceManager: nil
-                )
+                let phaseCollector = WorkspaceFileSearchPhaseCollector()
+                let result = try await WorkspaceFileSearchDebugContext.$collector.withValue(phaseCollector) {
+                    try await StoreBackedWorkspaceSearch.search(
+                        pattern: "FirstScopedNeedle",
+                        mode: .path,
+                        maxPaths: 1,
+                        rootScope: projection.lookupRootScope,
+                        store: store,
+                        workspaceManager: nil
+                    )
+                }
                 let finished = DispatchTime.now()
+                let phases = phaseCollector.snapshot(
+                    readySearchNanoseconds: finished.uptimeNanoseconds - materialized.uptimeNanoseconds
+                )
                 let physicalRootID = try XCTUnwrap(projection.physicalRootRefs.first?.id)
-                let snapshot = await store.searchCatalogSnapshot(rootScope: projection.lookupRootScope)
+                let snapshot = await store.searchCatalogSnapshot(
+                    rootScope: projection.lookupRootScope,
+                    requirement: .recordsOnly
+                )
                 let after = await WorkspaceFileSearchIndexBenchmarkCounterMark.capture(
                     store: store,
                     rootID: physicalRootID
@@ -170,6 +193,7 @@ import XCTest
                 let counters = after.delta(from: before)
 
                 try require(projection.isFullyMaterialized, "Cold projection must be fully materialized")
+                try require(phases.status == .completed, "Cold phase collector must complete")
                 try require(result.paths == [fixture.firstScopedNeedleURL.path], "Cold search must return the worktree needle")
                 try require(!(result.paths?.contains { $0.hasPrefix(fixture.visibleRootURL.path) } ?? false), "Cold search must not substitute the visible root")
                 try require(snapshot.diagnostics.fileCount == WorkspaceFileSearchIndexBenchmarkFixture.seedFileCount, "Cold snapshot file count must match the fixture")
@@ -178,8 +202,17 @@ import XCTest
                 try require(counters.shardBuild == 1, "Cold sample must build one shard")
                 try require(counters.patch == 0, "Cold sample must not patch a shard")
                 try require(counters.authoritative == 1, "Cold sample must perform one authoritative shard build")
-                try require(counters.pathIndexBuild == 1, "Cold sample must build one full path index")
+                try require(counters.pathIndexBuild == 0, "Cold sample must not build a full path index")
                 try require(counters.overlayPathIndexBuild == 0, "Cold sample must not build an overlay")
+                try require(phases.catalog.pathIndexKeyMicroseconds == 0, "Cold path-index key phase must be zero")
+                try require(
+                    phases.catalog.pathIndexConstructionMicroseconds == 0,
+                    "Cold path-index construction phase must be zero"
+                )
+                try require(
+                    counterVector(counters) == [1, 0, 1, 0, 1, 0, 0, 0, 1, 1],
+                    "Cold counter vector must match the records-only contract"
+                )
                 let fallbackDiagnostics = counters.fallbackDiagnosticDescription()
                 try require(
                     counters.fallbackReasonDeltasAreNonnegative,
@@ -208,7 +241,8 @@ import XCTest
                     totalWallMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: started, to: finished),
                     preSearchMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: started, to: materialized),
                     searchMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: materialized, to: finished),
-                    counters: counters
+                    counters: counters,
+                    phases: phases
                 )
             } catch {
                 await materializer.abort(preparation)
@@ -237,7 +271,7 @@ import XCTest
                 canonicalRootPaths: [],
                 physicalRootPaths: [fixture.worktreeRootURL.standardizedFileURL.path]
             )
-            _ = await store.searchCatalogSnapshot(rootScope: scope)
+            _ = await store.searchCatalogSnapshot(rootScope: scope, requirement: .recordsOnly)
             let initialResult = try await StoreBackedWorkspaceSearch.search(
                 pattern: "FirstScopedNeedle",
                 mode: .path,
@@ -295,23 +329,30 @@ import XCTest
                 deltas: [.fileAdded(relativePath)]
             )
             let published = DispatchTime.now()
-            let result = try await StoreBackedWorkspaceSearch.search(
-                pattern: relativePath,
-                mode: .path,
-                maxPaths: 1,
-                rootScope: scope,
-                store: store,
-                workspaceManager: nil
-            )
+            let phaseCollector = WorkspaceFileSearchPhaseCollector()
+            let result = try await WorkspaceFileSearchDebugContext.$collector.withValue(phaseCollector) {
+                try await StoreBackedWorkspaceSearch.search(
+                    pattern: relativePath,
+                    mode: .path,
+                    maxPaths: 1,
+                    rootScope: scope,
+                    store: store,
+                    workspaceManager: nil
+                )
+            }
             let finished = DispatchTime.now()
+            let phases = phaseCollector.snapshot(
+                readySearchNanoseconds: finished.uptimeNanoseconds - published.uptimeNanoseconds
+            )
             let after = await WorkspaceFileSearchIndexBenchmarkCounterMark.capture(store: store, rootID: rootID)
             let counters = after.delta(from: before)
-            let snapshot = await store.searchCatalogSnapshot(rootScope: scope)
+            let snapshot = await store.searchCatalogSnapshot(rootScope: scope, requirement: .recordsOnly)
             let workDiagnostics = await store.storeWorkDiagnosticsSnapshot()
             let shardDiagnostics = try XCTUnwrap(
                 workDiagnostics.rootCatalogShards.roots.first { $0.rootID == rootID }
             )
 
+            try require(phases.status == .completed, "Incremental phase collector must complete")
             try require(result.paths == [fileURL.path], "Incremental search must return the added path")
             try require(snapshot.files.contains { $0.standardizedFullPath == fileURL.path }, "Fresh scoped snapshot must contain the added path")
             try require(counters.appliedGeneration == 1, "Incremental sample must advance one applied generation")
@@ -319,8 +360,12 @@ import XCTest
             try require(counters.shardBuild == 1, "Incremental sample must build one shard")
             try require(counters.patch == 1, "Incremental sample must apply one shard patch")
             try require(counters.authoritative == 0, "Incremental sample must not rebuild authoritatively")
-            try require(counters.pathIndexBuild == 0, "Incremental sample must reuse the full path index")
-            try require(counters.overlayPathIndexBuild == 1, "Incremental sample must build one overlay")
+            try require(counters.pathIndexBuild == 0, "Incremental sample must not build a full path index")
+            try require(counters.overlayPathIndexBuild == 0, "Incremental sample must not build an overlay")
+            try require(
+                counterVector(counters) == [0, 1, 1, 1, 0, 0, 0, 0, 1, 1],
+                "Incremental counter vector must match the records-only contract"
+            )
             let fallbackDiagnostics = counters.fallbackDiagnosticDescription()
             try require(
                 counters.fallbackReasonDeltasAreNonnegative,
@@ -346,8 +391,88 @@ import XCTest
                 totalWallMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: started, to: finished),
                 preSearchMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: started, to: published),
                 searchMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: published, to: finished),
-                counters: counters
+                counters: counters,
+                phases: phases
             )
+        }
+
+        private func runSortAttributionProbe() async throws -> WorkspaceFileSearchIndexSortDiagnostic {
+            let fixture = try WorkspaceFileSearchIndexBenchmarkFixture.make()
+            defer { fixture.remove() }
+
+            let store = WorkspaceFileContextStore(enableCatalogShardShadowValidation: false)
+            let worktreeRoot = try await store.loadRoot(
+                path: fixture.worktreeRootURL.path,
+                kind: .sessionWorktree
+            )
+            let scope = WorkspaceLookupRootScope.sessionBoundWorkspace(
+                canonicalRootPaths: [],
+                physicalRootPaths: [fixture.worktreeRootURL.standardizedFileURL.path]
+            )
+            let before = await WorkspaceFileSearchIndexBenchmarkCounterMark.capture(
+                store: store,
+                rootID: worktreeRoot.id
+            )
+            let workBefore = await store.storeWorkDiagnosticsSnapshot()
+            let catalogCacheBefore = await store.searchCatalogSnapshotCacheCountForTesting()
+            let staticCacheBefore = await store.staticPathMatchSnapshotCacheCountForTesting()
+            let sessionGenerationBefore = await store.sessionCatalogGenerationForTesting(scope: scope)
+            let rootsBefore = await store.roots().map(\.id)
+
+            let probe = await store.debugAuthoritativeCatalogSortProbe(rootScope: scope)
+
+            let after = await WorkspaceFileSearchIndexBenchmarkCounterMark.capture(
+                store: store,
+                rootID: worktreeRoot.id
+            )
+            let workAfter = await store.storeWorkDiagnosticsSnapshot()
+            let catalogCacheAfter = await store.searchCatalogSnapshotCacheCountForTesting()
+            let staticCacheAfter = await store.staticPathMatchSnapshotCacheCountForTesting()
+            let sessionGenerationAfter = await store.sessionCatalogGenerationForTesting(scope: scope)
+            let rootsAfter = await store.roots().map(\.id)
+            let counters = after.delta(from: before)
+            let storeStateUnchanged = counterVector(counters).allSatisfy { $0 == 0 }
+                && workAfter == workBefore
+                && catalogCacheAfter == catalogCacheBefore
+                && staticCacheAfter == staticCacheBefore
+                && sessionGenerationAfter == sessionGenerationBefore
+                && rootsAfter == rootsBefore
+
+            try require(probe.status == .completed, "Sort attribution probe must complete")
+            try require(
+                probe.sourceFileCount == WorkspaceFileSearchIndexBenchmarkFixture.seedFileCount,
+                "Sort attribution probe file count must match the fresh fixture"
+            )
+            try require(
+                probe.sourceFolderCount == WorkspaceFileSearchIndexBenchmarkFixture.folderCount,
+                "Sort attribution probe folder count must match the fresh fixture"
+            )
+            try require(probe.samples.count == 3, "Sort attribution probe must retain three samples")
+            try require(
+                probe.directAndProjectedOrdersMatch,
+                "Sort attribution probe direct/projected ordering must match"
+            )
+            try require(storeStateUnchanged, "Sort attribution probe must not mutate store state")
+            await unloadAllRoots(in: store)
+            return WorkspaceFileSearchIndexSortDiagnostic(
+                probe: probe,
+                storeStateUnchanged: storeStateUnchanged
+            )
+        }
+
+        private func counterVector(_ counters: WorkspaceFileSearchIndexBenchmarkCounters) -> [Int] {
+            [
+                counters.crawl,
+                counters.appliedGeneration,
+                counters.shardBuild,
+                counters.patch,
+                counters.authoritative,
+                counters.pathIndexBuild,
+                counters.overlayPathIndexBuild,
+                counters.fallback,
+                counters.catalogRebuild,
+                counters.catalogInvalidation
+            ]
         }
 
         private func require(
