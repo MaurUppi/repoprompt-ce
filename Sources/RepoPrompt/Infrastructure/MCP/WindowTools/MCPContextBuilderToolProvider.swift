@@ -416,6 +416,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                                 effectivePrompt,
                                 sel,
                                 lookupContext,
+                                tabResolution.reviewGitContext,
                                 progressReporter,
                                 activityReporter
                             )

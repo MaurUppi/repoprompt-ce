@@ -3457,7 +3457,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 XCTAssertNil(sample.watcherAcceptedWatermark, caseLabel)
                 XCTAssertEqual(sample.preparedDeltaCount, fileCount, caseLabel)
                 XCTAssertEqual(sample.topologyInvalidationCount, 1, caseLabel)
-                XCTAssertEqual(sample.catalogGenerationAdvanceCount, 3, caseLabel)
+                XCTAssertEqual(sample.catalogGenerationAdvanceCount, 4, caseLabel)
                 XCTAssertEqual(sample.searchCatalogCacheClearCount, 1, caseLabel)
                 XCTAssertEqual(sample.pathWorkerInvalidationRequestCount, 0, caseLabel)
                 XCTAssertEqual(sample.contentInvalidationCount, 0, caseLabel)

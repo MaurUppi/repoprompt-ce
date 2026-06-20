@@ -83,15 +83,21 @@ import XCTest
                         )
                     }
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
-                        _, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, _, _ in
+                        _, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, _, _ in
                         XCTAssertEqual(agentModeSessionID, sessionID)
                         XCTAssertEqual(agentModeRunID, parentRunID)
+                        XCTAssertEqual(reviewGitContext.compareIntent, .uncommittedHEAD)
+                        XCTAssertEqual(
+                            reviewGitContext.displayContext.roots.first?.physicalRootPath,
+                            worktreeRoot.standardizedFileURL.path
+                        )
                         let message = await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
                             from: HeadlessContextSnapshot(
                                 tabID: tabID,
                                 promptText: prompt,
                                 selection: selection,
-                                lookupContext: lookupContext
+                                lookupContext: lookupContext,
+                                reviewGitContext: reviewGitContext
                             ),
                             model: fixture.contextA.window.promptManager.preferredAIModel,
                             mode: mode
@@ -181,6 +187,13 @@ import XCTest
                         XCTAssertEqual(followUp.selection.selectedPaths, [logicalFile.path])
                         XCTAssertNotNil(followUp.lookupContext?.bindingProjection)
                     }
+                    XCTAssertNil(followUps[0].gitDiff)
+                    XCTAssertTrue(
+                        followUps[1].gitDiff?.contains("REPOPROMPT REVIEW DIFF INCOMPLETE") == true,
+                        followUps[1].gitDiff ?? ""
+                    )
+                    XCTAssertFalse(followUps[1].gitDiff?.contains(worktreeRoot.path) ?? true)
+                    XCTAssertFalse(followUps[1].gitDiff?.contains(canonicalSentinel) ?? true)
 
                     let lookupContext = try await AgentWorkspaceLookupContextResolver.requiredLookupContext(
                         source: AgentWorkspaceLookupContextSource(

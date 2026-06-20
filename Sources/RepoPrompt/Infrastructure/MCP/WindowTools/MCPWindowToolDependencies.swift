@@ -14,6 +14,7 @@ struct MCPWindowToolDependencies {
         let bindCaller: Bool
         let lookupContext: WorkspaceLookupContext
         let workspaceContext: ContextBuilderWorkspaceContext?
+        let reviewGitContext: FrozenPromptGitReviewContext
     }
 
     typealias ExecuteTool = @Sendable (_ args: [String: Value]) async throws -> Value
@@ -87,6 +88,7 @@ struct MCPWindowToolDependencies {
         _ prompt: String,
         _ selection: StoredSelection,
         _ lookupContext: WorkspaceLookupContext?,
+        _ reviewGitContext: FrozenPromptGitReviewContext,
         _ progressReporter: ContextBuilderMCPProgressReporter?,
         _ activityReporter: ContextBuilderMCPActivityReporter?
     ) async throws -> ChatSendReply

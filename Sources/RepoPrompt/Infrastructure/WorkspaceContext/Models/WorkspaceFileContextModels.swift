@@ -5,6 +5,7 @@ enum WorkspaceLookupRootScope: Hashable {
     case visibleWorkspace
     case visibleWorkspacePlusGitData
     case allLoaded
+    case allLoadedExcludingGitData
     case sessionBoundWorkspace(canonicalRootPaths: Set<String>, physicalRootPaths: Set<String>)
     case validatedSessionBoundWorkspace(
         canonicalRoots: Set<WorkspaceRootRef>,
@@ -384,6 +385,7 @@ struct ResolvedPromptFileEntry: Identifiable, Equatable {
     let mode: PromptFileEntryMode
     let loadedContent: String?
     let rootFolderPath: String?
+    let role: ResolvedPromptFileEntryRole
 
     init(
         file: WorkspaceFileRecord,
@@ -391,7 +393,8 @@ struct ResolvedPromptFileEntry: Identifiable, Equatable {
         lineRanges: [LineRange]? = nil,
         mode: PromptFileEntryMode = .fullFile,
         loadedContent: String? = nil,
-        rootFolderPath: String? = nil
+        rootFolderPath: String? = nil,
+        role: ResolvedPromptFileEntryRole = .ordinary
     ) {
         id = ResolvedPromptFileEntryID(fileID: file.id, mode: mode, lineRanges: lineRanges)
         self.file = file
@@ -400,7 +403,13 @@ struct ResolvedPromptFileEntry: Identifiable, Equatable {
         self.mode = mode
         self.loadedContent = loadedContent
         self.rootFolderPath = rootFolderPath
+        self.role = role
     }
+}
+
+enum ResolvedPromptFileEntryRole: Equatable {
+    case ordinary
+    case authorizedGitDiffArtifact
 }
 
 struct ResolvedPromptFileBlockRecord: Equatable {

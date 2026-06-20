@@ -3761,6 +3761,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         prompt: String,
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext? = nil,
+        reviewGitContext: FrozenPromptGitReviewContext,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
         chatName: String,
@@ -3804,7 +3805,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     tabID: tabID,
                     promptText: prompt,
                     selection: selection,
-                    lookupContext: lookupContext
+                    lookupContext: lookupContext,
+                    reviewGitContext: reviewGitContext
                 ),
                 model: model,
                 mode: mode,
@@ -3953,6 +3955,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         prompt: String,
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext? = nil,
+        reviewGitContext: FrozenPromptGitReviewContext,
         gitScopeOverride: GitInclusion? = nil,
         progressReporter: ContextBuilderMCPProgressReporter? = nil,
         activityReporter: ContextBuilderMCPActivityReporter? = nil
@@ -3997,6 +4000,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             prompt: prompt,
             selection: selection,
             lookupContext: lookupContext,
+            reviewGitContext: reviewGitContext,
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID,
             chatName: chatNameForTab(tabID),
@@ -4099,6 +4103,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         case .review: "Review"
         case .chat: "Answer"
         }
+        let reviewGitContext = mode == .review
+            ? await promptManager.freezePromptGitReviewContext(tabID: tabID, base: "HEAD")
+            : .automaticOnly()
 
         return try await runFollowUpOracleStream(
             for: tabID,
@@ -4106,6 +4113,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             mode: mode,
             prompt: prompt,
             selection: selection,
+            reviewGitContext: reviewGitContext,
             chatName: chatName ?? defaultChatName,
             model: promptManager.preferredAIModel,
             chatPresetID: nil,

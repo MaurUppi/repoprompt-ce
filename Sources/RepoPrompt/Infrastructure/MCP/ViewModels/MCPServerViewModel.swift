@@ -822,7 +822,8 @@ final class MCPServerViewModel: ObservableObject {
                 agentModeRunID: resolution.agentModeRunID,
                 bindCaller: resolution.bindCaller,
                 lookupContext: resolution.lookupContext,
-                workspaceContext: resolution.workspaceContext
+                workspaceContext: resolution.workspaceContext,
+                reviewGitContext: resolution.reviewGitContext
             )
         },
         bindTabForConnection: { [weak self] connectionID, clientName, tabID, workspaceID, windowID in
@@ -869,7 +870,7 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while writing Oracle export") }
             return try await writeGeneratedOracleExportFile(path: path, content: content, destination: destination)
         },
-        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, progressReporter, activityReporter in
+        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, progressReporter, activityReporter in
             guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
             #if DEBUG
                 if let override = contextBuilderFollowUpOverrideForTesting {
@@ -882,6 +883,7 @@ final class MCPServerViewModel: ObservableObject {
                         prompt,
                         selection,
                         lookupContext,
+                        reviewGitContext,
                         progressReporter,
                         activityReporter
                     )
@@ -896,6 +898,7 @@ final class MCPServerViewModel: ObservableObject {
                 prompt: prompt,
                 selection: selection,
                 lookupContext: lookupContext,
+                reviewGitContext: reviewGitContext,
                 progressReporter: progressReporter,
                 activityReporter: activityReporter
             )
@@ -2991,7 +2994,8 @@ final class MCPServerViewModel: ObservableObject {
         agentModeRunID: UUID?,
         bindCaller: Bool,
         lookupContext: WorkspaceLookupContext,
-        workspaceContext: ContextBuilderWorkspaceContext?
+        workspaceContext: ContextBuilderWorkspaceContext?,
+        reviewGitContext: FrozenPromptGitReviewContext
     ) {
         let purpose: MCPRunPurpose = if let connectionID {
             await ServerNetworkManager.shared.runPurpose(for: connectionID)
@@ -3050,6 +3054,7 @@ final class MCPServerViewModel: ObservableObject {
                     workspaceContext = try await ContextBuilderWorkspaceContext.resolve(
                         from: context,
                         workspaceRepoPaths: workspace.repoPaths,
+                        workspaceDirectoryPath: targetWindow.workspaceManager.workspaceDirectory(for: workspace).path,
                         store: targetWindow.promptManager.workspaceFileContextStore
                     )
                 } catch {
@@ -3067,6 +3072,17 @@ final class MCPServerViewModel: ObservableObject {
                     workspaceID: context.workspaceID
                 )
             }
+            let reviewGitContext = if let workspaceContext {
+                workspaceContext.reviewGitContext
+            } else {
+                await targetWindow.promptManager.freezePromptGitReviewContext(
+                    workspaceID: context.workspaceID,
+                    tabID: context.tabID,
+                    sessionID: context.activeAgentSessionID,
+                    bindings: context.worktreeBindings,
+                    base: "HEAD"
+                )
+            }
             let agentModeSessionID = purpose == .agentModeRun ? context.activeAgentSessionID : nil
             let agentModeRunID = purpose == .agentModeRun ? context.runID : nil
             return (
@@ -3076,7 +3092,8 @@ final class MCPServerViewModel: ObservableObject {
                 agentModeRunID,
                 shouldBindCaller,
                 lookupContext,
-                workspaceContext
+                workspaceContext,
+                reviewGitContext
             )
         } catch {
             if explicitHint != nil || existingBinding != nil || purpose == .agentModeRun {
@@ -3092,6 +3109,11 @@ final class MCPServerViewModel: ObservableObject {
         ) else {
             throw MCPError.internalError("Failed to create compose tab.")
         }
+        let reviewGitContext = await targetWindow.promptManager.freezePromptGitReviewContext(
+            workspaceID: targetWindow.workspaceManager.activeWorkspace?.id,
+            tabID: createdTab.id,
+            base: "HEAD"
+        )
         return (
             createdTab.id,
             targetWindow.workspaceManager.activeWorkspace?.id,
@@ -3099,7 +3121,8 @@ final class MCPServerViewModel: ObservableObject {
             nil,
             true,
             .visibleWorkspace,
-            nil
+            nil,
+            reviewGitContext
         )
     }
 
@@ -4496,7 +4519,7 @@ final class MCPServerViewModel: ObservableObject {
         let scopedRootIDs = Set(roots.map(\.id))
         let requiresScopedRootMembership = switch lookupContext.rootScope {
         case .sessionBoundWorkspace, .validatedSessionBoundWorkspace: true
-        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded: false
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded, .allLoadedExcludingGitData: false
         }
         var codeStructureFiles: [CodeStructureFile] = []
         var seenPaths = Set<String>()

@@ -6,6 +6,7 @@ struct ContextBuilderWorkspaceContext {
     let worktreeBindings: [AgentSessionWorktreeBinding]
     let lookupContext: WorkspaceLookupContext
     let providerWorkspacePath: String
+    let reviewGitContext: FrozenPromptGitReviewContext
 
     var tabID: UUID {
         frozenTabContext.tabID
@@ -14,6 +15,7 @@ struct ContextBuilderWorkspaceContext {
     static func resolve(
         from snapshot: MCPServerViewModel.TabContextSnapshot,
         workspaceRepoPaths: [String],
+        workspaceDirectoryPath: String,
         store: WorkspaceFileContextStore
     ) async throws -> ContextBuilderWorkspaceContext {
         guard let parentAgentSessionID = snapshot.activeAgentSessionID else {
@@ -73,15 +75,32 @@ struct ContextBuilderWorkspaceContext {
             throw ContextBuilderWorkspaceContextError.missingWorkspaceRoot
         }
 
+        let reviewGitContext = try await FrozenPromptGitReviewContext.make(
+            workspaceID: requireWorkspaceID(snapshot.workspaceID),
+            workspaceDirectoryPath: workspaceDirectoryPath,
+            workspaceRootPaths: workspaceRepoPaths,
+            tabID: snapshot.tabID,
+            sessionID: parentAgentSessionID,
+            bindings: bindings,
+            base: "HEAD",
+            store: store
+        )
+
         let context = ContextBuilderWorkspaceContext(
             parentAgentSessionID: parentAgentSessionID,
             frozenTabContext: snapshot,
             worktreeBindings: bindings,
             lookupContext: lookupContext,
-            providerWorkspacePath: providerWorkspacePath
+            providerWorkspacePath: providerWorkspacePath,
+            reviewGitContext: reviewGitContext
         )
         try context.validateAvailability()
         return context
+    }
+
+    private static func requireWorkspaceID(_ workspaceID: UUID?) throws -> UUID {
+        guard let workspaceID else { throw ContextBuilderWorkspaceContextError.missingWorkspace }
+        return workspaceID
     }
 
     func validateAvailability() throws {

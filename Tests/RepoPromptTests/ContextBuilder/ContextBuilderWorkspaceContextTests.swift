@@ -48,6 +48,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         let context = try await ContextBuilderWorkspaceContext.resolve(
             from: snapshot,
             workspaceRepoPaths: [logicalRoot.path],
+            workspaceDirectoryPath: logicalRoot.path,
             store: store
         )
 
@@ -102,6 +103,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         let context = try await ContextBuilderWorkspaceContext.resolve(
             from: snapshot,
             workspaceRepoPaths: [logicalRoot.path],
+            workspaceDirectoryPath: logicalRoot.path,
             store: store
         )
 
@@ -142,6 +144,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             _ = try await ContextBuilderWorkspaceContext.resolve(
                 from: snapshot,
                 workspaceRepoPaths: [logicalRoot.path],
+                workspaceDirectoryPath: logicalRoot.path,
                 store: store
             )
             XCTFail("Expected unhydrated binding state to fail closed")
@@ -197,6 +200,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             _ = try await ContextBuilderWorkspaceContext.resolve(
                 from: snapshot,
                 workspaceRepoPaths: [logicalRoot.path],
+                workspaceDirectoryPath: logicalRoot.path,
                 store: store
             )
             XCTFail("Expected unavailable inherited worktree to fail closed")

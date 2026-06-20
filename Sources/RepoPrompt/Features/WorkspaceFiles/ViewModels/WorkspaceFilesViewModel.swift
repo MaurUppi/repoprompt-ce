@@ -5758,7 +5758,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         switch scope {
         case .allLoaded:
             return getAllFileViewModels()
-        case .visibleWorkspace, .visibleWorkspacePlusGitData, .sessionBoundWorkspace,
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoadedExcludingGitData, .sessionBoundWorkspace,
              .validatedSessionBoundWorkspace:
             let allowedRoots = allowedRootPaths(in: scope)
             return allFilesSnapshot(sorted: false).filter {
@@ -8103,6 +8103,9 @@ class WorkspaceFilesViewModel: ObservableObject {
             return visibleRootFolders + gitDataRootFolders()
         case .allLoaded:
             return rootFolders
+        case .allLoadedExcludingGitData:
+            let gitDataRootIDs = Set(gitDataRootFolders().map(\.id))
+            return rootFolders.filter { !gitDataRootIDs.contains($0.id) }
         case let .sessionBoundWorkspace(canonicalRootPaths, physicalRootPaths):
             return rootFolders.filter { root in
                 if physicalRootPaths.contains(root.standardizedFullPath) { return true }

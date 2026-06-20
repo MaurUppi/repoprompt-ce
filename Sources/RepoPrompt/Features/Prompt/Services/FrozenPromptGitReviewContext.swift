@@ -1,0 +1,222 @@
+import Foundation
+
+/// Immutable Git inputs captured for one prompt-packaging request.
+///
+/// This value deliberately carries no live view-model references. Later packaging stages may
+/// consume it, but must not reacquire repository, comparison, workspace, or tab identity.
+struct FrozenPromptGitReviewContext: Equatable {
+    let artifactCapability: SelectedGitArtifactCapability?
+    let compareIntent: ReviewGitCompareIntent
+    let displayContext: ReviewGitDisplayContext
+}
+
+enum ReviewGitCompareIntent: Equatable {
+    case uncommittedHEAD
+    case uncommittedMergeBase(symbolicBase: String)
+
+    init(base: String?) {
+        let normalized = base?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if normalized.isEmpty || normalized.caseInsensitiveCompare("HEAD") == .orderedSame {
+            self = .uncommittedHEAD
+        } else {
+            self = .uncommittedMergeBase(symbolicBase: normalized)
+        }
+    }
+}
+
+/// Exact, ephemeral authority to inspect already-selected files in one loaded workspace Git-data root.
+///
+/// The capability is never persisted and grants no root enumeration, search, tree, or raw filesystem
+/// access. Authorization still validates every selected record and its manifest provenance.
+struct SelectedGitArtifactCapability: Equatable {
+    let workspaceID: UUID
+    let workspaceDirectoryPath: String
+    let gitDataRoot: WorkspaceRootRef
+    let creatorTabID: UUID
+    let sessionID: UUID?
+    let boundCheckouts: [FrozenBoundCheckoutIdentity]
+    let canonicalWorkspaceRootPaths: [String]
+
+    init(
+        workspaceID: UUID,
+        workspaceDirectoryPath: String,
+        gitDataRoot: WorkspaceRootRef,
+        creatorTabID: UUID,
+        sessionID: UUID?,
+        boundCheckouts: [FrozenBoundCheckoutIdentity],
+        canonicalWorkspaceRootPaths: [String]
+    ) {
+        self.workspaceID = workspaceID
+        self.workspaceDirectoryPath = StandardizedPath.absolute(
+            (workspaceDirectoryPath as NSString).expandingTildeInPath
+        )
+        self.gitDataRoot = gitDataRoot
+        self.creatorTabID = creatorTabID
+        self.sessionID = sessionID
+        self.boundCheckouts = boundCheckouts
+        self.canonicalWorkspaceRootPaths = canonicalWorkspaceRootPaths.map {
+            StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
+        }
+    }
+}
+
+struct FrozenBoundCheckoutIdentity: Equatable {
+    let logicalRootPath: String
+    let logicalRootName: String
+    let physicalWorktreeRootPath: String
+    let repositoryID: String
+    let worktreeID: String
+
+    init(
+        logicalRootPath: String,
+        logicalRootName: String,
+        physicalWorktreeRootPath: String,
+        repositoryID: String,
+        worktreeID: String
+    ) {
+        self.logicalRootPath = StandardizedPath.absolute(
+            (logicalRootPath as NSString).expandingTildeInPath
+        )
+        self.logicalRootName = logicalRootName
+        self.physicalWorktreeRootPath = StandardizedPath.absolute(
+            (physicalWorktreeRootPath as NSString).expandingTildeInPath
+        )
+        self.repositoryID = repositoryID
+        self.worktreeID = worktreeID
+    }
+}
+
+/// Frozen logical labels for future multi-checkout rendering and diagnostics.
+struct ReviewGitDisplayContext: Equatable {
+    let roots: [ReviewGitDisplayRoot]
+}
+
+struct ReviewGitDisplayRoot: Equatable {
+    let logicalRootPath: String
+    let logicalRootName: String
+    let physicalRootPath: String
+
+    init(logicalRootPath: String, logicalRootName: String, physicalRootPath: String) {
+        self.logicalRootPath = StandardizedPath.absolute(
+            (logicalRootPath as NSString).expandingTildeInPath
+        )
+        self.logicalRootName = logicalRootName
+        self.physicalRootPath = StandardizedPath.absolute(
+            (physicalRootPath as NSString).expandingTildeInPath
+        )
+    }
+}
+
+extension FrozenPromptGitReviewContext {
+    static func automaticOnly(
+        base: String? = nil,
+        workspaceRootPaths: [String] = [],
+        bindings: [AgentSessionWorktreeBinding] = []
+    ) -> FrozenPromptGitReviewContext {
+        FrozenPromptGitReviewContext(
+            artifactCapability: nil,
+            compareIntent: ReviewGitCompareIntent(base: base),
+            displayContext: makeDisplayContext(
+                workspaceRootPaths: workspaceRootPaths,
+                bindings: bindings
+            )
+        )
+    }
+
+    /// Derives an exact selected-artifact capability from already-frozen workspace/tab/binding
+    /// identity. A missing cataloged Git-data root fails closed while preserving automatic review
+    /// diff generation for ordinary selected files.
+    static func make(
+        workspaceID: UUID,
+        workspaceDirectoryPath: String,
+        workspaceRootPaths: [String],
+        tabID: UUID,
+        sessionID: UUID?,
+        bindings: [AgentSessionWorktreeBinding],
+        base: String?,
+        store: WorkspaceFileContextStore
+    ) async -> FrozenPromptGitReviewContext {
+        let standardizedWorkspaceDirectory = StandardizedPath.absolute(
+            (workspaceDirectoryPath as NSString).expandingTildeInPath
+        )
+        let gitDataPath = StandardizedPath.join(
+            standardizedRoot: standardizedWorkspaceDirectory,
+            standardizedRelativePath: "_git_data"
+        )
+        let gitDataRoot = await store.exactRootRef(path: gitDataPath, kind: .workspaceGitData)
+        let boundCheckouts = bindings.map {
+            FrozenBoundCheckoutIdentity(
+                logicalRootPath: $0.logicalRootPath,
+                logicalRootName: $0.logicalRootName
+                    ?? (StandardizedPath.absolute($0.logicalRootPath) as NSString).lastPathComponent,
+                physicalWorktreeRootPath: $0.worktreeRootPath,
+                repositoryID: $0.repositoryID,
+                worktreeID: $0.worktreeID
+            )
+        }
+        let capability = gitDataRoot.map {
+            SelectedGitArtifactCapability(
+                workspaceID: workspaceID,
+                workspaceDirectoryPath: standardizedWorkspaceDirectory,
+                gitDataRoot: $0,
+                creatorTabID: tabID,
+                sessionID: sessionID,
+                boundCheckouts: boundCheckouts,
+                canonicalWorkspaceRootPaths: workspaceRootPaths
+            )
+        }
+        return FrozenPromptGitReviewContext(
+            artifactCapability: capability,
+            compareIntent: ReviewGitCompareIntent(base: base),
+            displayContext: makeDisplayContext(
+                workspaceRootPaths: workspaceRootPaths,
+                bindings: bindings
+            )
+        )
+    }
+
+    private static func makeDisplayContext(
+        workspaceRootPaths: [String],
+        bindings: [AgentSessionWorktreeBinding]
+    ) -> ReviewGitDisplayContext {
+        let bindingByLogicalRoot = Dictionary(
+            bindings.map { (StandardizedPath.absolute($0.logicalRootPath), $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var roots: [ReviewGitDisplayRoot] = []
+        var seenPhysicalRoots = Set<String>()
+
+        for rawRoot in workspaceRootPaths {
+            let logicalRoot = StandardizedPath.absolute((rawRoot as NSString).expandingTildeInPath)
+            let binding = bindingByLogicalRoot[logicalRoot]
+            let physicalRoot = StandardizedPath.absolute(binding?.worktreeRootPath ?? logicalRoot)
+            guard seenPhysicalRoots.insert(physicalRoot).inserted else { continue }
+            roots.append(
+                ReviewGitDisplayRoot(
+                    logicalRootPath: logicalRoot,
+                    logicalRootName: binding?.logicalRootName
+                        ?? (logicalRoot as NSString).lastPathComponent,
+                    physicalRootPath: physicalRoot
+                )
+            )
+        }
+
+        // Keep a binding whose logical root was absent from the persisted root list visible for
+        // diagnostics without widening any lookup scope.
+        for binding in bindings {
+            let physicalRoot = StandardizedPath.absolute(binding.worktreeRootPath)
+            guard seenPhysicalRoots.insert(physicalRoot).inserted else { continue }
+            let logicalRoot = StandardizedPath.absolute(binding.logicalRootPath)
+            roots.append(
+                ReviewGitDisplayRoot(
+                    logicalRootPath: logicalRoot,
+                    logicalRootName: binding.logicalRootName
+                        ?? (logicalRoot as NSString).lastPathComponent,
+                    physicalRootPath: physicalRoot
+                )
+            )
+        }
+
+        return ReviewGitDisplayContext(roots: roots)
+    }
+}

@@ -2747,6 +2747,7 @@ class OracleViewModel: ObservableObject {
         gitBaseOverride: String? = nil,
         selectionOverride: StoredSelection? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil,
+        reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
         overrideAIMessage: AIMessage? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async {
@@ -2883,7 +2884,8 @@ class OracleViewModel: ObservableObject {
                         gitInclusionOverride: gitInclusionOverride,
                         gitBaseOverride: gitBaseOverride,
                         selectionOverride: selectionOverride,
-                        lookupContextOverride: lookupContextOverride
+                        lookupContextOverride: lookupContextOverride,
+                        reviewGitContextOverride: reviewGitContextOverride
                     )
                 }
                 guard await shouldContinueStreaming() else {

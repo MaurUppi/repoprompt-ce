@@ -25,6 +25,7 @@ extension OracleViewModel {
         let promptText: String
         let selection: StoredSelection
         let lookupContext: WorkspaceLookupContext?
+        let reviewGitContext: FrozenPromptGitReviewContext
         let agentModeSessionID: UUID?
         let agentModeRunID: UUID?
 
@@ -33,6 +34,7 @@ extension OracleViewModel {
             promptText: String,
             selection: StoredSelection,
             lookupContext: WorkspaceLookupContext? = nil,
+            reviewGitContext: FrozenPromptGitReviewContext,
             agentModeSessionID: UUID? = nil,
             agentModeRunID: UUID? = nil
         ) {
@@ -40,6 +42,7 @@ extension OracleViewModel {
             self.promptText = promptText
             self.selection = selection
             self.lookupContext = lookupContext
+            self.reviewGitContext = reviewGitContext
             self.agentModeSessionID = agentModeSessionID
             self.agentModeRunID = agentModeRunID
         }
@@ -945,6 +948,7 @@ extension OracleViewModel {
         _ = args["include_diffs"]?.boolValue
         let selectionOverride = tabContext?.selection
         let lookupContextOverride = tabContext?.lookupContext
+        let reviewGitContextOverride = tabContext?.reviewGitContext
 
         // ────────── 2. Handle model selection ──────────
         let presetsManager = ModelPresetsManager.shared
@@ -1027,7 +1031,8 @@ extension OracleViewModel {
             gitInclusionOverride: nil,
             gitBaseOverride: nil,
             selectionOverride: selectionOverride,
-            lookupContextOverride: lookupContextOverride
+            lookupContextOverride: lookupContextOverride,
+            reviewGitContextOverride: reviewGitContextOverride
         )
         let queryId = activeQueryId(for: chatID) ?? currentQueryId
 
@@ -1373,9 +1378,15 @@ extension OracleViewModel {
         tabID: UUID,
         selection: StoredSelection,
         gitScopeOverride: GitInclusion? = nil,
+        reviewGitContext: FrozenPromptGitReviewContext? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async throws -> ChatSendReply {
-        try await runHeadless(
+        let frozenReviewGitContext = if let reviewGitContext {
+            reviewGitContext
+        } else {
+            await promptViewModel.freezePromptGitReviewContext(tabID: tabID, base: "HEAD")
+        }
+        return try await runHeadless(
             prompt: prompt,
             modelParam: modelParam,
             chatName: chatName ?? "Review",
@@ -1383,6 +1394,7 @@ extension OracleViewModel {
             selection: selection,
             mode: .review,
             gitScopeOverride: gitScopeOverride,
+            reviewGitContext: frozenReviewGitContext,
             onProgress: onProgress
         )
     }
@@ -1402,7 +1414,7 @@ extension OracleViewModel {
         mode: HeadlessMode,
         useChatModelDirectly: Bool = false,
         gitScopeOverride: GitInclusion? = nil,
-        gitBaseOverride: String? = nil,
+        reviewGitContext: FrozenPromptGitReviewContext = .automaticOnly(),
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async throws -> ChatSendReply {
         // Check cancellation at entry
@@ -1442,7 +1454,8 @@ extension OracleViewModel {
         let snapshot = HeadlessContextSnapshot(
             tabID: tabID,
             promptText: trimmedPrompt,
-            selection: selection
+            selection: selection,
+            reviewGitContext: reviewGitContext
         )
 
         try Task.checkCancellation()
@@ -1452,8 +1465,7 @@ extension OracleViewModel {
             from: snapshot,
             model: model,
             mode: mode,
-            gitScopeOverride: gitScopeOverride,
-            gitBaseOverride: gitBaseOverride
+            gitScopeOverride: gitScopeOverride
         )
 
         try Task.checkCancellation()

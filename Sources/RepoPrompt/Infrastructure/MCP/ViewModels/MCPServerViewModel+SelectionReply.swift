@@ -119,21 +119,35 @@ extension MCPServerViewModel {
     private func virtualSelectionGitDiffText(
         for selection: StoredSelection,
         resolvedContext: PromptContextResolved,
-        lookupContext: WorkspaceLookupContext
+        lookupContext: WorkspaceLookupContext,
+        context: TabScopedContext
     ) async -> String? {
         switch resolvedContext.gitInclusion {
         case .none:
             return nil
         case .selected:
-            let selectedPaths = await WorkspaceGitDiffSelectionResolver.selectedGitDiffPaths(
+            let pathResolution = await WorkspaceGitDiffSelectionResolver.resolveSelectedGitDiffPaths(
                 for: lookupContext.physicalizeSelection(selection),
                 store: promptVM.workspaceFileContextStore,
                 rootScope: lookupContext.rootScope,
                 folderPolicy: .filesOnly,
                 profile: .mcpSelection,
-                allowFilesystemFallback: lookupContext.rootScope.allowsSelectedGitDiffFilesystemFallback
+                allowFilesystemFallback: lookupContext.rootScope.allowsSelectedGitDiffFilesystemFallback,
+                excluding: []
             )
-            return await promptVM.gitViewModel.getDiffForAbsolutePaths(selectedPaths, forceRefreshStatus: true)
+            let reviewGitContext = await promptVM.freezePromptGitReviewContext(
+                workspaceID: context.workspaceID,
+                tabID: context.tabID,
+                sessionID: context.activeAgentSessionID,
+                bindings: context.worktreeBindings
+            )
+            return await AutomaticReviewGitDiffCoordinator().resolve(
+                AutomaticReviewGitDiffRequest(
+                    pathResolution: pathResolution,
+                    compareIntent: reviewGitContext.compareIntent,
+                    displayContext: reviewGitContext.displayContext
+                )
+            ).text
         case .complete:
             guard lookupContext.bindingProjection == nil else {
                 return PromptContextGitDiffPolicy.deferredCompleteWorktreeGitDiffMessage
@@ -168,7 +182,8 @@ extension MCPServerViewModel {
             ? await virtualSelectionGitDiffText(
                 for: context.selection,
                 resolvedContext: resolvedContext,
-                lookupContext: lookupContext
+                lookupContext: lookupContext,
+                context: context
             )
             : nil
         let promptText = resolvedContext.includeUserPrompt ? context.promptText : ""

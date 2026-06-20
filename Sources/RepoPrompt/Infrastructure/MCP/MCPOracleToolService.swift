@@ -157,11 +157,19 @@ struct MCPOracleToolService {
                 throw MCPError.internalError("Unable to resolve compose tab context for ask_oracle")
             }
             let lookupContext = try await oraclePackagingLookupContext(owner: owner)
+            let reviewGitContext = await promptVM.freezePromptGitReviewContext(
+                workspaceID: targetWindow.workspaceManager.activeWorkspace?.id,
+                tabID: tabID,
+                sessionID: owner.agentSessionID,
+                bindings: owner.worktreeBindingState.bindings ?? [],
+                base: "HEAD"
+            )
             tabContext = OracleViewModel.OracleSendTabContext(
                 tabID: tabID,
                 promptText: tabSnapshot.promptText,
                 selection: tabSnapshot.selection,
                 lookupContext: lookupContext,
+                reviewGitContext: reviewGitContext,
                 agentModeSessionID: owner.agentSessionID,
                 agentModeRunID: owner.runID
             )
@@ -546,11 +554,19 @@ struct MCPOracleToolService {
         )
     ) async throws -> OracleViewModel.OracleSendTabContext {
         let lookupContext = try await oraclePackagingLookupContext(for: context)
+        let reviewGitContext = await promptVM.freezePromptGitReviewContext(
+            workspaceID: context.workspaceID,
+            tabID: context.tabID,
+            sessionID: owner.agentSessionID,
+            bindings: owner.worktreeBindingState.bindings ?? context.worktreeBindings,
+            base: "HEAD"
+        )
         return OracleViewModel.OracleSendTabContext(
             tabID: context.tabID,
             promptText: context.promptText,
             selection: context.selection,
             lookupContext: lookupContext,
+            reviewGitContext: reviewGitContext,
             agentModeSessionID: owner.agentSessionID,
             agentModeRunID: owner.runID
         )

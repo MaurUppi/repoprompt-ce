@@ -104,21 +104,35 @@ import XCTest
                 let capture = OracleWorktreeCapture()
                 do {
                     try await activateWorkspace(fixture.contextA)
-                    let logicalRootA = fixture.contextA.rootURL
-                    let logicalFileA = fixture.contextA.fileURL
-                    let logicalRootB = try makeTemporaryRoot(name: "OracleLogicalB")
+                    let gitFixture = try ReviewGitRepositoryFixture(name: "OracleMultiRoot")
+                    let logicalRootA = try gitFixture.makeRepository(
+                        named: "logical-a",
+                        files: ["Sources/First.swift": "let value = \"initial_a\"\n"]
+                    )
+                    let logicalRootB = try gitFixture.makeRepository(
+                        named: "logical-b",
+                        files: ["Sources/Second.swift": "let value = \"initial_b\"\n"]
+                    )
+                    let logicalFileA = logicalRootA.appendingPathComponent("Sources/First.swift")
                     let logicalFileB = logicalRootB.appendingPathComponent("Sources/Second.swift")
-                    let worktreeRootA = try makeTemporaryRoot(name: "OracleWorktreeA")
-                    let worktreeRootB = try makeTemporaryRoot(name: "OracleWorktreeB")
-                    let worktreeFileA = worktreeRootA
-                        .appendingPathComponent("Sources", isDirectory: true)
-                        .appendingPathComponent(logicalFileA.lastPathComponent)
+                    let worktreeRootA = try gitFixture.makeLinkedWorktree(
+                        from: logicalRootA,
+                        named: "worktree-a",
+                        branch: "feature/oracle-a"
+                    )
+                    let worktreeRootB = try gitFixture.makeLinkedWorktree(
+                        from: logicalRootB,
+                        named: "worktree-b",
+                        branch: "feature/oracle-b"
+                    )
+                    let worktreeFileA = worktreeRootA.appendingPathComponent("Sources/First.swift")
                     let worktreeFileB = worktreeRootB.appendingPathComponent("Sources/Second.swift")
 
                     try write("let value = \"canonical_oracle_a\"\n", to: logicalFileA)
                     try write("let value = \"canonical_oracle_b\"\n", to: logicalFileB)
                     try write("let value = \"worktree_oracle_a\"\n", to: worktreeFileA)
                     try write("let value = \"worktree_oracle_b\"\n", to: worktreeFileB)
+                    _ = try await fixture.contextA.window.workspaceFileContextStore.loadRoot(path: logicalRootA.path)
                     _ = try await fixture.contextA.window.workspaceFileContextStore.loadRoot(path: logicalRootB.path)
 
                     let bindings = [
@@ -135,11 +149,11 @@ import XCTest
                     )
                     let endpoint = try fixture.endpointA()
                     try await configureAgentModeEndpoint(endpoint, context: context, fixture: fixture)
-                    installOracleCapture(capture, on: fixture.contextA.window)
+                    installOracleCapture(capture, on: fixture.contextA.window, gitInclusion: .selected)
 
                     let response = try await endpoint.callTool(
                         name: MCPWindowToolName.askOracle,
-                        arguments: ["message": "Compare both selected roots."],
+                        arguments: ["message": "Compare both selected roots.", "mode": "review"],
                         timeoutSeconds: 30
                     )
                     XCTAssertTrue(try toolResultText(response).contains("captured oracle response"))
@@ -152,6 +166,120 @@ import XCTest
                     XCTAssertFalse(packaged.contains(worktreeRootA.path), packaged)
                     XCTAssertFalse(packaged.contains(worktreeRootB.path), packaged)
                     XCTAssertEqual(capture.tabContext?.lookupContext?.bindingProjection?.boundRootsForMetadata.count, 2)
+                    let gitDiff = try XCTUnwrap(capture.gitDiff)
+                    XCTAssertTrue(gitDiff.contains("worktree_oracle_a"), gitDiff)
+                    XCTAssertTrue(gitDiff.contains("worktree_oracle_b"), gitDiff)
+                    XCTAssertFalse(gitDiff.contains("canonical_oracle_a"), gitDiff)
+                    XCTAssertFalse(gitDiff.contains("canonical_oracle_b"), gitDiff)
+                    XCTAssertFalse(gitDiff.contains(worktreeRootA.path), gitDiff)
+                    XCTAssertFalse(gitDiff.contains(worktreeRootB.path), gitDiff)
+
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                    await fixture.cleanup()
+                } catch {
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testAskOracleReviewUsesAuthorizedSelectedArtifactAndKeepsMapAsContext() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let capture = OracleWorktreeCapture()
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let gitFixture = try ReviewGitRepositoryFixture(name: "OracleSelectedArtifact")
+                    let logicalRoot = try gitFixture.makeRepository(
+                        named: "logical",
+                        files: ["Sources/Feature.swift": "let value = \"initial\"\n"]
+                    )
+                    let worktreeRoot = try gitFixture.makeLinkedWorktree(
+                        from: logicalRoot,
+                        named: "worktree",
+                        branch: "feature/artifact"
+                    )
+                    let logicalFile = logicalRoot.appendingPathComponent("Sources/Feature.swift")
+                    let worktreeFile = worktreeRoot.appendingPathComponent("Sources/Feature.swift")
+                    try write("let value = \"canonical_artifact_leak\"\n", to: logicalFile)
+                    try write("let value = \"worktree_artifact_source\"\n", to: worktreeFile)
+                    _ = try await fixture.contextA.window.workspaceFileContextStore.loadRoot(path: logicalRoot.path)
+
+                    let layout = try XCTUnwrap(
+                        GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: worktreeRoot)
+                    )
+                    let repositoryIdentity = GitWorktreeIdentity.repositoryIdentity(
+                        commonGitDir: layout.commonDir,
+                        mainWorktreeRoot: layout.knownMainWorktreeRoot
+                    )
+                    let worktreeID = GitWorktreeIdentity.worktreeID(
+                        repositoryID: repositoryIdentity.repositoryID,
+                        gitDir: layout.gitDir,
+                        isMain: false,
+                        path: layout.workTreeRoot
+                    )
+                    let binding = AgentSessionWorktreeBinding(
+                        id: "binding-artifact",
+                        repositoryID: repositoryIdentity.repositoryID,
+                        repoKey: "artifact-repo",
+                        logicalRootPath: logicalRoot.path,
+                        logicalRootName: "ArtifactRepo",
+                        worktreeID: worktreeID,
+                        worktreeRootPath: worktreeRoot.path,
+                        worktreeName: "artifact",
+                        branch: "feature/artifact",
+                        source: "test"
+                    )
+
+                    let activeWorkspace = try XCTUnwrap(fixture.contextA.window.workspaceManager.activeWorkspace)
+                    let workspaceDirectory = fixture.contextA.window.workspaceManager.workspaceDirectory(for: activeWorkspace)
+                    let snapshotID = "2026-06-19/1851"
+                    let repoKey = "artifact-repo"
+                    let snapshotRoot = workspaceDirectory
+                        .appendingPathComponent("_git_data/repos/\(repoKey)/\(snapshotID)", isDirectory: true)
+                    let mapURL = snapshotRoot.appendingPathComponent("MAP.txt")
+                    let patchURL = snapshotRoot.appendingPathComponent("diff/all.patch")
+                    try write("oracle artifact map sentinel", to: mapURL)
+                    let patchText = "diff --git a/Sources/Feature.swift b/Sources/Feature.swift\n+oracle_authorized_patch\n"
+                    try write(patchText, to: patchURL)
+                    try writeGitArtifactManifest(
+                        to: snapshotRoot.appendingPathComponent("manifest.json"),
+                        snapshotID: snapshotID,
+                        repoKey: repoKey,
+                        repoRoot: worktreeRoot,
+                        layout: layout,
+                        tabID: fixture.contextA.tabID
+                    )
+                    _ = try await fixture.contextA.window.workspaceFileContextStore.loadRoot(
+                        path: workspaceDirectory.appendingPathComponent("_git_data").path,
+                        kind: .workspaceGitData
+                    )
+
+                    let context = makeFrozenContext(
+                        fixture: fixture,
+                        selection: StoredSelection(
+                            selectedPaths: [mapURL.path, patchURL.path, logicalFile.path],
+                            codemapAutoEnabled: false
+                        ),
+                        bindings: [binding]
+                    )
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(endpoint, context: context, fixture: fixture)
+                    installOracleCapture(capture, on: fixture.contextA.window, gitInclusion: .selected)
+
+                    let response = try await endpoint.callTool(
+                        name: MCPWindowToolName.askOracle,
+                        arguments: ["message": "Review the selected artifact.", "mode": "review"],
+                        timeoutSeconds: 30
+                    )
+                    XCTAssertTrue(try toolResultText(response).contains("captured oracle response"))
+                    XCTAssertEqual(capture.gitDiff, patchText)
+                    let packaged = capture.fileBlocks.joined(separator: "\n")
+                    XCTAssertTrue(packaged.contains("oracle artifact map sentinel"), packaged)
+                    XCTAssertTrue(packaged.contains("worktree_artifact_source"), packaged)
+                    XCTAssertFalse(packaged.contains("oracle_authorized_patch"), packaged)
+                    XCTAssertFalse(packaged.contains("canonical_artifact_leak"), packaged)
 
                     fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
                     await fixture.cleanup()
@@ -316,10 +444,15 @@ import XCTest
 
         private func installOracleCapture(
             _ capture: OracleWorktreeCapture,
-            on window: WindowState
+            on window: WindowState,
+            gitInclusion: GitInclusion = .none
         ) {
             window.mcpServer.setOracleChatSendOverrideForTesting { args, promptVM, tabContext in
                 let context = try XCTUnwrap(tabContext)
+                if gitInclusion != .none {
+                    promptVM.gitViewModel.selectedDiffBranch = "missing/live-ui-base"
+                    XCTAssertEqual(context.reviewGitContext.compareIntent, .uncommittedHEAD)
+                }
                 let config = PromptContextResolved(
                     includeFiles: true,
                     includeUserPrompt: true,
@@ -327,7 +460,7 @@ import XCTest
                     includeFileTree: true,
                     fileTreeMode: .auto,
                     codeMapUsage: .none,
-                    gitInclusion: .none,
+                    gitInclusion: gitInclusion,
                     storedPromptIds: []
                 )
                 let message = await promptVM.packagePrompt(
@@ -338,14 +471,16 @@ import XCTest
                         )
                     ],
                     overridePromptConfig: config,
-                    overrideMode: .chat,
+                    overrideMode: gitInclusion == .none ? .chat : .review,
                     selectionOverride: context.selection,
-                    lookupContextOverride: context.lookupContext
+                    lookupContextOverride: context.lookupContext,
+                    reviewGitContextOverride: context.reviewGitContext
                 )
                 capture.record(
                     tabContext: context,
                     fileTree: message.fileTree,
-                    fileBlocks: message.fileBlocks
+                    fileBlocks: message.fileBlocks,
+                    gitDiff: message.gitDiff
                 )
                 return [
                     "chat_id": .string(UUID().uuidString),
@@ -418,6 +553,49 @@ import XCTest
             context.window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
         }
 
+        private func writeGitArtifactManifest(
+            to url: URL,
+            snapshotID: String,
+            repoKey: String,
+            repoRoot: URL,
+            layout: GitRepositoryLayout,
+            tabID: UUID
+        ) throws {
+            let manifest = GitDiffSnapshotManifest(
+                snapshotID: snapshotID,
+                generatedAt: Date(timeIntervalSince1970: 1),
+                mode: .standard,
+                compare: "HEAD",
+                compareInput: nil,
+                scope: .selected,
+                requestedPaths: ["Sources/Feature.swift"],
+                fingerprint: GitDiffFingerprint(
+                    headSHA: "abc",
+                    baseRef: "HEAD",
+                    statusHash: "status",
+                    generatedAt: Date(timeIntervalSince1970: 1)
+                ),
+                contextLines: 3,
+                detectRenames: false,
+                summary: GitDiffSnapshotManifest.Summary(files: 1, insertions: 1, deletions: 0),
+                files: [],
+                repoKey: repoKey,
+                repoRoot: repoRoot.path,
+                isWorktree: true,
+                worktreeName: repoRoot.lastPathComponent,
+                worktreeRoot: repoRoot.path,
+                mainWorktreeRoot: layout.knownMainWorktreeRoot?.path,
+                commonGitDir: layout.commonDir.path,
+                tabID: tabID
+            )
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            try write(
+                XCTUnwrap(try String(data: encoder.encode(manifest), encoding: .utf8)),
+                to: url
+            )
+        }
+
         private func toolResultText(_ response: PersistentMCPTestRPCResponse) throws -> String {
             let data = try XCTUnwrap(response.rawJSON.data(using: .utf8))
             let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -484,16 +662,19 @@ import XCTest
         private(set) var tabContext: OracleViewModel.OracleSendTabContext?
         private(set) var fileTree = ""
         private(set) var fileBlocks: [String] = []
+        private(set) var gitDiff: String?
 
         func record(
             tabContext: OracleViewModel.OracleSendTabContext,
             fileTree: String,
-            fileBlocks: [String]
+            fileBlocks: [String],
+            gitDiff: String?
         ) {
             wasInvoked = true
             self.tabContext = tabContext
             self.fileTree = fileTree
             self.fileBlocks = fileBlocks
+            self.gitDiff = gitDiff
         }
     }
 

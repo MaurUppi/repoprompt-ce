@@ -1023,6 +1023,8 @@ actor WorkspaceFileContextStore {
                 "visible_workspace_plus_git_data"
             case .allLoaded:
                 "all_loaded"
+            case .allLoadedExcludingGitData:
+                "all_loaded_excluding_git_data"
             case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
                 "session_bound_workspace(logical=\(logicalRootPaths.sorted().joined(separator: ","));physical=\(physicalRootPaths.sorted().joined(separator: ",")))"
             case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
@@ -2602,7 +2604,7 @@ actor WorkspaceFileContextStore {
             }) == expectedPaths
         case let .validatedSessionBoundWorkspace(_, requestedPhysicalRoots):
             requestedPhysicalRoots == Set(expectedPhysicalRoots)
-        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded:
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded, .allLoadedExcludingGitData:
             false
         }
         guard requestedMatches,
@@ -2620,7 +2622,7 @@ actor WorkspaceFileContextStore {
     func rootScopeAvailability(_ rootScope: WorkspaceLookupRootScope) -> WorkspaceLookupRootScopeAvailability {
         let missing: [String]
         switch rootScope {
-        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded:
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded, .allLoadedExcludingGitData:
             return .available
         case let .sessionBoundWorkspace(requestedCanonicalRootPaths, requestedPhysicalRootPaths):
             guard !requestedCanonicalRootPaths.isEmpty || !requestedPhysicalRootPaths.isEmpty else {
@@ -7324,6 +7326,98 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    /// Returns one already-loaded root by exact path and kind without consulting a lookup scope.
+    /// This is intentionally not a discovery API: it never loads, enumerates, or aliases roots.
+    func exactRootRef(path: String, kind: WorkspaceRootKind) -> WorkspaceRootRef? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !StandardizedPath.containsNUL(trimmed),
+              trimmed.hasPrefix("/")
+        else { return nil }
+
+        let standardizedPath = StandardizedPath.absolute(trimmed)
+        guard let rootID = rootIDsByStandardizedPath[standardizedPath],
+              let state = rootStatesByID[rootID],
+              state.root.kind == kind,
+              state.root.standardizedFullPath == standardizedPath
+        else { return nil }
+
+        return WorkspaceRootRef(
+            id: state.root.id,
+            name: state.root.name,
+            fullPath: state.root.standardizedFullPath
+        )
+    }
+
+    /// Returns one exact catalog record under a previously frozen root identity.
+    /// Missing records remain missing; this never materializes an ignored or on-disk file.
+    func exactCatalogFile(
+        absolutePath: String,
+        expectedRoot: WorkspaceRootRef,
+        expectedKind: WorkspaceRootKind
+    ) -> WorkspaceFileRecord? {
+        guard let state = exactRootState(expectedRoot: expectedRoot, expectedKind: expectedKind) else {
+            return nil
+        }
+
+        let trimmed = absolutePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !StandardizedPath.containsNUL(trimmed),
+              trimmed.hasPrefix("/")
+        else { return nil }
+
+        let standardizedPath = StandardizedPath.absolute(trimmed)
+        guard StandardizedPath.isDescendant(standardizedPath, of: state.root.standardizedFullPath),
+              standardizedPath != state.root.standardizedFullPath
+        else { return nil }
+
+        let relativePath = relativePath(for: standardizedPath, rootPath: state.root.standardizedFullPath)
+        guard let record = file(rootID: state.root.id, relativePath: relativePath),
+              record.rootID == state.root.id,
+              record.standardizedFullPath == standardizedPath
+        else { return nil }
+        return record
+    }
+
+    /// Reads one exact, already-cataloged record and revalidates its root lifetime after the await.
+    /// No raw absolute-path or filesystem fallback is permitted.
+    func readExactCatalogFile(
+        _ file: WorkspaceFileRecord,
+        expectedRoot: WorkspaceRootRef
+    ) async -> String? {
+        guard let state = exactRootState(expectedRoot: expectedRoot, expectedKind: .workspaceGitData),
+              file.rootID == state.root.id,
+              let current = self.file(rootID: state.root.id, relativePath: file.standardizedRelativePath),
+              current.id == file.id,
+              current.standardizedFullPath == file.standardizedFullPath
+        else { return nil }
+
+        let expectedLifetimeID = state.lifetimeID
+        let content = try? await state.service.loadContent(ofRelativePath: file.standardizedRelativePath)
+
+        guard let currentState = rootStatesByID[expectedRoot.id],
+              currentState.lifetimeID == expectedLifetimeID,
+              currentState.root.standardizedFullPath == expectedRoot.standardizedFullPath,
+              currentState.root.kind == .workspaceGitData,
+              let revalidated = self.file(rootID: expectedRoot.id, relativePath: file.standardizedRelativePath),
+              revalidated.id == file.id,
+              revalidated.standardizedFullPath == file.standardizedFullPath
+        else { return nil }
+        return content
+    }
+
+    private func exactRootState(
+        expectedRoot: WorkspaceRootRef,
+        expectedKind: WorkspaceRootKind
+    ) -> RootState? {
+        guard let state = rootStatesByID[expectedRoot.id],
+              state.root.id == expectedRoot.id,
+              state.root.standardizedFullPath == expectedRoot.standardizedFullPath,
+              state.root.kind == expectedKind
+        else { return nil }
+        return state
+    }
+
     func displayRootRefsSnapshot() -> WorkspaceDisplayRootRefsSnapshot {
         WorkspaceDisplayRootRefsSnapshot(
             visibleRoots: rootRefs(scope: .visibleWorkspace),
@@ -7787,7 +7881,7 @@ actor WorkspaceFileContextStore {
         scope: WorkspaceLookupRootScope
     ) -> SearchCatalogSnapshotValidationToken {
         switch scope {
-        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded:
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded, .allLoadedExcludingGitData:
             let generation = (catalogGenerationsByScope[scope] ?? 0) &* 3 &+ scopeDiscriminator(scope)
             return .staticScope(generation: generation)
         case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
@@ -7875,6 +7969,8 @@ actor WorkspaceFileContextStore {
             return 1
         case .allLoaded:
             return 2
+        case .allLoadedExcludingGitData:
+            return 3
         case let .sessionBoundWorkspace(canonicalRootPaths, physicalRootPaths):
             var hasher = Hasher()
             hasher.combine("sessionBoundWorkspace")
@@ -7913,7 +8009,8 @@ actor WorkspaceFileContextStore {
     private static let catalogGenerationScopes: [WorkspaceLookupRootScope] = [
         .visibleWorkspace,
         .visibleWorkspacePlusGitData,
-        .allLoaded
+        .allLoaded,
+        .allLoadedExcludingGitData
     ]
 
     private func scopeIncludesAnyRootKind(_ scope: WorkspaceLookupRootScope, _ kinds: Set<WorkspaceRootKind>) -> Bool {
@@ -7924,6 +8021,8 @@ actor WorkspaceFileContextStore {
             kinds.contains(.primaryWorkspace) || kinds.contains(.workspaceGitData)
         case .allLoaded:
             true
+        case .allLoadedExcludingGitData:
+            kinds.contains { $0 != .workspaceGitData }
         case .sessionBoundWorkspace, .validatedSessionBoundWorkspace:
             kinds.contains(.primaryWorkspace) || kinds.contains(.sessionWorktree)
         }
@@ -7942,6 +8041,8 @@ actor WorkspaceFileContextStore {
             return allRoots.filter { $0.kind == .primaryWorkspace || $0.kind == .workspaceGitData }
         case .allLoaded:
             return allRoots
+        case .allLoadedExcludingGitData:
+            return allRoots.filter { $0.kind != .workspaceGitData }
         case let .sessionBoundWorkspace(canonicalRootPaths, physicalRootPaths):
             let normalizedCanonicalRootPaths = normalizedSessionSelectorPaths(canonicalRootPaths)
             let normalizedPhysicalRootPaths = normalizedSessionSelectorPaths(physicalRootPaths)

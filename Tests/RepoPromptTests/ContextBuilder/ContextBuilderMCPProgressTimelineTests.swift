@@ -244,6 +244,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 mode: .plan,
                 prompt: "Summarize the selected context.",
                 selection: StoredSelection(),
+                reviewGitContext: .automaticOnly(),
                 progressReporter: { phase in
                     await recorder.record(phase)
                 }
