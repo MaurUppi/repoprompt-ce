@@ -186,6 +186,55 @@ actor WorkspaceFileContextStore {
         var childFileIDsByFolderID: [UUID: [UUID]]
     }
 
+    private struct ModernCodemapRootAuthority: Equatable {
+        let rootEpoch: WorkspaceCodemapRootEpoch
+        let standardizedRootPath: String
+        let catalogGeneration: UInt64
+        let ingressGeneration: UInt64
+    }
+
+    private enum ModernCodemapSetupDisposition {
+        case ready
+        case unavailable(WorkspaceCodemapArtifactDemandUnavailableReason)
+    }
+
+    private struct ModernCodemapDemandRecord {
+        let ticket: WorkspaceCodemapArtifactDemandTicket
+        let identity: WorkspaceCodemapArtifactBindingIdentity
+        let language: LanguageType
+        let owner: WorkspaceCodemapLiveDemandOwner
+        var result: WorkspaceCodemapArtifactDemandResult
+        var task: Task<Void, Never>?
+    }
+
+    private struct ModernCodemapRootSession {
+        let authority: ModernCodemapRootAuthority
+        var endpoint: WorkspaceCodemapBindingIntegrationEndpoint?
+        var routeToken: WorkspaceCodemapBindingIntegrationRouteToken?
+        var runtime: CodeMapArtifactRuntime?
+        var engine: WorkspaceCodemapBindingEngine?
+        var setupTask: Task<ModernCodemapSetupDisposition, Never>?
+        var setupDisposition: ModernCodemapSetupDisposition?
+        var demandsByFileID: [UUID: ModernCodemapDemandRecord] = [:]
+        var bundlesByRequestID: [UUID: WorkspaceCodemapLiveOverlayBundle] = [:]
+    }
+
+    private struct DetachedModernCodemapSession: @unchecked Sendable {
+        let authority: ModernCodemapRootAuthority
+        let registry: WorkspaceCodemapBindingIntegrationRegistry?
+        let routeToken: WorkspaceCodemapBindingIntegrationRouteToken?
+        let engine: WorkspaceCodemapBindingEngine?
+        let owners: [WorkspaceCodemapLiveDemandOwner]
+        let setupTask: Task<ModernCodemapSetupDisposition, Never>?
+        let demandTasks: [Task<Void, Never>]
+    }
+
+    private struct ModernCodemapCleanupFlight {
+        let id: UUID
+        let rootEpoch: WorkspaceCodemapRootEpoch
+        let task: Task<Void, Never>
+    }
+
     private struct DetachedWatcherStop {
         let index: Int
         let rootID: UUID
@@ -1532,6 +1581,11 @@ actor WorkspaceFileContextStore {
     private let deferredReplayBuffer = DeferredReplayBufferActor(
         maxPendingDeltasPerRoot: WorkspaceFileContextStore.defaultMaxPendingDeltasPerRoot
     )
+    private let codemapRuntimeProvider: CodeMapArtifactRuntimeProvider.Factory
+    private let modernCodemapCancellationCleanupHook: @Sendable (WorkspaceCodemapArtifactDemandTicket) async -> Void
+    private let modernCodemapReadyPublicationHook: @Sendable (WorkspaceCodemapArtifactDemandTicket) async -> Void
+    private var modernCodemapSessionsByRootEpoch: [WorkspaceCodemapRootEpoch: ModernCodemapRootSession] = [:]
+    private var modernCodemapCleanupFlightsByRootID: [UUID: ModernCodemapCleanupFlight] = [:]
     private var codemapSnapshotsByFileID: [UUID: WorkspaceCodemapSnapshot] = [:]
     private var codemapFileIDsByRootID: [UUID: Set<UUID>] = [:]
     private var pendingCodemapRepairFileIDs = Set<UUID>()
@@ -1581,11 +1635,23 @@ actor WorkspaceFileContextStore {
             searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production,
             debugNowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
             unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production,
-            enableCatalogShardShadowValidation: Bool = true
+            enableCatalogShardShadowValidation: Bool = true,
+            codemapRuntimeProvider: @escaping CodeMapArtifactRuntimeProvider.Factory = {
+                try CodeMapArtifactRuntime.processWide()
+            },
+            modernCodemapCancellationCleanupHook: @escaping @Sendable (
+                WorkspaceCodemapArtifactDemandTicket
+            ) async -> Void = { _ in },
+            modernCodemapReadyPublicationHook: @escaping @Sendable (
+                WorkspaceCodemapArtifactDemandTicket
+            ) async -> Void = { _ in }
         ) {
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.debugNowNanoseconds = debugNowNanoseconds
             self.unloadTerminationPolicy = unloadTerminationPolicy
+            self.codemapRuntimeProvider = codemapRuntimeProvider
+            self.modernCodemapCancellationCleanupHook = modernCodemapCancellationCleanupHook
+            self.modernCodemapReadyPublicationHook = modernCodemapReadyPublicationHook
             isCatalogShardShadowValidationEnabled = enableCatalogShardShadowValidation
             publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator(debugNowNanoseconds: debugNowNanoseconds)
             #if os(macOS)
@@ -1603,10 +1669,22 @@ actor WorkspaceFileContextStore {
     #else
         init(
             searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production,
-            unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production
+            unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production,
+            codemapRuntimeProvider: @escaping CodeMapArtifactRuntimeProvider.Factory = {
+                try CodeMapArtifactRuntime.processWide()
+            },
+            modernCodemapCancellationCleanupHook: @escaping @Sendable (
+                WorkspaceCodemapArtifactDemandTicket
+            ) async -> Void = { _ in },
+            modernCodemapReadyPublicationHook: @escaping @Sendable (
+                WorkspaceCodemapArtifactDemandTicket
+            ) async -> Void = { _ in }
         ) {
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.unloadTerminationPolicy = unloadTerminationPolicy
+            self.codemapRuntimeProvider = codemapRuntimeProvider
+            self.modernCodemapCancellationCleanupHook = modernCodemapCancellationCleanupHook
+            self.modernCodemapReadyPublicationHook = modernCodemapReadyPublicationHook
             publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator()
             #if os(macOS)
                 let source = DispatchSource.makeMemoryPressureSource(
@@ -1627,6 +1705,18 @@ actor WorkspaceFileContextStore {
             searchContentMemoryPressureSource.cancel()
         #endif
         codeScanResultTask?.cancel()
+        for session in modernCodemapSessionsByRootEpoch.values {
+            session.setupTask?.cancel()
+            for demand in session.demandsByFileID.values {
+                demand.task?.cancel()
+            }
+            for bundle in session.bundlesByRequestID.values {
+                bundle.close()
+            }
+        }
+        for flight in modernCodemapCleanupFlightsByRootID.values {
+            flight.task.cancel()
+        }
         for attachment in watcherPublisherAttachmentsByKey.values {
             attachment.cancellable.cancel()
         }
@@ -6217,6 +6307,8 @@ actor WorkspaceFileContextStore {
         guard !orderedRootIDs.isEmpty else { return }
 
         var statesToUnload: [(rootID: UUID, state: RootState)] = []
+        var modernCodemapCleanupFlights: [ModernCodemapCleanupFlight] = []
+        var modernCodemapCleanupIDs = Set<UUID>()
         var ownershipResourcesReleasedByUnload = SessionWorktreeOwnershipRemoval()
         var invalidatedOwnershipTokens = Set<WorkspaceSessionWorktreeOwnershipToken>()
         for rootID in orderedRootIDs {
@@ -6254,6 +6346,15 @@ actor WorkspaceFileContextStore {
                 sessionRootLifetimeClock.advance()
             }
             guard let state = rootStatesByID.removeValue(forKey: rootID) else { continue }
+            let rootEpoch = WorkspaceCodemapRootEpoch(
+                rootID: rootID,
+                rootLifetimeID: state.lifetimeID
+            )
+            if let cleanup = detachModernCodemapSession(rootEpoch: rootEpoch),
+               modernCodemapCleanupIDs.insert(cleanup.id).inserted
+            {
+                modernCodemapCleanupFlights.append(cleanup)
+            }
             statesToUnload.append((rootID, state))
         }
         guard !statesToUnload.isEmpty else { return }
@@ -6427,6 +6528,9 @@ actor WorkspaceFileContextStore {
             let codeScanCancelStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
         await codeScanActor.cancelAndUnloadScans(forRootFolders: rootPathsToUnload)
+        for cleanup in modernCodemapCleanupFlights {
+            await cleanup.task.value
+        }
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "store.rootUnload.codeScanCancel",
@@ -6972,6 +7076,669 @@ actor WorkspaceFileContextStore {
     func requestCodemapScan(rootID: UUID, relativePath: String) async throws {
         guard let file = file(rootID: rootID, relativePath: relativePath) else { return }
         try await requestCodemapScans(for: [file])
+    }
+
+    func requestCodemapArtifact(
+        forFileID fileID: UUID,
+        priority: CodeMapArtifactBuildPriority = .demand
+    ) -> WorkspaceCodemapArtifactDemandResult {
+        guard let file = filesByID[fileID] else {
+            return .unavailable(.fileNotCataloged)
+        }
+        guard let state = rootStatesByID[file.rootID] else {
+            return .unavailable(.rootNotLoaded)
+        }
+        guard state.fileIDsByRelativePath[file.standardizedRelativePath] == file.id,
+              filesByID[file.id] == file
+        else {
+            return .unavailable(.fileNotCataloged)
+        }
+
+        let fileExtension = (file.name as NSString).pathExtension
+        guard let language = SyntaxManager.shared.language(forFileExtension: fileExtension),
+              SyntaxManager.supportsCodeMap(fileExtension: fileExtension)
+        else {
+            return .unavailable(.unsupportedFileType)
+        }
+        guard let catalogGeneration = translatedModernCodemapGeneration(
+            catalogGenerationsByRootID[file.rootID] ?? 0
+        ), let ingressGeneration = translatedModernCodemapGeneration(
+            appliedIndexGenerationsByRootID[file.rootID] ?? 0
+        ), let identity = WorkspaceCodemapArtifactBindingIdentity(
+            rootID: file.rootID,
+            rootLifetimeID: state.lifetimeID,
+            fileID: file.id,
+            standardizedRootPath: state.root.standardizedFullPath,
+            standardizedRelativePath: file.standardizedRelativePath,
+            standardizedFullPath: file.standardizedFullPath
+        ) else {
+            return .unavailable(.staleCurrentness)
+        }
+
+        let rootEpoch = WorkspaceCodemapRootEpoch(
+            rootID: file.rootID,
+            rootLifetimeID: state.lifetimeID
+        )
+        let authority = ModernCodemapRootAuthority(
+            rootEpoch: rootEpoch,
+            standardizedRootPath: state.root.standardizedFullPath,
+            catalogGeneration: catalogGeneration,
+            ingressGeneration: ingressGeneration
+        )
+        if modernCodemapCleanupFlightsByRootID[file.rootID] != nil {
+            return .unavailable(.busy(retryAfterMilliseconds: nil))
+        }
+        if let existing = modernCodemapSessionsByRootEpoch[rootEpoch],
+           existing.authority != authority
+        {
+            _ = detachModernCodemapSession(rootEpoch: rootEpoch)
+            return .unavailable(.busy(retryAfterMilliseconds: nil))
+        }
+
+        if let existing = modernCodemapSessionsByRootEpoch[rootEpoch]?.demandsByFileID[file.id] {
+            switch existing.result {
+            case .pending, .ready:
+                return existing.result
+            case let .unavailable(reason) where modernCodemapUnavailableIsStable(reason):
+                return existing.result
+            case .unavailable:
+                break
+            }
+        }
+        if case let .unavailable(reason)? =
+            modernCodemapSessionsByRootEpoch[rootEpoch]?.setupDisposition,
+            !modernCodemapUnavailableIsStable(reason)
+        {
+            _ = detachModernCodemapSession(rootEpoch: rootEpoch)
+            return .unavailable(.busy(retryAfterMilliseconds: nil))
+        }
+
+        if modernCodemapSessionsByRootEpoch[rootEpoch] == nil {
+            modernCodemapSessionsByRootEpoch[rootEpoch] = ModernCodemapRootSession(authority: authority)
+        }
+
+        let ticket = WorkspaceCodemapArtifactDemandTicket(
+            requestID: UUID(),
+            rootEpoch: rootEpoch,
+            fileID: file.id,
+            requestGeneration: ingressGeneration,
+            catalogGeneration: catalogGeneration,
+            pathGeneration: ingressGeneration,
+            ingressGeneration: ingressGeneration
+        )
+        let owner = WorkspaceCodemapLiveDemandOwner()
+        var record = ModernCodemapDemandRecord(
+            ticket: ticket,
+            identity: identity,
+            language: language,
+            owner: owner,
+            result: .pending(ticket),
+            task: nil
+        )
+
+        if modernCodemapSessionsByRootEpoch[rootEpoch]?.setupTask == nil,
+           modernCodemapSessionsByRootEpoch[rootEpoch]?.setupDisposition == nil
+        {
+            let setupTask = Task { [weak self] in
+                guard let self else {
+                    return ModernCodemapSetupDisposition.unavailable(.cancelled)
+                }
+                return await performModernCodemapSetup(authority: authority)
+            }
+            modernCodemapSessionsByRootEpoch[rootEpoch]?.setupTask = setupTask
+        }
+
+        modernCodemapSessionsByRootEpoch[rootEpoch]?.demandsByFileID[file.id] = record
+        let demandTask = Task { [weak self] in
+            guard let self else { return }
+            await performModernCodemapDemand(ticket: ticket, priority: priority)
+        }
+        record.task = demandTask
+        modernCodemapSessionsByRootEpoch[rootEpoch]?.demandsByFileID[file.id] = record
+        return .pending(ticket)
+    }
+
+    func codemapArtifactDemandStatus(
+        _ ticket: WorkspaceCodemapArtifactDemandTicket
+    ) -> WorkspaceCodemapArtifactDemandResult {
+        guard modernCodemapDemandIsCurrent(ticket),
+              let record = modernCodemapSessionsByRootEpoch[ticket.rootEpoch]?
+              .demandsByFileID[ticket.fileID],
+              record.ticket == ticket
+        else {
+            return .unavailable(.staleCurrentness)
+        }
+        return record.result
+    }
+
+    func cancelCodemapArtifactDemand(
+        _ ticket: WorkspaceCodemapArtifactDemandTicket
+    ) async -> Bool {
+        guard modernCodemapDemandIsCurrent(ticket),
+              var session = modernCodemapSessionsByRootEpoch[ticket.rootEpoch],
+              var record = session.demandsByFileID[ticket.fileID],
+              record.ticket == ticket
+        else {
+            return false
+        }
+        if case .unavailable(.cancelled) = record.result {
+            return true
+        }
+
+        record.task?.cancel()
+        let retainedBundle = session.bundlesByRequestID.removeValue(forKey: ticket.requestID)
+        record.result = .unavailable(.cancelled)
+        record.task = nil
+        session.demandsByFileID[ticket.fileID] = record
+        modernCodemapSessionsByRootEpoch[ticket.rootEpoch] = session
+        retainedBundle?.close()
+
+        if let engine = session.engine {
+            await modernCodemapCancellationCleanupHook(ticket)
+            _ = await engine.cancel(owner: record.owner)
+        }
+        return true
+    }
+
+    private func performModernCodemapSetup(
+        authority: ModernCodemapRootAuthority
+    ) async -> ModernCodemapSetupDisposition {
+        guard modernCodemapAuthorityIsCurrent(authority) else {
+            return .unavailable(.staleCurrentness)
+        }
+
+        let runtime: CodeMapArtifactRuntime
+        do {
+            runtime = try codemapRuntimeProvider()
+        } catch {
+            let disposition = ModernCodemapSetupDisposition.unavailable(.runtimeFailure)
+            publishModernCodemapSetupDisposition(disposition, authority: authority)
+            return disposition
+        }
+        guard modernCodemapAuthorityIsCurrent(authority), !Task.isCancelled else {
+            return .unavailable(.staleCurrentness)
+        }
+
+        let endpoint = WorkspaceCodemapBindingIntegrationEndpoint(
+            sourceReader: WorkspaceCodemapValidatedSourceReaderClient { [weak self] identity, fingerprint, maximumBytes, ownerID in
+                guard let self else {
+                    throw WorkspaceCodemapBindingIntegrationRoutingError.routeDetached(
+                        WorkspaceCodemapRootEpoch(
+                            rootID: identity.rootID,
+                            rootLifetimeID: identity.rootLifetimeID
+                        )
+                    )
+                }
+                return try await readModernCodemapSource(
+                    identity: identity,
+                    expectedFingerprint: fingerprint,
+                    maximumBytes: maximumBytes,
+                    ownerID: ownerID,
+                    authority: authority
+                )
+            },
+            catalogClient: WorkspaceCodemapBindingCatalogClient { [weak self] rootEpoch, relativePath in
+                guard let self else { return nil }
+                return await modernCodemapManifestCandidate(
+                    rootEpoch: rootEpoch,
+                    relativePath: relativePath,
+                    authority: authority
+                )
+            }
+        )
+        let registry = runtime.bindingIntegrationRegistry
+        guard let routeToken = await registry.register(
+            rootEpoch: authority.rootEpoch,
+            endpoint: endpoint
+        ) else {
+            let disposition = ModernCodemapSetupDisposition.unavailable(.routeConflict)
+            publishModernCodemapSetupDisposition(disposition, authority: authority)
+            return disposition
+        }
+        guard modernCodemapAuthorityIsCurrent(authority), !Task.isCancelled else {
+            _ = await registry.unregister(routeToken)
+            return .unavailable(.staleCurrentness)
+        }
+
+        modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.endpoint = endpoint
+        modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.routeToken = routeToken
+        modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.runtime = runtime
+
+        let engine: WorkspaceCodemapBindingEngine
+        do {
+            engine = try runtime.bindingEngine()
+        } catch {
+            _ = await registry.unregister(routeToken)
+            if modernCodemapAuthorityIsCurrent(authority) {
+                modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.endpoint = nil
+                modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.routeToken = nil
+                modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.runtime = nil
+            }
+            let disposition = ModernCodemapSetupDisposition.unavailable(.runtimeFailure)
+            publishModernCodemapSetupDisposition(disposition, authority: authority)
+            return disposition
+        }
+        guard modernCodemapAuthorityIsCurrent(authority), !Task.isCancelled else {
+            _ = await registry.unregister(routeToken)
+            await engine.unloadRoot(rootEpoch: authority.rootEpoch)
+            return .unavailable(.staleCurrentness)
+        }
+        modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.engine = engine
+
+        let registration = WorkspaceCodemapBindingRootRegistration(
+            rootID: authority.rootEpoch.rootID,
+            rootLifetimeID: authority.rootEpoch.rootLifetimeID,
+            loadedRootURL: URL(fileURLWithPath: authority.standardizedRootPath, isDirectory: true),
+            catalogGeneration: authority.catalogGeneration,
+            ingressGeneration: authority.ingressGeneration
+        )
+        let registrationResult = await engine.registerRoot(registration)
+        guard modernCodemapAuthorityIsCurrent(authority), !Task.isCancelled else {
+            _ = await registry.unregister(routeToken)
+            await engine.unloadRoot(rootEpoch: authority.rootEpoch)
+            return .unavailable(.staleCurrentness)
+        }
+
+        let disposition: ModernCodemapSetupDisposition = switch registrationResult {
+        case .registered, .exactDuplicate:
+            .ready
+        case let .unavailable(state):
+            switch state {
+            case let .terminalUnavailable(reason):
+                .unavailable(.gitTerminal(reason))
+            case let .transientUnavailable(reason, _):
+                .unavailable(.gitTransient(reason))
+            case .unresolved, .resolving, .eligible:
+                .unavailable(.registrationFailed)
+            }
+        case .busy:
+            .unavailable(.busy(retryAfterMilliseconds: nil))
+        case .failed:
+            .unavailable(.registrationFailed)
+        }
+        publishModernCodemapSetupDisposition(disposition, authority: authority)
+        return disposition
+    }
+
+    private func performModernCodemapDemand(
+        ticket: WorkspaceCodemapArtifactDemandTicket,
+        priority: CodeMapArtifactBuildPriority
+    ) async {
+        guard modernCodemapDemandIsCurrent(ticket),
+              let session = modernCodemapSessionsByRootEpoch[ticket.rootEpoch],
+              let record = session.demandsByFileID[ticket.fileID],
+              record.ticket == ticket
+        else { return }
+
+        let setupDisposition: ModernCodemapSetupDisposition = if let existing = session.setupDisposition {
+            existing
+        } else if let setupTask = session.setupTask {
+            await setupTask.value
+        } else {
+            .unavailable(.runtimeFailure)
+        }
+
+        guard modernCodemapDemandIsCurrent(ticket), !Task.isCancelled,
+              let refreshedSession = modernCodemapSessionsByRootEpoch[ticket.rootEpoch],
+              let refreshedRecord = refreshedSession.demandsByFileID[ticket.fileID],
+              refreshedRecord.ticket == ticket
+        else { return }
+
+        switch setupDisposition {
+        case let .unavailable(reason):
+            publishModernCodemapDemandResult(.unavailable(reason), ticket: ticket)
+            return
+        case .ready:
+            break
+        }
+        guard let engine = refreshedSession.engine else {
+            publishModernCodemapDemandResult(.unavailable(.runtimeFailure), ticket: ticket)
+            return
+        }
+
+        let result = await engine.demand(WorkspaceCodemapBindingDemand(
+            owner: refreshedRecord.owner,
+            identity: refreshedRecord.identity,
+            requestGeneration: ticket.requestGeneration,
+            catalogGeneration: ticket.catalogGeneration,
+            pathGeneration: ticket.pathGeneration,
+            ingressGeneration: ticket.ingressGeneration,
+            priority: priority,
+            language: refreshedRecord.language
+        ))
+        guard modernCodemapDemandIsCurrent(ticket), !Task.isCancelled else { return }
+
+        switch result {
+        case let .ready(snapshot), let .alreadyReady(snapshot):
+            await publishModernCodemapReady(
+                snapshot: snapshot,
+                engine: engine,
+                ticket: ticket
+            )
+        case let .unavailable(reason):
+            publishModernCodemapDemandResult(
+                .unavailable(.demandUnavailable(reason)),
+                ticket: ticket
+            )
+        case let .busy(retryAfterMilliseconds):
+            publishModernCodemapDemandResult(
+                .unavailable(.busy(retryAfterMilliseconds: retryAfterMilliseconds)),
+                ticket: ticket
+            )
+        case let .rejected(rejection):
+            publishModernCodemapDemandResult(
+                .unavailable(.rejected(rejection)),
+                ticket: ticket
+            )
+        case .cancelled:
+            publishModernCodemapDemandResult(.unavailable(.cancelled), ticket: ticket)
+        }
+    }
+
+    private func publishModernCodemapReady(
+        snapshot: WorkspaceCodemapLiveReadySnapshot,
+        engine: WorkspaceCodemapBindingEngine,
+        ticket: WorkspaceCodemapArtifactDemandTicket
+    ) async {
+        guard modernCodemapDemandIsCurrent(ticket),
+              let record = modernCodemapSessionsByRootEpoch[ticket.rootEpoch]?
+              .demandsByFileID[ticket.fileID],
+              record.ticket == ticket
+        else { return }
+
+        await modernCodemapReadyPublicationHook(ticket)
+        guard let bundle = await engine.freeze(rootEpoch: ticket.rootEpoch) else {
+            publishModernCodemapDemandResult(
+                .unavailable(.rejected(.staleCompletion)),
+                ticket: ticket
+            )
+            return
+        }
+        guard modernCodemapDemandIsCurrent(ticket),
+              bundle.rootEpoch == ticket.rootEpoch,
+              bundle.catalogGeneration == ticket.catalogGeneration,
+              snapshot.rootEpoch == ticket.rootEpoch,
+              snapshot.fileID == ticket.fileID,
+              snapshot.standardizedRelativePath == record.identity.standardizedRelativePath,
+              snapshot.requestGeneration == ticket.requestGeneration,
+              let frozenSnapshot = try? bundle.snapshot().first(where: {
+                  $0.fileID == ticket.fileID &&
+                      $0.standardizedRelativePath == record.identity.standardizedRelativePath &&
+                      $0.requestGeneration == ticket.requestGeneration &&
+                      $0.artifactKey == snapshot.artifactKey
+              }),
+              frozenSnapshot == snapshot,
+              let handle = try? bundle.handle(for: ticket.fileID),
+              (try? handle.artifactKey()) == snapshot.artifactKey
+        else {
+            bundle.close()
+            if modernCodemapDemandIsCurrent(ticket) {
+                publishModernCodemapDemandResult(
+                    .unavailable(.rejected(.staleCompletion)),
+                    ticket: ticket
+                )
+            }
+            return
+        }
+
+        modernCodemapSessionsByRootEpoch[ticket.rootEpoch]?
+            .bundlesByRequestID[ticket.requestID] = bundle
+        publishModernCodemapDemandResult(
+            .ready(WorkspaceCodemapArtifactDemandReady(
+                ticket: ticket,
+                identity: record.identity,
+                snapshot: snapshot,
+                handle: handle
+            )),
+            ticket: ticket
+        )
+    }
+
+    private func publishModernCodemapSetupDisposition(
+        _ disposition: ModernCodemapSetupDisposition,
+        authority: ModernCodemapRootAuthority
+    ) {
+        guard modernCodemapAuthorityIsCurrent(authority) else { return }
+        modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.setupDisposition = disposition
+        modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.setupTask = nil
+    }
+
+    private func publishModernCodemapDemandResult(
+        _ result: WorkspaceCodemapArtifactDemandResult,
+        ticket: WorkspaceCodemapArtifactDemandTicket
+    ) {
+        guard modernCodemapDemandIsCurrent(ticket),
+              var session = modernCodemapSessionsByRootEpoch[ticket.rootEpoch],
+              var record = session.demandsByFileID[ticket.fileID],
+              record.ticket == ticket
+        else { return }
+        record.result = result
+        record.task = nil
+        session.demandsByFileID[ticket.fileID] = record
+        modernCodemapSessionsByRootEpoch[ticket.rootEpoch] = session
+    }
+
+    private func modernCodemapManifestCandidate(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        relativePath: String,
+        authority: ModernCodemapRootAuthority
+    ) -> WorkspaceCodemapManifestBindingCandidate? {
+        guard rootEpoch == authority.rootEpoch,
+              modernCodemapAuthorityIsCurrent(authority),
+              let state = rootStatesByID[rootEpoch.rootID]
+        else { return nil }
+        let standardizedRelativePath = StandardizedPath.relative(relativePath)
+        guard !relativePath.isEmpty,
+              !relativePath.hasPrefix("/"),
+              !StandardizedPath.containsNUL(relativePath),
+              standardizedRelativePath == relativePath,
+              standardizedRelativePath != "..",
+              !standardizedRelativePath.hasPrefix("../"),
+              let fileID = state.fileIDsByRelativePath[standardizedRelativePath],
+              let file = filesByID[fileID],
+              file.rootID == rootEpoch.rootID,
+              file.standardizedRelativePath == standardizedRelativePath,
+              let identity = WorkspaceCodemapArtifactBindingIdentity(
+                  rootID: rootEpoch.rootID,
+                  rootLifetimeID: rootEpoch.rootLifetimeID,
+                  fileID: file.id,
+                  standardizedRootPath: authority.standardizedRootPath,
+                  standardizedRelativePath: standardizedRelativePath,
+                  standardizedFullPath: file.standardizedFullPath
+              )
+        else { return nil }
+        return WorkspaceCodemapManifestBindingCandidate(
+            identity: identity,
+            requestGeneration: authority.ingressGeneration,
+            pathGeneration: authority.ingressGeneration,
+            ingressGeneration: authority.ingressGeneration
+        )
+    }
+
+    private func readModernCodemapSource(
+        identity: WorkspaceCodemapArtifactBindingIdentity,
+        expectedFingerprint: GitBlobLStatFingerprint,
+        maximumBytes: Int64,
+        ownerID: UUID,
+        authority: ModernCodemapRootAuthority
+    ) async throws -> ValidatedRawFileContentSnapshot {
+        guard WorkspaceCodemapRootEpoch(
+            rootID: identity.rootID,
+            rootLifetimeID: identity.rootLifetimeID
+        ) == authority.rootEpoch,
+            modernCodemapAuthorityIsCurrent(authority),
+            let state = rootStatesByID[identity.rootID],
+            state.root.standardizedFullPath == identity.standardizedRootPath,
+            let fileID = state.fileIDsByRelativePath[identity.standardizedRelativePath],
+            fileID == identity.fileID,
+            let file = filesByID[fileID],
+            file.standardizedFullPath == identity.standardizedFullPath
+        else {
+            throw WorkspaceCodemapBindingIntegrationRoutingError.routeDetached(authority.rootEpoch)
+        }
+
+        let snapshot = try await state.service.loadValidatedRawContent(
+            ofRelativePath: identity.standardizedRelativePath,
+            expectedFingerprint: FileContentFingerprint(
+                deviceID: expectedFingerprint.device,
+                fileNumber: expectedFingerprint.inode,
+                byteSize: expectedFingerprint.size,
+                modificationSeconds: expectedFingerprint.modificationSeconds,
+                modificationNanoseconds: expectedFingerprint.modificationNanoseconds,
+                statusChangeSeconds: expectedFingerprint.changeSeconds,
+                statusChangeNanoseconds: expectedFingerprint.changeNanoseconds
+            ),
+            maximumBytes: maximumBytes,
+            workloadClass: .codemap,
+            schedulerOwnerID: ownerID
+        )
+        guard modernCodemapAuthorityIsCurrent(authority),
+              let currentState = rootStatesByID[identity.rootID],
+              currentState.lifetimeID == identity.rootLifetimeID,
+              currentState.root.standardizedFullPath == identity.standardizedRootPath,
+              currentState.fileIDsByRelativePath[identity.standardizedRelativePath] == identity.fileID,
+              let currentFile = filesByID[identity.fileID],
+              currentFile.standardizedFullPath == identity.standardizedFullPath
+        else {
+            throw WorkspaceCodemapBindingIntegrationRoutingError.routeDetached(authority.rootEpoch)
+        }
+        return snapshot
+    }
+
+    private func modernCodemapAuthorityIsCurrent(
+        _ authority: ModernCodemapRootAuthority
+    ) -> Bool {
+        guard modernCodemapSessionsByRootEpoch[authority.rootEpoch]?.authority == authority,
+              let state = rootStatesByID[authority.rootEpoch.rootID],
+              state.lifetimeID == authority.rootEpoch.rootLifetimeID,
+              state.root.standardizedFullPath == authority.standardizedRootPath,
+              translatedModernCodemapGeneration(
+                  catalogGenerationsByRootID[authority.rootEpoch.rootID] ?? 0
+              ) == authority.catalogGeneration,
+              translatedModernCodemapGeneration(
+                  appliedIndexGenerationsByRootID[authority.rootEpoch.rootID] ?? 0
+              ) == authority.ingressGeneration
+        else { return false }
+        return true
+    }
+
+    private func modernCodemapDemandIsCurrent(
+        _ ticket: WorkspaceCodemapArtifactDemandTicket
+    ) -> Bool {
+        guard ticket.requestGeneration > 0,
+              ticket.catalogGeneration > 0,
+              ticket.pathGeneration > 0,
+              ticket.ingressGeneration > 0,
+              ticket.requestGeneration == ticket.pathGeneration,
+              ticket.requestGeneration == ticket.ingressGeneration,
+              let session = modernCodemapSessionsByRootEpoch[ticket.rootEpoch],
+              session.authority.catalogGeneration == ticket.catalogGeneration,
+              session.authority.ingressGeneration == ticket.ingressGeneration,
+              modernCodemapAuthorityIsCurrent(session.authority),
+              let state = rootStatesByID[ticket.rootEpoch.rootID],
+              state.fileIDsByRelativePath.values.contains(ticket.fileID),
+              filesByID[ticket.fileID]?.rootID == ticket.rootEpoch.rootID
+        else { return false }
+        return true
+    }
+
+    private func modernCodemapUnavailableIsStable(
+        _ reason: WorkspaceCodemapArtifactDemandUnavailableReason
+    ) -> Bool {
+        switch reason {
+        case .rootNotLoaded, .fileNotCataloged, .unsupportedFileType, .gitTerminal,
+             .staleCurrentness:
+            true
+        case let .demandUnavailable(reason):
+            reason != .transient
+        case .gitTransient, .busy, .rejected, .routeConflict, .registrationFailed,
+             .runtimeFailure, .cancelled:
+            false
+        }
+    }
+
+    private func translatedModernCodemapGeneration(_ generation: UInt64) -> UInt64? {
+        let (translated, overflow) = generation.addingReportingOverflow(1)
+        return overflow ? nil : translated
+    }
+
+    @discardableResult
+    private func detachModernCodemapSession(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> ModernCodemapCleanupFlight? {
+        guard let session = modernCodemapSessionsByRootEpoch.removeValue(forKey: rootEpoch) else {
+            return modernCodemapCleanupFlightsByRootID[rootEpoch.rootID]
+        }
+        session.setupTask?.cancel()
+        let demandRecords = Array(session.demandsByFileID.values)
+        for record in demandRecords {
+            record.task?.cancel()
+        }
+        for bundle in session.bundlesByRequestID.values {
+            bundle.close()
+        }
+        let detached = DetachedModernCodemapSession(
+            authority: session.authority,
+            registry: session.runtime?.bindingIntegrationRegistry,
+            routeToken: session.routeToken,
+            engine: session.engine,
+            owners: demandRecords.map(\.owner),
+            setupTask: session.setupTask,
+            demandTasks: demandRecords.compactMap(\.task)
+        )
+        return startModernCodemapCleanup(detached)
+    }
+
+    private func detachModernCodemapSessions(rootIDs: Set<UUID>) {
+        guard !rootIDs.isEmpty else { return }
+        let rootEpochs = modernCodemapSessionsByRootEpoch.keys.filter {
+            rootIDs.contains($0.rootID)
+        }
+        for rootEpoch in rootEpochs {
+            _ = detachModernCodemapSession(rootEpoch: rootEpoch)
+        }
+    }
+
+    private func startModernCodemapCleanup(
+        _ detached: DetachedModernCodemapSession
+    ) -> ModernCodemapCleanupFlight {
+        if let existing = modernCodemapCleanupFlightsByRootID[detached.authority.rootEpoch.rootID] {
+            return existing
+        }
+        let cleanupID = UUID()
+        let task = Task { [weak self] in
+            if let registry = detached.registry, let routeToken = detached.routeToken {
+                _ = await registry.unregister(routeToken)
+            }
+            if let engine = detached.engine {
+                for owner in detached.owners {
+                    _ = await engine.cancel(owner: owner)
+                }
+                await engine.unloadRoot(rootEpoch: detached.authority.rootEpoch)
+            }
+            if let setupTask = detached.setupTask {
+                _ = await setupTask.value
+            }
+            for demandTask in detached.demandTasks {
+                await demandTask.value
+            }
+            await self?.finishModernCodemapCleanup(
+                rootID: detached.authority.rootEpoch.rootID,
+                cleanupID: cleanupID
+            )
+        }
+        let flight = ModernCodemapCleanupFlight(
+            id: cleanupID,
+            rootEpoch: detached.authority.rootEpoch,
+            task: task
+        )
+        modernCodemapCleanupFlightsByRootID[detached.authority.rootEpoch.rootID] = flight
+        return flight
+    }
+
+    private func finishModernCodemapCleanup(rootID: UUID, cleanupID: UUID) {
+        guard modernCodemapCleanupFlightsByRootID[rootID]?.id == cleanupID else { return }
+        modernCodemapCleanupFlightsByRootID.removeValue(forKey: rootID)
     }
 
     func requestCodemapScans(inRoot rootID: UUID) async throws {
@@ -9505,6 +10272,7 @@ actor WorkspaceFileContextStore {
         for rootID in rootIDsToAdvance {
             catalogGenerationsByRootID[rootID] = (catalogGenerationsByRootID[rootID] ?? 0) &+ 1
         }
+        detachModernCodemapSessions(rootIDs: rootIDsToAdvance)
     }
 
     private static let catalogGenerationScopes: [WorkspaceLookupRootScope] = [
