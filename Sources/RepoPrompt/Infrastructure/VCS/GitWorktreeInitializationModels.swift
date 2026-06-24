@@ -218,8 +218,7 @@ struct GitWorktreeCreationReceipt: Equatable, @unchecked Sendable {
               !includeCopyHadFailures
         else { return .includeCopyFailure }
         guard parentCompatibilityKey.searchABI == .current else { return .compatibilityMismatch }
-        guard parentCompatibilityKey.treeOID == resolvedBaseTreeOID,
-              parentAuthorityBefore.treeOID == resolvedBaseTreeOID,
+        guard parentCompatibilityKey.treeOID == parentAuthorityBefore.treeOID,
               targetAuthorityAfter.treeOID == resolvedBaseTreeOID,
               parentCompatibilityKey.repositoryNamespace == targetAuthorityAfter.repositoryNamespace,
               parentCompatibilityKey.repositoryRelativeRootPrefix == repositoryRelativeRootPrefix,

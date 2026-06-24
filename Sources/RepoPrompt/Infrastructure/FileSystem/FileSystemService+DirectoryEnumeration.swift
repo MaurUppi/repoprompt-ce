@@ -1,6 +1,167 @@
+import Darwin
 import Foundation
 
+enum WorkspaceRootSeedVerificationError: Error, Equatable {
+    case invalidPath
+    case limitExceeded
+    case unsupportedTopology
+}
+
 extension FileSystemService {
+    /// Collects bounded, target-local facts without mutating the service's visited state.
+    /// The seed route uses these facts only for shadow verification; the ordinary crawler
+    /// remains authoritative and retains ownership of ignore caches/publications.
+    func workspaceRootSeedVerificationFacts(
+        relativePaths: Set<String>,
+        affectedDirectories: Set<String>,
+        allowRepositoryMetadataAtRoot: Bool = true,
+        limits: WorkspaceRootSeedPlannerLimits
+    ) async throws -> [String: WorkspaceRootSeedVerificationFact] {
+        var candidates = Set<String>()
+        candidates.reserveCapacity(relativePaths.count)
+        for path in relativePaths {
+            let standardized = StandardizedPath.relative(path)
+            guard !standardized.isEmpty,
+                  standardized == path,
+                  standardized.utf8.count <= 16 * 1024,
+                  standardized.split(separator: "/").count <= 512,
+                  !standardized.hasPrefix("../"),
+                  standardized != ".git",
+                  !standardized.hasPrefix(".git/")
+            else { throw WorkspaceRootSeedVerificationError.invalidPath }
+            candidates.insert(standardized)
+        }
+
+        let fileManager = FileManager.default
+        var proofDirectories = affectedDirectories
+        for relativePath in candidates {
+            try Task.checkCancellation()
+            let absolutePath = rootURL.appendingPathComponent(relativePath).path
+            var value = stat()
+            if lstat(absolutePath, &value) == 0 {
+                if value.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) {
+                    proofDirectories.insert(relativePath)
+                }
+            } else if errno != ENOENT, errno != ENOTDIR {
+                throw CocoaError(.fileReadUnknown)
+            }
+        }
+        guard proofDirectories.count <= limits.maximumVerificationPathCount else {
+            throw WorkspaceRootSeedVerificationError.limitExceeded
+        }
+
+        let sortedProofDirectories = proofDirectories.map(StandardizedPath.relative).sorted {
+            let lhsDepth = $0.split(separator: "/").count
+            let rhsDepth = $1.split(separator: "/").count
+            return lhsDepth == rhsDepth ? $0 < $1 : lhsDepth < rhsDepth
+        }
+        var disjointProofDirectories: [String] = []
+        for directory in sortedProofDirectories {
+            if disjointProofDirectories.contains(where: { ancestor in
+                ancestor.isEmpty || directory == ancestor || directory.hasPrefix(ancestor + "/")
+            }) {
+                continue
+            }
+            disjointProofDirectories.append(directory)
+        }
+
+        for directory in disjointProofDirectories {
+            try Task.checkCancellation()
+            let standardized = StandardizedPath.relative(directory)
+            guard standardized == directory,
+                  standardized.utf8.count <= 16 * 1024,
+                  standardized.split(separator: "/").count <= 512,
+                  !standardized.hasPrefix("../"),
+                  standardized != ".git",
+                  !standardized.hasPrefix(".git/")
+            else { throw WorkspaceRootSeedVerificationError.invalidPath }
+            let absolute = standardized.isEmpty
+                ? rootURL
+                : rootURL.appendingPathComponent(standardized, isDirectory: true)
+            var enumerationFailed = false
+            guard let enumerator = fileManager.enumerator(
+                at: absolute,
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                options: [],
+                errorHandler: { _, _ in
+                    enumerationFailed = true
+                    return false
+                }
+            ) else { continue }
+            while let child = enumerator.nextObject() as? URL {
+                try Task.checkCancellation()
+                let absolutePath = child.standardizedFileURL.path
+                let rootPath = rootURL.standardizedFileURL.path
+                guard absolutePath.hasPrefix(rootPath + "/") else {
+                    throw WorkspaceRootSeedVerificationError.invalidPath
+                }
+                let relative = StandardizedPath.relative(
+                    String(absolutePath.dropFirst(rootPath.count + 1))
+                )
+                if relative == ".git" || relative.hasPrefix(".git/") {
+                    if allowRepositoryMetadataAtRoot {
+                        enumerator.skipDescendants()
+                        continue
+                    }
+                    throw WorkspaceRootSeedVerificationError.unsupportedTopology
+                }
+                if relative.hasSuffix("/.git") || relative.contains("/.git/") {
+                    throw WorkspaceRootSeedVerificationError.unsupportedTopology
+                }
+                let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                if values?.isSymbolicLink == true {
+                    enumerator.skipDescendants()
+                }
+                candidates.insert(relative)
+                if candidates.count > limits.maximumVerificationPathCount {
+                    throw WorkspaceRootSeedVerificationError.limitExceeded
+                }
+            }
+            guard !enumerationFailed else { throw CocoaError(.fileReadUnknown) }
+        }
+        guard candidates.count <= limits.maximumVerificationPathCount else {
+            throw WorkspaceRootSeedVerificationError.limitExceeded
+        }
+
+        var facts: [String: WorkspaceRootSeedVerificationFact] = [:]
+        facts.reserveCapacity(candidates.count)
+        for relativePath in candidates.sorted() {
+            try Task.checkCancellation()
+            let absolutePath = rootURL.appendingPathComponent(relativePath).path
+            var value = stat()
+            let kind: WorkspaceRootSeedVerifiedPathKind
+            if lstat(absolutePath, &value) != 0 {
+                guard errno == ENOENT || errno == ENOTDIR else {
+                    throw CocoaError(.fileReadUnknown)
+                }
+                kind = .missing
+            } else {
+                switch value.st_mode & mode_t(S_IFMT) {
+                case mode_t(S_IFREG):
+                    kind = .regularFile(isExecutable: value.st_mode & mode_t(0o111) != 0)
+                case mode_t(S_IFDIR):
+                    kind = .directory
+                case mode_t(S_IFLNK):
+                    kind = .symbolicLink
+                default:
+                    kind = .special
+                }
+            }
+            let isDirectory = kind == .directory
+            facts[relativePath] = await WorkspaceRootSeedVerificationFact(
+                relativePath: relativePath,
+                kind: kind,
+                isIgnored: kind == .missing
+                    ? false
+                    : isIgnoredHierarchical(
+                        relativePath: relativePath,
+                        isDirectory: isDirectory
+                    )
+            )
+        }
+        return facts
+    }
+
     // MARK: - Parallel scanning support
 
     struct FolderScanBatchResult {

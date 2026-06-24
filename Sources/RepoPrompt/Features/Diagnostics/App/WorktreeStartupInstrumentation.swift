@@ -67,6 +67,7 @@ enum WorkspaceRootSeedFallbackReason: String, Equatable {
     case unknownCopiedPath
     case changedIgnoreAuthority
     case conflictOrUnmergedIndex
+    case assumeUnchangedIndexEntry
     case sparseCheckout
     case submoduleOrNestedRepository
     case symlinkOrSpecialTopology
@@ -85,6 +86,7 @@ enum WorktreeStartupPhase: String, Equatable {
     case worktreePreparationStarted
     case bindingTransitionStarted
     case rootLoadStarted
+    case shadowVerified
     case rootReady
     case providerStart
     case failed
@@ -126,6 +128,19 @@ enum WorktreeStartupInstrumentation {
         let gitCommands: [GitCommandMetric]
         let routeCounts: [WorkspaceRootStartupRoute: Int]
         let fallbackCounts: [WorkspaceRootSeedFallbackReason: Int]
+        let shadow: ShadowCounters
+    }
+
+    struct ShadowCounters: Equatable {
+        var inventoryComparisons = 0
+        var inventoryMatches = 0
+        var inventoryMismatches = 0
+        var projectedSearchComparisons = 0
+        var projectedSearchMatches = 0
+        var projectedSearchMismatches = 0
+        var latestBaseEntryCount = 0
+        var latestOverlayEntryCount = 0
+        var latestTombstoneCount = 0
     }
 
     private static let lock = NSLock()
@@ -135,6 +150,7 @@ enum WorktreeStartupInstrumentation {
     private static var gitCommands: [GitCommandMetric] = []
     private static var routeCounts: [WorkspaceRootStartupRoute: Int] = [:]
     private static var fallbackCounts: [WorkspaceRootSeedFallbackReason: Int] = [:]
+    private static var shadowCounters = ShadowCounters()
 
     static func record(
         _ phase: WorktreeStartupPhase,
@@ -186,6 +202,45 @@ enum WorktreeStartupInstrumentation {
         ))
     }
 
+    static func recordInventoryComparison(matched: Bool) {
+        lock.lock()
+        shadowCounters.inventoryComparisons = incremented(shadowCounters.inventoryComparisons)
+        if matched {
+            shadowCounters.inventoryMatches = incremented(shadowCounters.inventoryMatches)
+        } else {
+            shadowCounters.inventoryMismatches = incremented(shadowCounters.inventoryMismatches)
+        }
+        lock.unlock()
+    }
+
+    static func recordShadowFallback(_ reason: WorkspaceRootSeedFallbackReason) {
+        lock.lock()
+        fallbackCounts[reason, default: 0] = incremented(fallbackCounts[reason, default: 0])
+        lock.unlock()
+    }
+
+    static func recordProjectedSearchComparison(
+        matched: Bool,
+        baseEntryCount: Int,
+        overlayEntryCount: Int,
+        tombstoneCount: Int
+    ) {
+        lock.lock()
+        shadowCounters.projectedSearchComparisons = incremented(shadowCounters.projectedSearchComparisons)
+        if matched {
+            shadowCounters.projectedSearchMatches = incremented(shadowCounters.projectedSearchMatches)
+        } else {
+            shadowCounters.projectedSearchMismatches = incremented(shadowCounters.projectedSearchMismatches)
+            fallbackCounts[.projectedSearchMismatch, default: 0] = incremented(
+                fallbackCounts[.projectedSearchMismatch, default: 0]
+            )
+        }
+        shadowCounters.latestBaseEntryCount = max(0, baseEntryCount)
+        shadowCounters.latestOverlayEntryCount = max(0, overlayEntryCount)
+        shadowCounters.latestTombstoneCount = max(0, tombstoneCount)
+        lock.unlock()
+    }
+
     static func snapshot() -> Snapshot {
         lock.lock()
         defer { lock.unlock() }
@@ -193,8 +248,13 @@ enum WorktreeStartupInstrumentation {
             events: events,
             gitCommands: gitCommands,
             routeCounts: routeCounts,
-            fallbackCounts: fallbackCounts
+            fallbackCounts: fallbackCounts,
+            shadow: shadowCounters
         )
+    }
+
+    private static func incremented(_ value: Int) -> Int {
+        value == Int.max ? value : value + 1
     }
 
     #if DEBUG
@@ -204,6 +264,7 @@ enum WorktreeStartupInstrumentation {
             gitCommands.removeAll(keepingCapacity: true)
             routeCounts.removeAll(keepingCapacity: true)
             fallbackCounts.removeAll(keepingCapacity: true)
+            shadowCounters = ShadowCounters()
             lock.unlock()
         }
     #endif

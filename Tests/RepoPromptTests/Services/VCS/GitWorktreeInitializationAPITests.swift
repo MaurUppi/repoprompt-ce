@@ -123,6 +123,70 @@ final class GitWorktreeInitializationAPITests: XCTestCase {
         XCTAssertEqual(finalAdmission.activeLeaseCount, 0)
     }
 
+    func testIndexManifestReportsAssumeUnchangedAndRepositoryWideSparseEnablement() async throws {
+        let fixture = try GitInitializationFixture()
+        defer { fixture.cleanup() }
+        let git = GitService()
+        let layout = try XCTUnwrap(GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: fixture.root))
+        let prefix = try GitRepositoryRelativeRootPrefix("Root")
+
+        try fixture.git(["update-index", "--assume-unchanged", "--", "Root/old file.txt"])
+        var manifest = try await git.indexManifest(in: layout, prefix: prefix)
+        XCTAssertTrue(manifest.entries.contains {
+            $0.repositoryRelativePath == "Root/old file.txt" && $0.assumeUnchanged
+        })
+        XCTAssertFalse(manifest.sparseCheckoutEnabled)
+
+        try fixture.git(["update-index", "--no-assume-unchanged", "--", "Root/old file.txt"])
+        try fixture.git(["sparse-checkout", "init", "--cone"])
+        try fixture.git(["sparse-checkout", "set", "Root"])
+        manifest = try await git.indexManifest(in: layout, prefix: prefix)
+        XCTAssertTrue(manifest.sparseCheckoutEnabled)
+        XCTAssertTrue(manifest.entries.contains { $0.repositoryRelativePath == "Root/old file.txt" })
+        XCTAssertFalse(manifest.entries.contains { $0.skipWorktree })
+    }
+
+    func testUntrackedNestedRepositoryDirectoryReachesBoundedTopologyProof() async throws {
+        let fixture = try GitInitializationFixture()
+        defer { fixture.cleanup() }
+        let nested = fixture.root.appendingPathComponent("Root/Nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let nestedProcess = Process()
+        nestedProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        nestedProcess.arguments = ["init", "--quiet", nested.path]
+        try nestedProcess.run()
+        nestedProcess.waitUntilExit()
+        XCTAssertEqual(nestedProcess.terminationStatus, 0)
+
+        let git = GitService()
+        let layout = try XCTUnwrap(GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: fixture.root))
+        let prefix = try GitRepositoryRelativeRootPrefix("Root")
+        let status = try await git.worktreeStatus(
+            in: layout,
+            prefix: prefix
+        )
+        XCTAssertTrue(status.pathRecords.contains { record in
+            record.kind == .untracked && StandardizedPath.relative(record.path) == "Root/Nested"
+        })
+
+        let service = try await FileSystemService(
+            path: fixture.root.appendingPathComponent("Root", isDirectory: true).path,
+            respectRepoIgnore: false,
+            respectCursorignore: false
+        )
+        do {
+            _ = try await service.workspaceRootSeedVerificationFacts(
+                relativePaths: ["Nested"],
+                affectedDirectories: [],
+                allowRepositoryMetadataAtRoot: false,
+                limits: .production
+            )
+            XCTFail("Expected nested repository topology fallback")
+        } catch let error as WorkspaceRootSeedVerificationError {
+            XCTAssertEqual(error, .unsupportedTopology)
+        }
+    }
+
     func testAuthorityPolicyIdentityUsesResolvedExternalContentsAndHierarchicalPrefixControls() async throws {
         let fixture = try GitInitializationFixture()
         defer { fixture.cleanup() }

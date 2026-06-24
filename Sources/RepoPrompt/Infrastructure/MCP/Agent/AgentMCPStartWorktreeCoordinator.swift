@@ -178,9 +178,14 @@ struct AgentMCPStartWorktreeCoordinator {
                 }
                 try Task.checkCancellation()
                 let identity = try persistVisualIdentity(for: worktree, request: request)
+                let rootPrefix = try repositoryRelativeRootPrefix(
+                    logicalRoot: context.logicalRoot,
+                    repositoryRoot: context.repo.rootURL
+                )
                 let binding = makeBinding(
                     worktree: worktree,
                     logicalRoot: context.logicalRoot,
+                    repositoryRelativeRootPrefix: rootPrefix,
                     visualIdentity: identity,
                     replacing: agentModeVM.worktreeBindings(forAgentSessionID: targetSessionID).first {
                         standardizedPath($0.logicalRootPath) == standardizedPath(context.logicalRoot.standardizedFullPath)
@@ -428,17 +433,23 @@ struct AgentMCPStartWorktreeCoordinator {
     private func makeBinding(
         worktree: GitWorktreeDescriptor,
         logicalRoot: WorkspaceRootRef,
+        repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix,
         visualIdentity: WorktreeVisualIdentity,
         replacing previous: AgentSessionWorktreeBinding?
     ) -> AgentSessionWorktreeBinding {
-        AgentSessionWorktreeBinding(
+        let physicalRootPath = repositoryRelativeRootPrefix.value.isEmpty
+            ? worktree.path
+            : URL(fileURLWithPath: worktree.path, isDirectory: true)
+            .appendingPathComponent(repositoryRelativeRootPrefix.value, isDirectory: true)
+            .standardizedFileURL.path
+        return AgentSessionWorktreeBinding(
             id: previous?.id ?? UUID().uuidString,
             repositoryID: worktree.repository.repositoryID,
             repoKey: worktree.repository.repoKey,
             logicalRootPath: logicalRoot.standardizedFullPath,
             logicalRootName: logicalRoot.name,
             worktreeID: worktree.worktreeID,
-            worktreeRootPath: worktree.path,
+            worktreeRootPath: physicalRootPath,
             worktreeName: worktree.name,
             branch: worktree.branch,
             head: worktree.head,

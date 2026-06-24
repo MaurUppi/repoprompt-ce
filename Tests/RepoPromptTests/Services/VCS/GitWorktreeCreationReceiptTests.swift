@@ -4,6 +4,124 @@ import Darwin
 import XCTest
 
 final class GitWorktreeCreationReceiptTests: XCTestCase {
+    func testSubdirectoryReceiptPlansOnlyCorrespondingPhysicalRoot() async throws {
+        let fixture = try ReceiptFixture()
+        defer { fixture.cleanup() }
+        try fixture.write("Subdir/Inside.swift", "let inside = true\n")
+        try fixture.git(["add", "Subdir/Inside.swift"])
+        try fixture.git(["commit", "-m", "subdirectory root"])
+
+        let logicalRoot = fixture.root.appendingPathComponent("Subdir", isDirectory: true)
+        let prefix = try GitRepositoryRelativeRootPrefix("Subdir")
+        let authority = GitWorkspaceStateAuthority.shared
+        let git = GitService(workspaceStateAuthority: authority)
+        let coordinator = WorkspaceRootReusableSnapshotCoordinator(gitService: git, authority: authority)
+        guard case .admitted = await coordinator.observeAuthoritativeFullLoad(
+            rootURL: logicalRoot,
+            authoritativeRelativeFilePaths: ["Inside.swift"]
+        ) else { return XCTFail("Expected prefix-scoped reusable snapshot") }
+
+        let initializationContext = GitWorktreeInitializationContext(
+            agentSessionID: fixture.agentSessionID,
+            correlationID: fixture.correlationID,
+            logicalRootPath: logicalRoot.path,
+            expectedOwnerBindingGeneration: fixture.expectedOwnerBindingGeneration,
+            repositoryRelativeRootPrefix: prefix,
+            observeReceipt: true
+        )
+        let result = try await git.createWorktreeWithResult(
+            request: fixture.createRequest(),
+            at: fixture.root,
+            initializationContext: initializationContext
+        )
+        let receipt = try XCTUnwrap(result.initializationReceipt)
+        let physicalRoot = URL(fileURLWithPath: result.descriptor.path, isDirectory: true)
+            .appendingPathComponent(prefix.value, isDirectory: true)
+            .standardizedFileURL.path
+        let binding = AgentSessionWorktreeBinding(
+            id: "subdir-binding",
+            repositoryID: result.descriptor.repository.repositoryID,
+            repoKey: result.descriptor.repository.repoKey,
+            logicalRootPath: logicalRoot.path,
+            logicalRootName: logicalRoot.lastPathComponent,
+            worktreeID: result.descriptor.worktreeID,
+            worktreeRootPath: physicalRoot,
+            source: "test"
+        )
+        let startupContext = fixture.startupContext()
+        let hint = WorkspaceRootMaterializationHint(
+            bindingID: binding.id,
+            standardizedTargetPath: physicalRoot,
+            creationReceipt: receipt,
+            correlationID: fixture.correlationID
+        ).validated(
+            matching: binding,
+            sessionID: fixture.agentSessionID,
+            startupContext: startupContext
+        )
+        XCTAssertNil(hint.validationFallbackReason)
+
+        let store = WorkspaceFileContextStore()
+        let logicalRecord = try await store.loadRoot(path: logicalRoot.path)
+        let materializer = WorkspaceRootBindingProjectionMaterializer(store: store)
+        WorktreeStartupInstrumentation.resetForTesting()
+        let preparation = try await materializer.prepare(
+            sessionID: fixture.agentSessionID,
+            bindings: [binding],
+            startupContext: startupContext,
+            initializationHintsByBindingID: [binding.id: hint]
+        )
+        XCTAssertEqual(
+            preparation.ownership.materializationHintObservationsByPhysicalRootPath[physicalRoot],
+            .eligible(receipt.parentSnapshotIdentity)
+        )
+        XCTAssertEqual(WorktreeStartupInstrumentation.snapshot().shadow.inventoryMatches, 1)
+        await materializer.abort(preparation)
+        await store.unloadRoot(id: logicalRecord.id)
+    }
+
+    func testReceiptKeepsReusableParentWhenRequestedTargetTreeDiffers() async throws {
+        let fixture = try ReceiptFixture()
+        defer { fixture.cleanup() }
+        try fixture.write("Tracked.swift", "let value = 2\n")
+        try fixture.git(["add", "Tracked.swift"])
+        try fixture.git(["commit", "-m", "new parent snapshot"])
+
+        let authority = GitWorkspaceStateAuthority()
+        let git = GitService(workspaceStateAuthority: authority)
+        let coordinator = WorkspaceRootReusableSnapshotCoordinator(gitService: git, authority: authority)
+        guard case let .admitted(snapshotIdentity) = await coordinator.observeAuthoritativeFullLoad(
+            rootURL: fixture.root,
+            authoritativeRelativeFilePaths: fixture.authoritativeRelativeFilePaths
+        ) else { return XCTFail("Expected reusable parent snapshot") }
+
+        let result = try await git.createWorktreeWithResult(
+            request: fixture.createRequest(baseRef: "HEAD~1"),
+            at: fixture.root,
+            initializationContext: fixture.initializationContext()
+        )
+        let receipt = try XCTUnwrap(result.initializationReceipt)
+        XCTAssertEqual(receipt.parentSnapshotIdentity, snapshotIdentity)
+        XCTAssertNotEqual(receipt.parentCompatibilityKey.treeOID, receipt.resolvedBaseTreeOID)
+        XCTAssertEqual(receipt.targetAuthorityAfter.treeOID, receipt.resolvedBaseTreeOID)
+        XCTAssertNil(receipt.fallbackReason())
+
+        let binding = fixture.binding(for: result.descriptor)
+        let hint = WorkspaceRootMaterializationHint(
+            bindingID: binding.id,
+            standardizedTargetPath: binding.worktreeRootPath,
+            creationReceipt: receipt,
+            correlationID: fixture.correlationID
+        ).validated(
+            matching: binding,
+            sessionID: fixture.agentSessionID,
+            startupContext: fixture.startupContext()
+        )
+        let evaluator = WorkspaceRootMaterializationHintEvaluator(gitService: git, authority: authority)
+        let eligibility = await evaluator.observe(hint, observationEnabled: true)
+        XCTAssertEqual(eligibility, .eligible(snapshotIdentity))
+    }
+
     func testSameRepositoryLinkedWorktreeReceiptIsEligibleAndCarriesExactScope() async throws {
         let fixture = try ReceiptFixture()
         defer { fixture.cleanup() }
@@ -82,6 +200,7 @@ final class GitWorktreeCreationReceiptTests: XCTestCase {
         _ = try await store.loadRoot(path: fixture.root.path)
         let sessionID = fixture.agentSessionID
         let materializer = WorkspaceRootBindingProjectionMaterializer(store: store)
+        WorktreeStartupInstrumentation.resetForTesting()
         let preparation = try await materializer.prepare(
             sessionID: sessionID,
             bindings: [binding],
@@ -100,6 +219,10 @@ final class GitWorktreeCreationReceiptTests: XCTestCase {
             1,
             "eligible observation must still publish only through the full crawler"
         )
+        let shadow = WorktreeStartupInstrumentation.snapshot().shadow
+        XCTAssertEqual(shadow.inventoryComparisons, 1)
+        XCTAssertEqual(shadow.inventoryMatches, 1)
+        XCTAssertEqual(shadow.inventoryMismatches, 0)
         await materializer.release(sessionID: sessionID)
     }
 
@@ -680,12 +803,12 @@ private struct ReceiptFixture {
         )
     }
 
-    func createRequest() -> GitWorktreeCreateRequest {
+    func createRequest(baseRef: String = "HEAD") -> GitWorktreeCreateRequest {
         let target = worktrees.appendingPathComponent("child-\(UUID().uuidString)", isDirectory: true)
         return GitWorktreeCreateRequest(
             path: target,
             branch: "receipt-\(UUID().uuidString)",
-            baseRef: "HEAD",
+            baseRef: baseRef,
             appManagedContainer: worktrees,
             mainWorktreeRoot: root,
             knownWorktreeRoots: [root],

@@ -87,5 +87,36 @@ import XCTest
             await materializer.release(sessionID: sessionID)
             await store.unloadRoot(id: logicalRecord.id)
         }
+
+        func testShadowCountersAreBoundedAndPathFree() {
+            WorktreeStartupInstrumentation.resetForTesting()
+            WorktreeStartupInstrumentation.recordInventoryComparison(matched: true)
+            WorktreeStartupInstrumentation.recordInventoryComparison(matched: false)
+            WorktreeStartupInstrumentation.recordProjectedSearchComparison(
+                matched: true,
+                baseEntryCount: 90,
+                overlayEntryCount: 3,
+                tombstoneCount: 2
+            )
+            WorktreeStartupInstrumentation.recordProjectedSearchComparison(
+                matched: false,
+                baseEntryCount: 89,
+                overlayEntryCount: 4,
+                tombstoneCount: 3
+            )
+
+            let snapshot = WorktreeStartupInstrumentation.snapshot()
+            let counters = snapshot.shadow
+            XCTAssertEqual(counters.inventoryComparisons, 2)
+            XCTAssertEqual(counters.inventoryMatches, 1)
+            XCTAssertEqual(counters.inventoryMismatches, 1)
+            XCTAssertEqual(counters.projectedSearchComparisons, 2)
+            XCTAssertEqual(counters.projectedSearchMatches, 1)
+            XCTAssertEqual(counters.projectedSearchMismatches, 1)
+            XCTAssertEqual(counters.latestBaseEntryCount, 89)
+            XCTAssertEqual(counters.latestOverlayEntryCount, 4)
+            XCTAssertEqual(counters.latestTombstoneCount, 3)
+            XCTAssertEqual(snapshot.fallbackCounts[.projectedSearchMismatch], 1)
+        }
     }
 #endif

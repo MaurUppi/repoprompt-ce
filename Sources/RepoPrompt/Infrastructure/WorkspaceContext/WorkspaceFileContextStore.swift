@@ -1608,6 +1608,12 @@ actor WorkspaceFileContextStore {
     private var searchCatalogSnapshotsByScope: [WorkspaceLookupRootScope: SearchCatalogSnapshotCacheEntry] = [:]
     private var nextSearchCatalogSnapshotAccessSequence: UInt64 = 0
     private var publishedRootCatalogShardsByRootID: [UUID: RootCatalogShard] = [:]
+    private struct RootSeedSearchShadow {
+        let scope: WorkspaceRootSeedShadowScope
+        let control: WorkspaceProjectedPathSearchShadowControl
+    }
+
+    private var rootSeedSearchShadowsByRootID: [UUID: RootSeedSearchShadow] = [:]
     private var rootCatalogShardWeakReferencesByRootID: [UUID: [WeakRootCatalogShardReference]] = [:]
     private var rootCatalogShardDeltaStatesByRootID: [UUID: RootCatalogShardDeltaState] = [:]
     private var pathMatchSnapshotIdentitiesByScope: [WorkspaceLookupRootScope: PathMatchCacheIdentity] = [:]
@@ -1616,6 +1622,8 @@ actor WorkspaceFileContextStore {
     private let storeBackedSearchLane: StoreBackedWorkspaceSearchLane
     private let rootReusableSnapshotCoordinator = WorkspaceRootReusableSnapshotCoordinator.shared
     private let rootMaterializationHintEvaluator = WorkspaceRootMaterializationHintEvaluator.shared
+    private let rootSeedPlanner = WorkspaceRootSeedPlanner.shared
+    private let workspaceStateAuthority = GitWorkspaceStateAuthority.shared
     private let searchDecodedContentCache = WorkspaceSearchDecodedContentCache()
     private let interactiveReadCache = WorkspaceInteractiveReadCache()
     private let searchContentSchedulerOwnerID = UUID()
@@ -2162,8 +2170,15 @@ actor WorkspaceFileContextStore {
 
         let generation = (latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] ?? 0) &+ 1
         latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] = generation
-        let token = WorkspaceSessionWorktreeOwnershipToken(ownerID: ownerID, generation: generation)
         let installedToken = installedSessionWorktreeOwnershipTokenByOwnerID[ownerID]
+        if let installedToken,
+           let installedRecord = sessionWorktreeOwnershipRecordsByToken[installedToken]
+        {
+            for root in installedRecord.roots {
+                invalidateRootSeedSearchShadow(rootID: root.rootID)
+            }
+        }
+        let token = WorkspaceSessionWorktreeOwnershipToken(ownerID: ownerID, generation: generation)
         let supersededTokens = sessionWorktreeOwnershipRecordsByToken.keys.filter {
             $0.ownerID == ownerID && $0 != installedToken
         }
@@ -2184,6 +2199,7 @@ actor WorkspaceFileContextStore {
         do {
             var preparedRoots: [WorkspaceSessionWorktreeOwnedRoot] = []
             var materializationHintObservations: [String: WorkspaceRootMaterializationHintObservation] = [:]
+            var rootSeedShadowPreparations: [WorkspaceRootSeedShadowPreparation] = []
             for path in standardizedPaths {
                 try Task.checkCancellation()
                 if let startupContext {
@@ -2236,7 +2252,8 @@ actor WorkspaceFileContextStore {
                 try Task.checkCancellation()
                 guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation,
                       isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: state.lifetimeID),
-                      let rootCatalogGeneration = catalogGenerationsByRootID[root.id]
+                      let rootCatalogGeneration = catalogGenerationsByRootID[root.id],
+                      let appliedIndexGeneration = appliedIndexGenerationsByRootID[root.id]
                 else {
                     throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
                 }
@@ -2253,9 +2270,76 @@ actor WorkspaceFileContextStore {
                         observationEnabled: startupContext?.flags.observeDiffSeededWorktreeStartup ?? false
                     )
                 }
+                if case let .fallback(reason) = observation,
+                   let startupContext,
+                   startupContext.flags.observeDiffSeededWorktreeStartup
+                {
+                    WorktreeStartupInstrumentation.record(
+                        .shadowVerified,
+                        context: startupContext,
+                        route: .diffSeedObservation,
+                        fallback: reason
+                    )
+                }
+                if case .eligible = observation,
+                   let hint,
+                   let startupContext,
+                   startupContext.flags.observeDiffSeededWorktreeStartup
+                {
+                    let planningOutcome = await rootSeedPlanner.plan(hint: hint, service: state.service)
+                    switch planningOutcome {
+                    case let .fallback(reason):
+                        WorktreeStartupInstrumentation.record(
+                            .shadowVerified,
+                            context: startupContext,
+                            route: .diffSeedObservation,
+                            fallback: reason
+                        )
+                    case let .planned(plan):
+                        let authoritativeFiles = Set(state.fileIDsByRelativePath.keys)
+                        let authoritativeFolders = Set(state.folderIDsByRelativePath.keys.filter { !$0.isEmpty })
+                        let matches = authoritativeFiles == plan.relativeFilePaths
+                            && authoritativeFolders == plan.relativeFolderPaths
+                        WorktreeStartupInstrumentation.recordInventoryComparison(matched: matches)
+                        if matches,
+                           let snapshot = await workspaceStateAuthority.reusableSnapshot(
+                               identity: plan.snapshotIdentity,
+                               expectedCompatibilityKey: hint.creationReceipt.parentCompatibilityKey
+                           )
+                        {
+                            let scope = WorkspaceRootSeedShadowScope(
+                                token: token,
+                                bindingFingerprint: bindingFingerprint,
+                                rootID: root.id,
+                                lifetimeID: state.lifetimeID,
+                                standardizedPhysicalPath: path,
+                                catalogGeneration: rootCatalogGeneration,
+                                appliedIndexGeneration: appliedIndexGeneration
+                            )
+                            rootSeedShadowPreparations.append(WorkspaceRootSeedShadowPreparation(
+                                scope: scope,
+                                snapshot: snapshot,
+                                plan: plan
+                            ))
+                            WorktreeStartupInstrumentation.record(
+                                .shadowVerified,
+                                context: startupContext,
+                                route: .diffSeedObservation
+                            )
+                        } else {
+                            WorktreeStartupInstrumentation.record(
+                                .shadowVerified,
+                                context: startupContext,
+                                route: .diffSeedObservation,
+                                fallback: .unexplainedFilesystemEntry
+                            )
+                        }
+                    }
+                }
                 guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation,
                       isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: state.lifetimeID),
-                      catalogGenerationsByRootID[root.id] == rootCatalogGeneration
+                      catalogGenerationsByRootID[root.id] == rootCatalogGeneration,
+                      appliedIndexGenerationsByRootID[root.id] == appliedIndexGeneration
                 else {
                     materializationHintObservations[path] = .fallback(.serviceIngressGenerationChanged)
                     throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
@@ -2267,7 +2351,8 @@ actor WorkspaceFileContextStore {
                 bindingFingerprint: bindingFingerprint,
                 roots: preparedRoots,
                 reusesInstalledOwnership: false,
-                materializationHintObservationsByPhysicalRootPath: materializationHintObservations
+                materializationHintObservationsByPhysicalRootPath: materializationHintObservations,
+                rootSeedShadowPreparations: rootSeedShadowPreparations
             )
         } catch {
             let resources = removeSessionWorktreeOwnershipToken(token)
@@ -2318,6 +2403,9 @@ actor WorkspaceFileContextStore {
         var previousResources = SessionWorktreeOwnershipRemoval()
         if let previousToken, previousToken != preparation.token {
             previousResources = removeSessionWorktreeOwnershipToken(previousToken)
+        }
+        for shadowPreparation in preparation.rootSeedShadowPreparations {
+            installRootSeedSearchShadow(shadowPreparation)
         }
         scheduleOrphanedSessionWorktreeResourceCleanup(previousResources)
         return record.roots
@@ -2512,6 +2600,9 @@ actor WorkspaceFileContextStore {
             lifetimeID: ownedRoot.lifetimeID
         )
         sessionWorktreeOwnershipTokensByRootLifetime[rootKey, default: []].insert(token)
+        if sessionWorktreeOwnershipTokensByRootLifetime[rootKey] != Set([token]) {
+            invalidateRootSeedSearchShadow(rootID: ownedRoot.rootID)
+        }
         removeSessionWorktreeReservation(
             standardizedPath: ownedRoot.standardizedPhysicalPath,
             token: token
@@ -2550,6 +2641,9 @@ actor WorkspaceFileContextStore {
             }
         }
         for root in record?.roots ?? [] {
+            if rootSeedSearchShadowsByRootID[root.rootID]?.scope.token == token {
+                invalidateRootSeedSearchShadow(rootID: root.rootID)
+            }
             let key = SessionWorktreeRootLifetimeKey(rootID: root.rootID, lifetimeID: root.lifetimeID)
             sessionWorktreeOwnershipTokensByRootLifetime[key]?.remove(token)
             if sessionWorktreeOwnershipTokensByRootLifetime[key]?.isEmpty == true {
@@ -3693,10 +3787,12 @@ actor WorkspaceFileContextStore {
             )
             let constructionStart = WorkspaceFileSearchDebugTiming.now()
         #endif
+        let shadowControl = rootSeedSearchShadowControl(key: key, root: root)
         let index = WorkspaceSearchRootPathIndex(
             identity: identity,
             rootPath: root.standardizedFullPath,
-            entries: entries
+            entries: entries,
+            shadowControl: shadowControl
         )
         #if DEBUG
             WorkspaceFileSearchDebugContext.catalogBuildObserver?.recordPathIndexConstruction(
@@ -3707,6 +3803,73 @@ actor WorkspaceFileContextStore {
             )
         #endif
         return index
+    }
+
+    private func installRootSeedSearchShadow(_ preparation: WorkspaceRootSeedShadowPreparation) {
+        let scope = preparation.scope
+        let lifetimeKey = SessionWorktreeRootLifetimeKey(rootID: scope.rootID, lifetimeID: scope.lifetimeID)
+        guard installedSessionWorktreeOwnershipTokenByOwnerID[scope.token.ownerID] == scope.token,
+              latestSessionWorktreeOwnershipGenerationByOwnerID[scope.token.ownerID] == scope.token.generation,
+              let record = sessionWorktreeOwnershipRecordsByToken[scope.token],
+              record.bindingFingerprint == scope.bindingFingerprint,
+              record.roots.contains(where: {
+                  $0.rootID == scope.rootID
+                      && $0.lifetimeID == scope.lifetimeID
+                      && $0.standardizedPhysicalPath == scope.standardizedPhysicalPath
+              }),
+              sessionWorktreeOwnershipTokensByRootLifetime[lifetimeKey] == Set([scope.token]),
+              let state = rootStatesByID[scope.rootID],
+              state.lifetimeID == scope.lifetimeID,
+              state.root.standardizedFullPath == scope.standardizedPhysicalPath,
+              catalogGenerationsByRootID[scope.rootID] == scope.catalogGeneration,
+              appliedIndexGenerationsByRootID[scope.rootID] == scope.appliedIndexGeneration
+        else {
+            WorktreeStartupInstrumentation.recordShadowFallback(.ownerSuperseded)
+            return
+        }
+        let entries = buildAuthoritativeCatalogComponents(roots: [state.root]).entries
+        guard let projection = WorkspaceProjectedPathSearchIndex(
+            snapshot: preparation.snapshot,
+            plan: preparation.plan,
+            root: state.root,
+            authoritativeEntries: entries
+        ) else {
+            WorktreeStartupInstrumentation.recordShadowFallback(.projectedSearchMismatch)
+            return
+        }
+        invalidateRootSeedSearchShadow(rootID: scope.rootID)
+        let control = WorkspaceProjectedPathSearchShadowControl(scope: scope, projection: projection)
+        rootSeedSearchShadowsByRootID[scope.rootID] = RootSeedSearchShadow(
+            scope: scope,
+            control: control
+        )
+    }
+
+    private func rootSeedSearchShadowControl(
+        key: RootCatalogShardKey,
+        root: WorkspaceRootRecord
+    ) -> WorkspaceProjectedPathSearchShadowControl? {
+        guard let shadow = rootSeedSearchShadowsByRootID[root.id] else { return nil }
+        let scope = shadow.scope
+        let lifetimeKey = SessionWorktreeRootLifetimeKey(rootID: scope.rootID, lifetimeID: scope.lifetimeID)
+        guard shadow.control.isActive,
+              scope.rootID == key.rootID,
+              scope.lifetimeID == key.lifetimeID,
+              scope.catalogGeneration == key.topologyGeneration,
+              scope.standardizedPhysicalPath == root.standardizedFullPath,
+              appliedIndexGenerationsByRootID[root.id] == scope.appliedIndexGeneration,
+              installedSessionWorktreeOwnershipTokenByOwnerID[scope.token.ownerID] == scope.token,
+              latestSessionWorktreeOwnershipGenerationByOwnerID[scope.token.ownerID] == scope.token.generation,
+              sessionWorktreeOwnershipTokensByRootLifetime[lifetimeKey] == Set([scope.token])
+        else {
+            invalidateRootSeedSearchShadow(rootID: root.id)
+            return nil
+        }
+        return shadow.control
+    }
+
+    private func invalidateRootSeedSearchShadow(rootID: UUID) {
+        rootSeedSearchShadowsByRootID.removeValue(forKey: rootID)?.control.invalidate()
     }
 
     private func registerPublishedRootCatalogShard(
@@ -3767,6 +3930,8 @@ actor WorkspaceFileContextStore {
     }
 
     private func applyAppliedIndexEventToRootCatalogShard(_ event: WorkspaceAppliedIndexBatchEvent) {
+        // Any post-initialization filesystem publication invalidates the one-shot shadow plan.
+        invalidateRootSeedSearchShadow(rootID: event.rootID)
         if event.isRootUnload {
             publishedRootCatalogShardsByRootID.removeValue(forKey: event.rootID)
             rootCatalogShardDeltaStatesByRootID.removeValue(forKey: event.rootID)
@@ -4386,14 +4551,20 @@ actor WorkspaceFileContextStore {
         #endif
         let indexes: [WorkspaceSearchRootPathIndex] = roots.compactMap { root in
             guard let state = rootStatesByID[root.id] else { return nil }
+            let rootEntries = entriesByRootID[root.id] ?? []
+            let identity = WorkspaceSearchRootPathIndexIdentity(
+                rootID: root.id,
+                lifetimeID: state.lifetimeID,
+                topologyGeneration: catalogGenerationsByRootID[root.id] ?? 0
+            )
+            let shadowControl = rootCatalogShardKey(for: root).flatMap {
+                rootSeedSearchShadowControl(key: $0, root: root)
+            }
             return WorkspaceSearchRootPathIndex(
-                identity: WorkspaceSearchRootPathIndexIdentity(
-                    rootID: root.id,
-                    lifetimeID: state.lifetimeID,
-                    topologyGeneration: catalogGenerationsByRootID[root.id] ?? 0
-                ),
+                identity: identity,
                 rootPath: root.standardizedFullPath,
-                entries: entriesByRootID[root.id] ?? []
+                entries: rootEntries,
+                shadowControl: shadowControl
             )
         }
         #if DEBUG
@@ -6192,6 +6363,7 @@ actor WorkspaceFileContextStore {
                 sessionRootLifetimeClock.advance()
             }
             guard let state = rootStatesByID.removeValue(forKey: rootID) else { continue }
+            invalidateRootSeedSearchShadow(rootID: rootID)
             let rootEpoch = WorkspaceCodemapRootEpoch(
                 rootID: rootID,
                 rootLifetimeID: state.lifetimeID

@@ -26,6 +26,18 @@ struct WorkspaceRootSeedCompatibilityKey: Hashable {
     var searchABI: GitWorkspaceSearchABIIdentity {
         policyIdentity.searchABI
     }
+
+    /// Delta reuse deliberately excludes the committed tree object from compatibility.
+    /// The planner proves that difference with a bounded tree-to-tree delta; every policy,
+    /// prefix, repository, and matcher field must still match exactly.
+    func isDeltaCompatible(with other: Self) -> Bool {
+        repositoryNamespace == other.repositoryNamespace
+            && objectFormat == other.objectFormat
+            && repositoryRelativeRootPrefix == other.repositoryRelativeRootPrefix
+            && inventorySchemaVersion == other.inventorySchemaVersion
+            && policyIdentity == other.policyIdentity
+            && searchABI == other.searchABI
+    }
 }
 
 struct WorkspaceRootReusableSnapshotIdentity: Hashable {
@@ -63,10 +75,10 @@ final class WorkspaceSearchRelativePathBase: @unchecked Sendable {
 
     init(relativePaths: [String], stableOrdinals: [Int]) {
         precondition(relativePaths.count == stableOrdinals.count)
-        self.relativePaths = relativePaths
-        filenames = relativePaths.map { ($0 as NSString).lastPathComponent }
+        self.relativePaths = relativePaths.map(StandardizedPath.relative)
+        filenames = self.relativePaths.map { ($0 as NSString).lastPathComponent }
         self.stableOrdinals = stableOrdinals
-        index = PathSearchIndex(paths: relativePaths)
+        index = PathSearchIndex(paths: self.relativePaths)
     }
 }
 
@@ -271,6 +283,14 @@ struct WorkspaceRootMaterializationHint: Equatable, @unchecked Sendable {
         sessionID: UUID,
         startupContext: WorktreeStartupContext?
     ) -> WorkspaceRootSeedFallbackReason? {
+        let expectedPhysicalRootPath = creationReceipt.repositoryRelativeRootPrefix.value.isEmpty
+            ? creationReceipt.actualTargetPath
+            : URL(fileURLWithPath: creationReceipt.actualTargetPath, isDirectory: true)
+            .appendingPathComponent(
+                creationReceipt.repositoryRelativeRootPrefix.value,
+                isDirectory: true
+            )
+            .standardizedFileURL.path
         guard let startupContext,
               startupContext.agentSessionID == sessionID,
               agentSessionID == sessionID,
@@ -281,7 +301,7 @@ struct WorkspaceRootMaterializationHint: Equatable, @unchecked Sendable {
               standardizedLogicalRootPath == creationReceipt.standardizedLogicalRootPath,
               StandardizedPath.absolute(binding.logicalRootPath) == standardizedLogicalRootPath,
               StandardizedPath.absolute(binding.worktreeRootPath) == standardizedTargetPath,
-              creationReceipt.actualTargetPath == standardizedTargetPath,
+              expectedPhysicalRootPath == standardizedTargetPath,
               binding.repositoryID == creationReceipt.worktree.repository.repositoryID,
               binding.repoKey == creationReceipt.worktree.repository.repoKey,
               binding.worktreeID == creationReceipt.worktree.worktreeID
@@ -293,6 +313,52 @@ struct WorkspaceRootMaterializationHint: Equatable, @unchecked Sendable {
 enum WorkspaceRootMaterializationHintObservation: Equatable {
     case observationDisabled
     case eligible(WorkspaceRootReusableSnapshotIdentity)
+    case fallback(WorkspaceRootSeedFallbackReason)
+}
+
+struct WorkspaceRootSeedPlannerLimits: Equatable {
+    let maximumVerificationPathCount: Int
+    let maximumAffectedDirectoryCount: Int
+    let maximumOverlayChangedFileCount: Int
+
+    static let production = WorkspaceRootSeedPlannerLimits(
+        maximumVerificationPathCount: 512,
+        maximumAffectedDirectoryCount: 64,
+        maximumOverlayChangedFileCount: WorkspaceSearchRootPathIndex.maxOverlayChangedFileCount
+    )
+}
+
+enum WorkspaceRootSeedVerifiedPathKind: Equatable {
+    case missing
+    case regularFile(isExecutable: Bool)
+    case directory
+    case symbolicLink
+    case special
+}
+
+struct WorkspaceRootSeedVerificationFact: Equatable {
+    let relativePath: String
+    let kind: WorkspaceRootSeedVerifiedPathKind
+    let isIgnored: Bool
+}
+
+struct WorkspaceRootSeedPlan: Equatable {
+    let snapshotIdentity: WorkspaceRootReusableSnapshotIdentity
+    let targetTreeOID: GitObjectID
+    let relativeFilePaths: Set<String>
+    let relativeFolderPaths: Set<String>
+    let baseRelativeFilePaths: Set<String>
+    let changedRelativeFilePaths: Set<String>
+    let tombstonedBaseRelativeFilePaths: Set<String>
+    let verifiedPathCount: Int
+
+    var overlayRelativeFilePaths: Set<String> {
+        changedRelativeFilePaths.intersection(relativeFilePaths)
+    }
+}
+
+enum WorkspaceRootSeedPlannerOutcome: Equatable {
+    case planned(WorkspaceRootSeedPlan)
     case fallback(WorkspaceRootSeedFallbackReason)
 }
 

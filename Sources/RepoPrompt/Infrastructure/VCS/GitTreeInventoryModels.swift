@@ -191,6 +191,19 @@ struct GitIndexManifest: Equatable {
     let rootPrefix: GitRepositoryRelativeRootPrefix
     let entries: [GitIndexManifestEntry]
     let outputByteCount: Int
+    let sparseCheckoutEnabled: Bool
+
+    init(
+        rootPrefix: GitRepositoryRelativeRootPrefix,
+        entries: [GitIndexManifestEntry],
+        outputByteCount: Int,
+        sparseCheckoutEnabled: Bool = false
+    ) {
+        self.rootPrefix = rootPrefix
+        self.entries = entries
+        self.outputByteCount = outputByteCount
+        self.sparseCheckoutEnabled = sparseCheckoutEnabled
+    }
 }
 
 enum GitTreeInventoryParser {
@@ -318,7 +331,8 @@ enum GitTreeInventoryParser {
         _ data: Data,
         objectFormat: GitObjectFormat,
         rootPrefix: GitRepositoryRelativeRootPrefix,
-        limits: GitWorktreeInitializationLimits
+        limits: GitWorktreeInitializationLimits,
+        sparseCheckoutEnabled: Bool = false
     ) throws -> GitIndexManifest {
         try validateOutputSize(data, limits: limits)
         try validateNULTermination(data)
@@ -367,7 +381,12 @@ enum GitTreeInventoryParser {
             seen[key] = entry
             entries.append(entry)
         }
-        return GitIndexManifest(rootPrefix: rootPrefix, entries: entries, outputByteCount: data.count)
+        return GitIndexManifest(
+            rootPrefix: rootPrefix,
+            entries: entries,
+            outputByteCount: data.count,
+            sparseCheckoutEnabled: sparseCheckoutEnabled
+        )
     }
 
     static func validateStatusSnapshot(
@@ -388,7 +407,16 @@ enum GitTreeInventoryParser {
         }
         try validateRecordCount(snapshot.pathRecords.count, limits: limits)
         for record in snapshot.pathRecords {
-            try validatePathString(record.path, rootPrefix: rootPrefix, limits: limits)
+            let validatedRecordPath: String = if record.kind == .untracked || record.kind == .ignored,
+                                                 record.path.hasSuffix("/"),
+                                                 !record.path.dropLast().isEmpty,
+                                                 !record.path.dropLast().hasSuffix("/")
+            {
+                String(record.path.dropLast())
+            } else {
+                record.path
+            }
+            try validatePathString(validatedRecordPath, rootPrefix: rootPrefix, limits: limits)
             if case let .renamedOrCopied(originalPath, _) = record.kind {
                 try validatePathString(originalPath, rootPrefix: rootPrefix, limits: limits)
             }

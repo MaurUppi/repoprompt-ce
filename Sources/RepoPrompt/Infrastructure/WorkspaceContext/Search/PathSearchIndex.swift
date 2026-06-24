@@ -16,6 +16,19 @@ final class PathSearchIndex: @unchecked Sendable {
         let tieBreakKey: String
     }
 
+    struct ProjectedSearchDiagnostics: Equatable {
+        let examinedCount: Int
+        let matchedCount: Int
+        let heapPeakCount: Int
+        let heapComparisonCount: Int
+        let scratchBytes: Int
+    }
+
+    enum ProjectedSearchOutcome {
+        case completed([Candidate], ProjectedSearchDiagnostics)
+        case cancelled(ProjectedSearchDiagnostics)
+    }
+
     private let cIndex: OpaquePointer? // const path_search_index_t*
     private let originalPaths: [String]
     private let filenames: [String]
@@ -93,6 +106,126 @@ final class PathSearchIndex: @unchecked Sendable {
         return candidates
     }
 
+    func searchProjectedSynchronously(
+        _ pattern: String,
+        displayPrefix: String,
+        absolutePrefix: String,
+        limit: Int = 300
+    ) -> [Candidate] {
+        switch searchProjectedSynchronously(
+            pattern,
+            displayPrefix: displayPrefix,
+            absolutePrefix: absolutePrefix,
+            limit: limit,
+            cancellation: nil
+        ) {
+        case let .completed(candidates, _): candidates
+        case .cancelled: []
+        }
+    }
+
+    func searchProjected(
+        _ pattern: String,
+        displayPrefix: String,
+        absolutePrefix: String,
+        limit: Int = 300
+    ) async -> ProjectedSearchOutcome {
+        guard let cancellation = PathSearchCancellation() else {
+            return searchProjectedSynchronously(
+                pattern,
+                displayPrefix: displayPrefix,
+                absolutePrefix: absolutePrefix,
+                limit: limit,
+                cancellation: nil
+            )
+        }
+        let worker = Task.detached { [self, cancellation] in
+            searchProjectedSynchronously(
+                pattern,
+                displayPrefix: displayPrefix,
+                absolutePrefix: absolutePrefix,
+                limit: limit,
+                cancellation: cancellation
+            )
+        }
+        return await withTaskCancellationHandler {
+            if Task.isCancelled {
+                cancellation.cancel()
+                worker.cancel()
+            }
+            return await worker.value
+        } onCancel: {
+            cancellation.cancel()
+            worker.cancel()
+        }
+    }
+
+    private func searchProjectedSynchronously(
+        _ pattern: String,
+        displayPrefix: String,
+        absolutePrefix: String,
+        limit: Int,
+        cancellation: PathSearchCancellation?
+    ) -> ProjectedSearchOutcome {
+        let emptyDiagnostics = ProjectedSearchDiagnostics(
+            examinedCount: 0,
+            matchedCount: 0,
+            heapPeakCount: 0,
+            heapComparisonCount: 0,
+            scratchBytes: 0
+        )
+        guard let cIndex, limit > 0 else { return .completed([], emptyDiagnostics) }
+        var stats = path_search_work_stats_t()
+        let result = pattern.withCString { patternCString in
+            displayPrefix.withCString { displayCString in
+                absolutePrefix.withCString { absoluteCString in
+                    path_search_projected_find_cancellable(
+                        cIndex,
+                        patternCString,
+                        displayCString,
+                        absoluteCString,
+                        limit,
+                        cancellation?.pointer,
+                        &stats
+                    )
+                }
+            }
+        }
+        let diagnostics = ProjectedSearchDiagnostics(
+            examinedCount: stats.examinedCount,
+            matchedCount: stats.matchedCount,
+            heapPeakCount: stats.heapPeakCount,
+            heapComparisonCount: stats.heapComparisonCount,
+            scratchBytes: stats.scratchBytes
+        )
+        guard let result else {
+            return stats.cancelled ? .cancelled(diagnostics) : .completed([], diagnostics)
+        }
+        defer { search_result_destroy(result) }
+
+        if stats.cancelled { return .cancelled(diagnostics) }
+
+        let resultPointer = UnsafePointer<search_result_t>(result)
+        let count = Int(resultPointer.pointee.count)
+        guard count > 0,
+              let indices = resultPointer.pointee.indices,
+              let scores = resultPointer.pointee.scores
+        else { return .completed([], diagnostics) }
+        let candidates: [Candidate] = (0 ..< count).compactMap { resultIndex in
+            let pathIndex = Int(indices[resultIndex])
+            guard originalPaths.indices.contains(pathIndex) else { return nil }
+            let relativePath = originalPaths[pathIndex]
+            return Candidate(
+                index: pathIndex,
+                path: relativePath,
+                filename: filenames[pathIndex],
+                score: scores[resultIndex],
+                tieBreakKey: displayPrefix + relativePath + "\n" + absolutePrefix + relativePath
+            )
+        }
+        return .completed(candidates, diagnostics)
+    }
+
     func path(at index: Int) -> String? {
         guard originalPaths.indices.contains(index) else { return nil }
         return originalPaths[index]
@@ -108,10 +241,80 @@ final class PathSearchIndex: @unchecked Sendable {
     }
 }
 
+private final class PathSearchCancellation: @unchecked Sendable {
+    let pointer: OpaquePointer
+
+    init?() {
+        guard let pointer = path_search_cancellation_create() else { return nil }
+        self.pointer = pointer
+    }
+
+    deinit {
+        path_search_cancellation_destroy(pointer)
+    }
+
+    func cancel() {
+        path_search_cancellation_cancel(pointer)
+    }
+}
+
 struct WorkspaceSearchRootPathIndexIdentity: Equatable, Hashable {
     let rootID: UUID
     let lifetimeID: UUID
     let topologyGeneration: UInt64
+}
+
+final class WorkspaceProjectedPathSearchShadowControl: @unchecked Sendable {
+    struct Lease {
+        let projection: WorkspaceProjectedPathSearchIndex
+        fileprivate let generation: UInt64
+    }
+
+    let scope: WorkspaceRootSeedShadowScope
+    private let lock = NSLock()
+    private var projection: WorkspaceProjectedPathSearchIndex?
+    private var generation: UInt64 = 0
+
+    init(scope: WorkspaceRootSeedShadowScope, projection: WorkspaceProjectedPathSearchIndex) {
+        self.scope = scope
+        self.projection = projection
+    }
+
+    func begin() -> Lease? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let projection else { return nil }
+        return Lease(projection: projection, generation: generation)
+    }
+
+    /// Returns true only when this completion still owns the active generation.
+    /// A mismatch drops the projection before releasing the lock, so no later query can rerun it.
+    func complete(_ lease: Lease, matched: Bool) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard projection != nil, generation == lease.generation else { return false }
+        if !matched {
+            projection = nil
+            generation &+= 1
+        }
+        return true
+    }
+
+    @discardableResult
+    func invalidate() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard projection != nil else { return false }
+        projection = nil
+        generation &+= 1
+        return true
+    }
+
+    var isActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return projection != nil
+    }
 }
 
 /// Immutable root-local search projection retained by catalog snapshots and active readers.
@@ -169,11 +372,13 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
     private let overlayIndex: PathSearchIndex?
     private let tombstonedBaseEntryIDs: Set<UUID>
     private let accumulatedChangedFileIDs: Set<UUID>
+    private let shadowControl: WorkspaceProjectedPathSearchShadowControl?
 
     init(
         identity: WorkspaceSearchRootPathIndexIdentity,
         rootPath: String,
-        entries: [WorkspaceSearchCatalogEntry]
+        entries: [WorkspaceSearchCatalogEntry],
+        shadowControl: WorkspaceProjectedPathSearchShadowControl? = nil
     ) {
         self.identity = identity
         self.rootPath = rootPath
@@ -184,6 +389,7 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
         overlayIndex = nil
         tombstonedBaseEntryIDs = []
         accumulatedChangedFileIDs = []
+        self.shadowControl = shadowControl
     }
 
     private init(
@@ -195,7 +401,8 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
         overlayEntries: [WorkspaceSearchCatalogEntry],
         preparedOverlayIndex: PathSearchIndex? = nil,
         tombstonedBaseEntryIDs: Set<UUID>,
-        accumulatedChangedFileIDs: Set<UUID>
+        accumulatedChangedFileIDs: Set<UUID>,
+        shadowControl: WorkspaceProjectedPathSearchShadowControl?
     ) {
         self.identity = identity
         self.rootPath = rootPath
@@ -210,6 +417,7 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
         )
         self.tombstonedBaseEntryIDs = tombstonedBaseEntryIDs
         self.accumulatedChangedFileIDs = accumulatedChangedFileIDs
+        self.shadowControl = shadowControl
     }
 
     var count: Int {
@@ -237,11 +445,13 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
                 overlayEntries: overlayEntries,
                 preparedOverlayIndex: overlayIndex,
                 tombstonedBaseEntryIDs: tombstonedBaseEntryIDs,
-                accumulatedChangedFileIDs: accumulatedChangedFileIDs
+                accumulatedChangedFileIDs: accumulatedChangedFileIDs,
+                shadowControl: shadowControl
             )
         }
 
         let nextChangedFileIDs = accumulatedChangedFileIDs.union(changedFileIDs)
+        shadowControl?.invalidate()
         guard nextChangedFileIDs.count < Self.maxOverlayChangedFileCount else {
             return WorkspaceSearchRootPathIndex(identity: identity, rootPath: rootPath, entries: entries)
         }
@@ -278,7 +488,8 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
             base: base,
             overlayEntries: nextOverlayEntries,
             tombstonedBaseEntryIDs: nextTombstonedBaseEntryIDs,
-            accumulatedChangedFileIDs: nextChangedFileIDs
+            accumulatedChangedFileIDs: nextChangedFileIDs,
+            shadowControl: nil
         )
     }
 
@@ -341,6 +552,48 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
         return results
     }
 
+    func searchVerifyingShadow(_ query: String, limit: Int) async -> [Candidate] {
+        let results = search(query, limit: limit)
+        guard !Task.isCancelled, let lease = shadowControl?.begin() else { return results }
+        let shadowProjection = lease.projection
+        switch await shadowProjection.searchCancellable(query, limit: limit) {
+        case .cancelled:
+            return results
+        case let .completed(projected, _):
+            let matched = projected.count == results.count
+                && zip(projected, results).allSatisfy { projected, authoritative in
+                    projected.entry == authoritative.entry
+                        && projected.score == authoritative.score
+                        && projected.tieBreakKey == authoritative.tieBreakKey
+                }
+            if shadowControl?.complete(lease, matched: matched) == true {
+                WorktreeStartupInstrumentation.recordProjectedSearchComparison(
+                    matched: matched,
+                    baseEntryCount: shadowProjection.baseEntryCount,
+                    overlayEntryCount: shadowProjection.overlayEntryCount,
+                    tombstoneCount: shadowProjection.tombstoneCount
+                )
+            }
+        }
+        return results
+    }
+
+    func recordEmptyQueryShadowParity(limit: Int) {
+        guard let shadowControl, let lease = shadowControl.begin(), limit > 0 else { return }
+        let shadowProjection = lease.projection
+        let authoritative = Array(entries.prefix(limit))
+        let projected = Array(shadowProjection.entries.prefix(limit))
+        let matched = authoritative == projected
+        if shadowControl.complete(lease, matched: matched) {
+            WorktreeStartupInstrumentation.recordProjectedSearchComparison(
+                matched: matched,
+                baseEntryCount: shadowProjection.baseEntryCount,
+                overlayEntryCount: shadowProjection.overlayEntryCount,
+                tombstoneCount: shadowProjection.tombstoneCount
+            )
+        }
+    }
+
     private static func candidatePrecedes(_ lhs: Candidate, _ rhs: Candidate) -> Bool {
         if lhs.score != rhs.score { return lhs.score > rhs.score }
         switch WorkspaceFileContextStore.compareUTF8Binary(lhs.tieBreakKey, rhs.tieBreakKey) {
@@ -352,6 +605,222 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
             break
         }
         return WorkspaceFileContextStore.searchCatalogEntryPrecedes(lhs.entry, rhs.entry)
+    }
+}
+
+final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
+    typealias Candidate = WorkspaceSearchRootPathIndex.Candidate
+
+    enum CancellableSearchOutcome {
+        case completed([Candidate], PathSearchIndex.ProjectedSearchDiagnostics)
+        case cancelled(PathSearchIndex.ProjectedSearchDiagnostics)
+    }
+
+    let entries: [WorkspaceSearchCatalogEntry]
+    let baseEntryCount: Int
+    let overlayEntryCount: Int
+    let tombstoneCount: Int
+
+    private let relativeBase: WorkspaceSearchRelativePathBase
+    private let targetEntriesByBaseIndex: [WorkspaceSearchCatalogEntry?]
+    private let overlayEntries: [WorkspaceSearchCatalogEntry]
+    private let overlayIndex: PathSearchIndex?
+    private let displayPrefix: String
+    private let absolutePrefix: String
+
+    init?(
+        snapshot: WorkspaceRootReusableSnapshot,
+        plan: WorkspaceRootSeedPlan,
+        root: WorkspaceRootRecord,
+        authoritativeEntries: [WorkspaceSearchCatalogEntry]
+    ) {
+        guard snapshot.identity == plan.snapshotIdentity,
+              plan.changedRelativeFilePaths.count < WorkspaceSearchRootPathIndex.maxOverlayChangedFileCount
+        else { return nil }
+        let entriesByRelativePath = Dictionary(
+            authoritativeEntries.map { ($0.standardizedRelativePath, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let changed = plan.changedRelativeFilePaths
+        let projectedDisplayPrefix = root.name + "/"
+        let projectedAbsolutePrefix = root.standardizedFullPath + "/"
+        guard authoritativeEntries.allSatisfy({ entry in
+            entry.displayPath == projectedDisplayPrefix + entry.standardizedRelativePath
+                && entry.standardizedFullPath == projectedAbsolutePrefix + entry.standardizedRelativePath
+        }) else { return nil }
+        var targets: [WorkspaceSearchCatalogEntry?] = []
+        targets.reserveCapacity(snapshot.searchBase.relativePaths.count)
+        var baseRelativePaths = Set<String>()
+        for relativePath in snapshot.searchBase.relativePaths {
+            let standardized = StandardizedPath.relative(relativePath)
+            baseRelativePaths.insert(standardized)
+            if changed.contains(standardized)
+                || plan.tombstonedBaseRelativeFilePaths.contains(standardized)
+            {
+                targets.append(nil)
+            } else {
+                guard let entry = entriesByRelativePath[standardized] else { return nil }
+                targets.append(entry)
+            }
+        }
+
+        relativeBase = snapshot.searchBase
+        targetEntriesByBaseIndex = targets
+        overlayEntries = authoritativeEntries.filter {
+            changed.contains($0.standardizedRelativePath)
+                || !baseRelativePaths.contains($0.standardizedRelativePath)
+        }
+        overlayIndex = overlayEntries.isEmpty
+            ? nil
+            : PathSearchIndex(paths: overlayEntries.map(\.pathSearchIndexKey))
+        entries = authoritativeEntries
+        baseEntryCount = targets.compactMap(\.self).count
+        overlayEntryCount = overlayEntries.count
+        tombstoneCount = targets.count - baseEntryCount
+        displayPrefix = projectedDisplayPrefix
+        absolutePrefix = projectedAbsolutePrefix
+    }
+
+    func search(_ query: String, limit: Int) -> [Candidate] {
+        guard limit > 0 else { return [] }
+        let boundedBaseLimit = min(targetEntriesByBaseIndex.count, limit)
+        let baseOverfetch = min(tombstoneCount, targetEntriesByBaseIndex.count - boundedBaseLimit)
+        let baseCandidates = relativeBase.index.searchProjectedSynchronously(
+            query,
+            displayPrefix: displayPrefix,
+            absolutePrefix: absolutePrefix,
+            limit: boundedBaseLimit + baseOverfetch
+        ).compactMap { candidate -> Candidate? in
+            guard targetEntriesByBaseIndex.indices.contains(candidate.index),
+                  let entry = targetEntriesByBaseIndex[candidate.index]
+            else { return nil }
+            return Candidate(entry: entry, score: candidate.score, tieBreakKey: candidate.tieBreakKey)
+        }
+        let overlayCandidates = overlayIndex?.searchSynchronously(
+            query,
+            limit: min(limit, overlayEntries.count)
+        ).compactMap { candidate -> Candidate? in
+            guard overlayEntries.indices.contains(candidate.index) else { return nil }
+            return Candidate(
+                entry: overlayEntries[candidate.index],
+                score: candidate.score,
+                tieBreakKey: candidate.tieBreakKey
+            )
+        } ?? []
+
+        var baseIndex = 0
+        var overlayIndex = 0
+        var results: [Candidate] = []
+        results.reserveCapacity(limit)
+        while results.count < limit,
+              baseIndex < baseCandidates.count || overlayIndex < overlayCandidates.count
+        {
+            if overlayIndex >= overlayCandidates.count {
+                results.append(baseCandidates[baseIndex])
+                baseIndex += 1
+            } else if baseIndex >= baseCandidates.count {
+                results.append(overlayCandidates[overlayIndex])
+                overlayIndex += 1
+            } else if Self.candidatePrecedes(
+                overlayCandidates[overlayIndex],
+                baseCandidates[baseIndex]
+            ) {
+                results.append(overlayCandidates[overlayIndex])
+                overlayIndex += 1
+            } else {
+                results.append(baseCandidates[baseIndex])
+                baseIndex += 1
+            }
+        }
+        return results
+    }
+
+    func searchCancellable(
+        _ query: String,
+        limit: Int
+    ) async -> CancellableSearchOutcome {
+        guard limit > 0 else {
+            return .completed([], .init(
+                examinedCount: 0,
+                matchedCount: 0,
+                heapPeakCount: 0,
+                heapComparisonCount: 0,
+                scratchBytes: 0
+            ))
+        }
+        let boundedBaseLimit = min(targetEntriesByBaseIndex.count, limit)
+        let baseOverfetch = min(tombstoneCount, targetEntriesByBaseIndex.count - boundedBaseLimit)
+        let baseOutcome = await relativeBase.index.searchProjected(
+            query,
+            displayPrefix: displayPrefix,
+            absolutePrefix: absolutePrefix,
+            limit: boundedBaseLimit + baseOverfetch
+        )
+        let baseCandidates: [Candidate]
+        let diagnostics: PathSearchIndex.ProjectedSearchDiagnostics
+        switch baseOutcome {
+        case let .cancelled(value):
+            return .cancelled(value)
+        case let .completed(candidates, value):
+            diagnostics = value
+            baseCandidates = candidates.compactMap { candidate -> Candidate? in
+                guard targetEntriesByBaseIndex.indices.contains(candidate.index),
+                      let entry = targetEntriesByBaseIndex[candidate.index]
+                else { return nil }
+                return Candidate(entry: entry, score: candidate.score, tieBreakKey: candidate.tieBreakKey)
+            }
+        }
+        guard !Task.isCancelled else { return .cancelled(diagnostics) }
+        let overlayCandidates = overlayIndex?.searchSynchronously(
+            query,
+            limit: min(limit, overlayEntries.count)
+        ).compactMap { candidate -> Candidate? in
+            guard overlayEntries.indices.contains(candidate.index) else { return nil }
+            return Candidate(
+                entry: overlayEntries[candidate.index],
+                score: candidate.score,
+                tieBreakKey: candidate.tieBreakKey
+            )
+        } ?? []
+
+        var baseIndex = 0
+        var overlayIndex = 0
+        var results: [Candidate] = []
+        results.reserveCapacity(limit)
+        while results.count < limit,
+              baseIndex < baseCandidates.count || overlayIndex < overlayCandidates.count
+        {
+            if Task.isCancelled { return .cancelled(diagnostics) }
+            if overlayIndex >= overlayCandidates.count {
+                results.append(baseCandidates[baseIndex])
+                baseIndex += 1
+            } else if baseIndex >= baseCandidates.count {
+                results.append(overlayCandidates[overlayIndex])
+                overlayIndex += 1
+            } else if Self.candidatePrecedes(
+                overlayCandidates[overlayIndex],
+                baseCandidates[baseIndex]
+            ) {
+                results.append(overlayCandidates[overlayIndex])
+                overlayIndex += 1
+            } else {
+                results.append(baseCandidates[baseIndex])
+                baseIndex += 1
+            }
+        }
+        return .completed(results, diagnostics)
+    }
+
+    private static func candidatePrecedes(_ lhs: Candidate, _ rhs: Candidate) -> Bool {
+        if lhs.score != rhs.score { return lhs.score > rhs.score }
+        switch WorkspaceFileContextStore.compareUTF8Binary(lhs.tieBreakKey, rhs.tieBreakKey) {
+        case .orderedAscending:
+            return true
+        case .orderedDescending:
+            return false
+        case .orderedSame:
+            return WorkspaceFileContextStore.searchCatalogEntryPrecedes(lhs.entry, rhs.entry)
+        }
     }
 }
 
@@ -416,6 +885,35 @@ func path_search_destroy(_ index: OpaquePointer?)
 @_silgen_name("path_search_find")
 func path_search_find(_ index: OpaquePointer?, _ pattern: UnsafePointer<CChar>?, _ limit: Int) -> OpaquePointer?
 
+@_silgen_name("path_search_projected_find")
+func path_search_projected_find(
+    _ index: OpaquePointer?,
+    _ pattern: UnsafePointer<CChar>?,
+    _ displayPrefix: UnsafePointer<CChar>?,
+    _ absolutePrefix: UnsafePointer<CChar>?,
+    _ limit: Int
+) -> OpaquePointer?
+
+@_silgen_name("path_search_projected_find_cancellable")
+func path_search_projected_find_cancellable(
+    _ index: OpaquePointer?,
+    _ pattern: UnsafePointer<CChar>?,
+    _ displayPrefix: UnsafePointer<CChar>?,
+    _ absolutePrefix: UnsafePointer<CChar>?,
+    _ limit: Int,
+    _ cancellation: OpaquePointer?,
+    _ stats: UnsafeMutablePointer<path_search_work_stats_t>?
+) -> OpaquePointer?
+
+@_silgen_name("path_search_cancellation_create")
+func path_search_cancellation_create() -> OpaquePointer?
+
+@_silgen_name("path_search_cancellation_cancel")
+func path_search_cancellation_cancel(_ cancellation: OpaquePointer?)
+
+@_silgen_name("path_search_cancellation_destroy")
+func path_search_cancellation_destroy(_ cancellation: OpaquePointer?)
+
 @_silgen_name("search_result_destroy")
 func search_result_destroy(_ result: OpaquePointer?)
 
@@ -425,4 +923,13 @@ struct search_result_t {
     var tieBreakKeys: UnsafeMutablePointer<UnsafePointer<CChar>?>?
     var count: size_t
     var capacity: size_t
+}
+
+struct path_search_work_stats_t {
+    var examinedCount: size_t = 0
+    var matchedCount: size_t = 0
+    var heapPeakCount: size_t = 0
+    var heapComparisonCount: size_t = 0
+    var scratchBytes: size_t = 0
+    var cancelled = false
 }

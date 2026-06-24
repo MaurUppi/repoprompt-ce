@@ -394,13 +394,12 @@ actor GitService {
                    layout: sourceLayout,
                    prefix: initializationContext.repositoryRelativeRootPrefix
                ),
-               let baseTree = try? await resolveTreeOID(
+               let targetTree = try? await resolveTreeOID(
                    request.baseRef?.isEmpty == false ? request.baseRef! : "HEAD",
                    in: sourceLayout
-               ),
-               reusableEvidence.snapshot.compatibilityKey.treeOID == baseTree
+               )
             {
-                parentEvidence = (reusableEvidence.lease, reusableEvidence.snapshot, baseTree)
+                parentEvidence = (reusableEvidence.lease, reusableEvidence.snapshot, targetTree)
                 witnessSession = creationReceiptCoordinator.start(destinationURL: request.path)
             }
 
@@ -2698,6 +2697,31 @@ actor GitService {
         priority: GitProcessAdmissionPriority = .rootBootstrap
     ) async throws -> GitIndexManifest {
         let format = try await boundedObjectFormat(in: layout, priority: priority, timeout: limits.commandTimeout)
+        let sparseLimits = GitWorktreeInitializationLimits(
+            maximumRecordCount: 1,
+            maximumOutputBytes: 16,
+            maximumPathUTF8Bytes: 16,
+            maximumPathDepth: 1,
+            commandTimeout: limits.commandTimeout
+        )
+        let sparseData = try await runBoundedAuthorityGit(
+            ["config", "--bool", "-z", "--get", "core.sparseCheckout"],
+            layout: layout,
+            limits: sparseLimits,
+            priority: priority,
+            family: .authorityMetadata,
+            allowedExitCodes: [0, 1]
+        )
+        let sparseCheckoutEnabled: Bool
+        if sparseData.isEmpty {
+            sparseCheckoutEnabled = false
+        } else if sparseData == Data("true\0".utf8) {
+            sparseCheckoutEnabled = true
+        } else if sparseData == Data("false\0".utf8) {
+            sparseCheckoutEnabled = false
+        } else {
+            throw GitWorktreeInitializationError.malformedOutput("invalid core.sparseCheckout boolean")
+        }
         var args = ["ls-files", "--stage", "-v", "-z"]
         appendLiteralPrefix(prefix, to: &args)
         let data = try await runBoundedAuthorityGit(
@@ -2711,7 +2735,8 @@ actor GitService {
             data,
             objectFormat: format,
             rootPrefix: prefix,
-            limits: limits
+            limits: limits,
+            sparseCheckoutEnabled: sparseCheckoutEnabled
         )
     }
 

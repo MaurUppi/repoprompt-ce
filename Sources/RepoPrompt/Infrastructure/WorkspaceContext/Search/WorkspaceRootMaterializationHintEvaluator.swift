@@ -38,12 +38,25 @@ actor WorkspaceRootMaterializationHintEvaluator {
                 layout: hint.creationReceipt.targetLayout,
                 prefix: hint.creationReceipt.repositoryRelativeRootPrefix
             )
-            guard current == hint.creationReceipt.targetAuthorityAfter else {
+            let receiptAuthority = hint.creationReceipt.targetAuthorityAfter
+            guard current.repositoryKey == receiptAuthority.repositoryKey,
+                  current.repositoryNamespace == receiptAuthority.repositoryNamespace,
+                  current.objectFormat == receiptAuthority.objectFormat,
+                  current.headCommitOID == receiptAuthority.headCommitOID,
+                  current.treeOID == receiptAuthority.treeOID,
+                  current.repositoryRelativeRootPrefix == receiptAuthority.repositoryRelativeRootPrefix,
+                  current.repositoryBindingEpoch == receiptAuthority.repositoryBindingEpoch,
+                  current.worktreeBindingEpoch == receiptAuthority.worktreeBindingEpoch,
+                  current.layoutGeneration == receiptAuthority.layoutGeneration,
+                  current.policyIdentity == receiptAuthority.policyIdentity
+            else {
                 return .fallback(.authorityUnstable)
             }
             let currentCompatibility = WorkspaceRootSeedCompatibilityKey(authority: current)
-            guard currentCompatibility == hint.creationReceipt.parentCompatibilityKey,
-                  currentCompatibility.searchABI == .current
+            guard currentCompatibility.isDeltaCompatible(
+                with: hint.creationReceipt.parentCompatibilityKey
+            ),
+                currentCompatibility.searchABI == .current
             else {
                 return .fallback(.compatibilityMismatch)
             }

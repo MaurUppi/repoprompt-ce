@@ -53,6 +53,22 @@ enum WorkspaceAuthorizedSelectionCandidateResolution: Equatable {
     case staleAuthority(WorkspaceSessionRootAuthorizationMismatch)
 }
 
+struct WorkspaceRootSeedShadowScope: Hashable {
+    let token: WorkspaceSessionWorktreeOwnershipToken
+    let bindingFingerprint: String
+    let rootID: UUID
+    let lifetimeID: UUID
+    let standardizedPhysicalPath: String
+    let catalogGeneration: UInt64
+    let appliedIndexGeneration: UInt64
+}
+
+struct WorkspaceRootSeedShadowPreparation {
+    let scope: WorkspaceRootSeedShadowScope
+    let snapshot: WorkspaceRootReusableSnapshot
+    let plan: WorkspaceRootSeedPlan
+}
+
 struct WorkspaceSessionWorktreeOwnershipPreparation {
     let token: WorkspaceSessionWorktreeOwnershipToken
     let bindingFingerprint: String
@@ -61,6 +77,7 @@ struct WorkspaceSessionWorktreeOwnershipPreparation {
     let materializationHintObservationsByPhysicalRootPath: [
         String: WorkspaceRootMaterializationHintObservation
     ]
+    let rootSeedShadowPreparations: [WorkspaceRootSeedShadowPreparation]
 
     init(
         token: WorkspaceSessionWorktreeOwnershipToken,
@@ -69,13 +86,15 @@ struct WorkspaceSessionWorktreeOwnershipPreparation {
         reusesInstalledOwnership: Bool,
         materializationHintObservationsByPhysicalRootPath: [
             String: WorkspaceRootMaterializationHintObservation
-        ] = [:]
+        ] = [:],
+        rootSeedShadowPreparations: [WorkspaceRootSeedShadowPreparation] = []
     ) {
         self.token = token
         self.bindingFingerprint = bindingFingerprint
         self.roots = roots
         self.reusesInstalledOwnership = reusesInstalledOwnership
         self.materializationHintObservationsByPhysicalRootPath = materializationHintObservationsByPhysicalRootPath
+        self.rootSeedShadowPreparations = rootSeedShadowPreparations
     }
 }
 
