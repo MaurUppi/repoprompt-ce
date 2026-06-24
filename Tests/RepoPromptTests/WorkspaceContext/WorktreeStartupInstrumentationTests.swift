@@ -35,6 +35,104 @@ import XCTest
             XCTAssertTrue(forced.flags.serveDiffSeededWorktreeStartup)
         }
 
+        func testScopedControlPreparesExactLoadedRootAndRejectsStaleScopeBeforeLease() async throws {
+            let repositories = try ReviewGitRepositoryFixture(name: #function)
+            let root = try repositories.makeRepository(
+                named: "repository",
+                files: ["Sources/App.swift": "struct ScopedControl {}\n"]
+            )
+            defer { repositories.cleanup() }
+
+            WorktreeStartupBenchmarkDiagnostics.setGateEnabled(true)
+            defer { WorktreeStartupBenchmarkDiagnostics.setGateEnabled(false) }
+            let diagnostics = WorktreeStartupBenchmarkDiagnostics.shared
+            let store = WorkspaceFileContextStore()
+            let loadedRoot = try await store.loadRoot(path: root.path)
+            let exactScope = DebugWorktreeStartupBenchmarkScope(
+                windowID: 501,
+                workspaceID: UUID(),
+                contextID: UUID(),
+                rootID: loadedRoot.id
+            )
+
+            let prepared = try await diagnostics.setFlagsPreparingBaseSnapshot(
+                scope: exactScope,
+                observe: false,
+                serve: true,
+                forceFullCrawl: false,
+                expiresSeconds: 120,
+                store: store,
+                expectedStandardizedRootPath: loadedRoot.standardizedFullPath
+            )
+            XCTAssertTrue(prepared.baseSnapshotPrepared)
+            XCTAssertEqual(prepared.control.route.name, "diffSeedServing")
+            XCTAssertEqual(try diagnostics.reset(scope: exactScope)["control_count"], 1)
+
+            let crossRootScope = DebugWorktreeStartupBenchmarkScope(
+                windowID: 502,
+                workspaceID: UUID(),
+                contextID: UUID(),
+                rootID: loadedRoot.id
+            )
+            do {
+                _ = try await diagnostics.setFlagsPreparingBaseSnapshot(
+                    scope: crossRootScope,
+                    observe: true,
+                    serve: false,
+                    forceFullCrawl: false,
+                    expiresSeconds: 120,
+                    store: store,
+                    expectedStandardizedRootPath: root.deletingLastPathComponent().path
+                )
+                XCTFail("A mismatched loaded-root path must not create a benchmark control.")
+            } catch {
+                XCTAssertEqual(error as? DebugWorktreeStartupBenchmarkError, .baseSnapshotUnavailable)
+            }
+            XCTAssertEqual(try diagnostics.reset(scope: crossRootScope)["control_count"], 0)
+
+            await store.unloadRoot(id: loadedRoot.id)
+            let staleScope = DebugWorktreeStartupBenchmarkScope(
+                windowID: 503,
+                workspaceID: UUID(),
+                contextID: UUID(),
+                rootID: loadedRoot.id
+            )
+            do {
+                _ = try await diagnostics.setFlagsPreparingBaseSnapshot(
+                    scope: staleScope,
+                    observe: true,
+                    serve: false,
+                    forceFullCrawl: false,
+                    expiresSeconds: 120,
+                    store: store,
+                    expectedStandardizedRootPath: loadedRoot.standardizedFullPath
+                )
+                XCTFail("An unloaded root must not create a benchmark control.")
+            } catch {
+                XCTAssertEqual(error as? DebugWorktreeStartupBenchmarkError, .baseSnapshotUnavailable)
+            }
+            XCTAssertEqual(try diagnostics.reset(scope: staleScope)["control_count"], 0)
+
+            let forcedScope = DebugWorktreeStartupBenchmarkScope(
+                windowID: 504,
+                workspaceID: UUID(),
+                contextID: UUID(),
+                rootID: UUID()
+            )
+            let forced = try await diagnostics.setFlagsPreparingBaseSnapshot(
+                scope: forcedScope,
+                observe: true,
+                serve: true,
+                forceFullCrawl: true,
+                expiresSeconds: 120,
+                store: store,
+                expectedStandardizedRootPath: "/not-loaded"
+            )
+            XCTAssertFalse(forced.baseSnapshotPrepared)
+            XCTAssertEqual(forced.control.route.name, "forcedFullCrawl")
+            XCTAssertEqual(try diagnostics.reset(scope: forcedScope)["control_count"], 1)
+        }
+
         func testNonGitMaterializationCarriesCorrelationUsesFullCrawlAndIssuesZeroGitCommands() async throws {
             let sandbox = FileManager.default.temporaryDirectory
                 .appendingPathComponent("WorktreeStartupInstrumentationTests-\(UUID().uuidString)", isDirectory: true)

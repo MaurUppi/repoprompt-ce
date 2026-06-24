@@ -46,13 +46,19 @@ import MCP
                 switch action {
                 case "set_flags":
                     let expiry = try debugWorktreeStartupBenchmarkExpiry(arguments)
-                    let result = try diagnostics.setFlags(
+                    let observe = debugBool(arguments, "observe") ?? false
+                    let serve = debugBool(arguments, "serve") ?? false
+                    let forceFullCrawl = debugBool(arguments, "force_full") ?? false
+                    let prepared = try await diagnostics.setFlagsPreparingBaseSnapshot(
                         scope: scope,
-                        observe: debugBool(arguments, "observe") ?? false,
-                        serve: debugBool(arguments, "serve") ?? false,
-                        forceFullCrawl: debugBool(arguments, "force_full") ?? false,
-                        expiresSeconds: expiry
+                        observe: observe,
+                        serve: serve,
+                        forceFullCrawl: forceFullCrawl,
+                        expiresSeconds: expiry,
+                        store: resolved.store,
+                        expectedStandardizedRootPath: resolved.rootPath
                     )
+                    let result = prepared.control
                     return debugDiagnosticsResult([
                         "ok": true,
                         "op": op,
@@ -60,7 +66,8 @@ import MCP
                         "control_id": result.controlID.uuidString,
                         "previous_control_id": result.previousControlID.map { $0.uuidString as Any } ?? NSNull(),
                         "route": result.route.name,
-                        "expires_in_seconds": expiry
+                        "expires_in_seconds": expiry,
+                        "base_snapshot_prepared": prepared.baseSnapshotPrepared
                     ])
                 case "restore_flags":
                     let controlID = try debugRequiredUUID(arguments, key: "control_id")
@@ -168,7 +175,11 @@ import MCP
             connectionID: UUID,
             arguments: [String: Value],
             requireRootID: Bool
-        ) async throws -> (scope: DebugWorktreeStartupBenchmarkScope, rootPath: String) {
+        ) async throws -> (
+            scope: DebugWorktreeStartupBenchmarkScope,
+            rootPath: String,
+            store: WorkspaceFileContextStore
+        ) {
             let suppliedWindowID = try debugRequiredBoundedInt(arguments, key: "window_id", range: 1 ... Int.max)
             let hiddenWindowID = try debugRequiredBoundedInt(arguments, key: "_windowID", range: 1 ... Int.max)
             let suppliedWorkspaceID = try debugRequiredUUID(arguments, key: "workspace_id")
@@ -226,7 +237,8 @@ import MCP
                     contextID: boundContextID,
                     rootID: selectedRoot.rootID
                 ),
-                (selectedRoot.rootPath as NSString).standardizingPath
+                (selectedRoot.rootPath as NSString).standardizingPath,
+                window.workspaceFileContextStore
             )
         }
 

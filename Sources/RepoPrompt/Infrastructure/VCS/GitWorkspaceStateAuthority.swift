@@ -89,8 +89,24 @@ actor GitWorkspaceStateAuthority {
     }
 
     private struct ReusableSnapshotAlias {
+        let admissionID: UUID
         let lease: GitWorkspaceAuthorityLease
         let snapshotIdentity: WorkspaceRootReusableSnapshotIdentity
+        let observationToken: GitWorkspaceMetadataMonitor.RetainToken
+    }
+
+    struct PreparedReusableSnapshotAdmission: Hashable {
+        fileprivate let id: UUID
+    }
+
+    struct ReusableSnapshotAdmissionReceipt: Hashable {
+        fileprivate let id: UUID
+        let snapshotIdentity: WorkspaceRootReusableSnapshotIdentity
+    }
+
+    private struct PendingReusableSnapshotAdmission {
+        let snapshot: WorkspaceRootReusableSnapshot
+        let lease: GitWorkspaceAuthorityLease
         let observationToken: GitWorkspaceMetadataMonitor.RetainToken
     }
 
@@ -101,6 +117,7 @@ actor GitWorkspaceStateAuthority {
     private var activeMutations: [UUID: GitWorkspaceMutationToken] = [:]
     private var reusableSnapshotsByIdentity: [WorkspaceRootReusableSnapshotIdentity: ReusableSnapshotCacheEntry] = [:]
     private var reusableSnapshotAliasesByScope: [GitWorkspaceAuthorityScopeKey: ReusableSnapshotAlias] = [:]
+    private var pendingReusableSnapshotAdmissions: [UUID: PendingReusableSnapshotAdmission] = [:]
     private var reusableSnapshotAccessOrdinal: UInt64 = 0
     private var reusableSnapshotEstimatedBytes = 0
     private var invalidationContinuations: [UUID: AsyncStream<GitWorkspaceAuthorityInvalidationEvent>.Continuation] = [:]
@@ -363,13 +380,64 @@ actor GitWorkspaceStateAuthority {
         capturedUsing lease: GitWorkspaceAuthorityLease,
         observationToken: GitWorkspaceMetadataMonitor.RetainToken
     ) async -> Bool {
+        guard let prepared = await prepareReusableSnapshotAdmission(
+            snapshot,
+            capturedUsing: lease,
+            observationToken: observationToken
+        ) else { return false }
+        return await admitPreparedReusableSnapshot(prepared) != nil
+    }
+
+    func prepareReusableSnapshotAdmission(
+        _ snapshot: WorkspaceRootReusableSnapshot,
+        capturedUsing lease: GitWorkspaceAuthorityLease,
+        observationToken: GitWorkspaceMetadataMonitor.RetainToken
+    ) async -> PreparedReusableSnapshotAdmission? {
         guard isCurrent(lease),
               snapshot.hasValidContentAddress(),
               snapshot.compatibilityKey == WorkspaceRootSeedCompatibilityKey(authority: lease.snapshot),
               snapshot.estimatedByteCount <= reusableSnapshotCacheLimits.maximumEstimatedBytes
         else {
             await metadataMonitor.release(observationToken)
-            return false
+            return nil
+        }
+
+        let prepared = PreparedReusableSnapshotAdmission(id: UUID())
+        pendingReusableSnapshotAdmissions[prepared.id] = PendingReusableSnapshotAdmission(
+            snapshot: snapshot,
+            lease: lease,
+            observationToken: observationToken
+        )
+        return prepared
+    }
+
+    func preparedReusableSnapshotAdmissionIsCurrent(
+        _ prepared: PreparedReusableSnapshotAdmission
+    ) -> Bool {
+        guard let pending = pendingReusableSnapshotAdmissions[prepared.id] else { return false }
+        return isCurrent(pending.lease)
+    }
+
+    func cancelPreparedReusableSnapshotAdmission(
+        _ prepared: PreparedReusableSnapshotAdmission
+    ) async {
+        guard let pending = pendingReusableSnapshotAdmissions.removeValue(forKey: prepared.id) else { return }
+        await metadataMonitor.release(pending.observationToken)
+    }
+
+    func admitPreparedReusableSnapshot(
+        _ prepared: PreparedReusableSnapshotAdmission
+    ) async -> ReusableSnapshotAdmissionReceipt? {
+        guard let pending = pendingReusableSnapshotAdmissions.removeValue(forKey: prepared.id) else { return nil }
+        let snapshot = pending.snapshot
+        let lease = pending.lease
+        let observationToken = pending.observationToken
+        guard isCurrent(lease),
+              snapshot.hasValidContentAddress(),
+              snapshot.compatibilityKey == WorkspaceRootSeedCompatibilityKey(authority: lease.snapshot)
+        else {
+            await metadataMonitor.release(observationToken)
+            return nil
         }
 
         reusableSnapshotAccessOrdinal &+= 1
@@ -379,7 +447,7 @@ actor GitWorkspaceStateAuthority {
                   existing.snapshot.hasValidContentAddress()
             else {
                 await metadataMonitor.release(observationToken)
-                return false
+                return nil
             }
             existing.lastAccessOrdinal = reusableSnapshotAccessOrdinal
             reusableSnapshotsByIdentity[snapshot.identity] = existing
@@ -393,6 +461,7 @@ actor GitWorkspaceStateAuthority {
 
         let previous = reusableSnapshotAliasesByScope.updateValue(
             ReusableSnapshotAlias(
+                admissionID: prepared.id,
                 lease: lease,
                 snapshotIdentity: snapshot.identity,
                 observationToken: observationToken
@@ -412,12 +481,46 @@ actor GitWorkspaceStateAuthority {
                 removeUnaliasedReusableSnapshot(snapshot.identity)
             }
             await metadataMonitor.release(observationToken)
-            return false
+            return nil
         }
         if let previous {
             await metadataMonitor.release(previous.observationToken)
         }
-        return true
+        return ReusableSnapshotAdmissionReceipt(
+            id: prepared.id,
+            snapshotIdentity: snapshot.identity
+        )
+    }
+
+    func reusableSnapshotAdmissionIsCurrent(
+        _ receipt: ReusableSnapshotAdmissionReceipt
+    ) -> Bool {
+        guard let alias = reusableSnapshotAliasesByScope.values.first(where: { $0.admissionID == receipt.id }) else {
+            return false
+        }
+        return alias.snapshotIdentity == receipt.snapshotIdentity && isCurrent(alias.lease)
+    }
+
+    func revokeReusableSnapshotAdmission(
+        _ receipt: ReusableSnapshotAdmissionReceipt
+    ) async {
+        guard let (scopeKey, alias) = reusableSnapshotAliasesByScope.first(where: { $0.value.admissionID == receipt.id }) else {
+            return
+        }
+        reusableSnapshotAliasesByScope.removeValue(forKey: scopeKey)
+        removeUnaliasedReusableSnapshot(receipt.snapshotIdentity)
+        await metadataMonitor.release(alias.observationToken)
+    }
+
+    func revokeReusableSnapshotAdmissions(
+        snapshotIdentity: WorkspaceRootReusableSnapshotIdentity
+    ) async {
+        let aliases = reusableSnapshotAliasesByScope.filter { $0.value.snapshotIdentity == snapshotIdentity }
+        for (scopeKey, alias) in aliases {
+            reusableSnapshotAliasesByScope.removeValue(forKey: scopeKey)
+            await metadataMonitor.release(alias.observationToken)
+        }
+        removeUnaliasedReusableSnapshot(snapshotIdentity)
     }
 
     func currentReusableSnapshot(

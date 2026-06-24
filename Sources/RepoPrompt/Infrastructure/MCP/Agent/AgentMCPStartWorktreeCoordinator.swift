@@ -3,6 +3,13 @@ import MCP
 
 @MainActor
 struct AgentMCPStartWorktreeCoordinator {
+    typealias TransitionObserver = @MainActor @Sendable (
+        _ sessionID: UUID,
+        _ bindings: [AgentSessionWorktreeBinding],
+        _ startupContext: WorktreeStartupContext?,
+        _ initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint]
+    ) -> Void
+
     struct Request {
         enum Mode: Equatable {
             case none
@@ -54,6 +61,19 @@ struct AgentMCPStartWorktreeCoordinator {
     let operationName: String
     let vcsService: VCSService
     let gitTargetResolver: GitRepoTargetResolver
+    private let transitionObserver: TransitionObserver?
+
+    init(
+        operationName: String,
+        vcsService: VCSService,
+        gitTargetResolver: GitRepoTargetResolver,
+        transitionObserver: TransitionObserver? = nil
+    ) {
+        self.operationName = operationName
+        self.vcsService = vcsService
+        self.gitTargetResolver = gitTargetResolver
+        self.transitionObserver = transitionObserver
+    }
 
     func containsArguments(_ args: [String: Value]) -> Bool {
         Request.argumentKeys.contains { args[$0] != nil }
@@ -208,6 +228,12 @@ struct AgentMCPStartWorktreeCoordinator {
                 } else {
                     [:]
                 }
+                transitionObserver?(
+                    targetSessionID,
+                    desiredBindings,
+                    startupContext,
+                    initializationHintsByBindingID
+                )
                 #if DEBUG
                     let metricTag = startupContext.flatMap {
                         WorktreeStartupInstrumentation.benchmarkMetricTag(correlationID: $0.correlationID)

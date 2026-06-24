@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPrompt
+import RepoPromptShared
 import XCTest
 
 private extension ToolResultDTOs.CodeStructureReplyDTO {
@@ -108,17 +109,60 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let store = window.workspaceFileContextStore
         let file = try await fileRecord(at: fileURL, store: store, rootScope: .visibleWorkspace)
-
-        let dto = try await window.mcpServer.buildCodeStructureDTO(
+        let warmCapability = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [file],
             request: request(waitMilliseconds: 2000),
             includePathNotFoundIssue: true,
             lookupContext: .visibleWorkspace
         )
+        XCTAssertEqual(warmCapability.status, "unavailable")
+        XCTAssertTrue(warmCapability.issues.contains { $0.code == "git_root_unavailable" })
 
-        XCTAssertEqual(dto.status, "unavailable")
-        XCTAssertTrue(dto.files.isEmpty)
-        XCTAssertTrue(dto.issues.contains { $0.code == "git_root_unavailable" })
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+        let connectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "code-structure-zero-git",
+            tabID: tabID,
+            workspaceID: workspace.id,
+            windowID: window.windowID
+        )
+        let tools = await window.mcpServer.windowMCPTools
+        let tool = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.getCodeStructure })
+        let requestIdentity = MCPRequestTimelineIdentity(
+            jsonRPCRequestID: .number(8001),
+            connectionID: connectionID.uuidString,
+            connectionGeneration: 1,
+            appInvocationID: UUID().uuidString,
+            requestOrdinal: 1
+        )
+        MCPToolWorkCountDiagnostics.resetForTesting()
+
+        let value = try await MCPRequestTimelineContext.$current.withValue(requestIdentity) {
+            try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await tool([
+                    "scope": .string("paths"),
+                    "paths": .array([.string(fileURL.path)]),
+                    "limits": .object(["wait_ms": .int(2000)])
+                ])
+            }
+        }
+
+        let object = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(object["status"]?.stringValue, "unavailable")
+        XCTAssertTrue(object["files"]?.arrayValue?.isEmpty == true)
+        let issueCodes = object["issues"]?.arrayValue?.compactMap {
+            $0.objectValue?["code"]?.stringValue
+        }
+        XCTAssertTrue(issueCodes?.contains("git_root_unavailable") == true)
+        let invocations = MCPToolWorkCountDiagnostics.debugSnapshots().git
+        XCTAssertEqual(invocations.count, 1)
+        let invocation = try XCTUnwrap(invocations.first)
+        XCTAssertEqual(invocation.operation, MCPWindowToolName.getCodeStructure)
+        XCTAssertEqual(invocation.commandCount, 0, invocation.commands.joined(separator: "\n"))
+        XCTAssertEqual(invocation.outcome, "success")
+        XCTAssertEqual(invocation.requestIdentity, requestIdentity)
     }
 
     func testStrictTokenBudgetNeverAdmitsOversizedFirstEntry() async throws {

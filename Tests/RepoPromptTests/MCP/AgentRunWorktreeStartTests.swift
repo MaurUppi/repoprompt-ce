@@ -973,7 +973,16 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 source.worktreeBindings = [parentBinding]
                 XCTAssertNil(source.mcpControlContext, testCase.label)
             }
-            let service = makeAgentRunStartService(window: window, sourceTabID: sourceTabID)
+            if testCase.sourceIsMCPControlled, testCase.inherits {
+                let ambiguousParent = viewModel.session(for: UUID())
+                ambiguousParent.testInstallPersistentSessionBinding(sessionID: parentID)
+                ambiguousParent.worktreeBindings = [parentBinding]
+            }
+            let service = makeAgentRunStartService(
+                window: window,
+                sourceTabID: testCase.sourceIsMCPControlled ? sourceTabID : nil,
+                fallbackParentSessionID: testCase.sourceIsMCPControlled ? nil : parentID
+            )
             var args: [String: Value] = [
                 "op": .string("start"),
                 "message": .string(testCase.label),
@@ -1001,16 +1010,31 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             let child = viewModel.session(for: childTabID)
             XCTAssertEqual(child.activeAgentSessionID, childSessionID, testCase.label)
             XCTAssertEqual(child.parentSessionID, parentID, testCase.label)
+            let pollValue = try await service.execute(args: [
+                "op": .string("poll"),
+                "session_id": .string(childSessionID.uuidString)
+            ])
+            let pollObject = try XCTUnwrap(pollValue.objectValue, testCase.label)
+            let pollSessionObject = try XCTUnwrap(pollObject["session"]?.objectValue, testCase.label)
+            XCTAssertEqual(pollSessionObject["parent_session_id"]?.stringValue, parentID.uuidString, testCase.label)
             if testCase.inherits {
                 let bindings = try XCTUnwrap(object["worktree_bindings"]?.arrayValue, testCase.label)
                 XCTAssertEqual(bindings.count, 1, testCase.label)
                 let bindingObject = try XCTUnwrap(bindings.first?.objectValue, testCase.label)
                 XCTAssertEqual(bindingObject["worktree_root_path"]?.stringValue, worktree.path, testCase.label)
+                let polledBindings = try XCTUnwrap(pollObject["worktree_bindings"]?.arrayValue, testCase.label)
+                XCTAssertEqual(polledBindings.count, 1, testCase.label)
+                XCTAssertEqual(
+                    polledBindings.first?.objectValue?["worktree_root_path"]?.stringValue,
+                    worktree.path,
+                    testCase.label
+                )
                 XCTAssertEqual(child.worktreeBindings, [parentBinding], testCase.label)
                 XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: child), worktree.path, testCase.label)
             } else {
                 XCTAssertNil(object["worktree"], testCase.label)
                 XCTAssertNil(object["worktree_bindings"], testCase.label)
+                XCTAssertNil(pollObject["worktree_bindings"], testCase.label)
                 XCTAssertTrue(child.worktreeBindings.isEmpty, testCase.label)
                 XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: child), root.path, testCase.label)
             }
@@ -1716,6 +1740,39 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         }
 
         await window.promptManager.createBlankComposeTab(createAgentSession: false)
+        let createdSourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let createdParentID = UUID()
+        installParentAgentSession(
+            createdParentID,
+            binding: parentBinding,
+            sourceTabID: createdSourceTabID,
+            in: window
+        )
+        let createdService = makeAgentRunStartService(window: window, sourceTabID: createdSourceTabID)
+        let createdValue = try await createdService.execute(args: [
+            "op": .string("start"),
+            "message": .string("run explicit create suppresses inherited binding"),
+            "detach": .bool(true),
+            "timeout": .int(0),
+            "worktree_create": .bool(true),
+            "worktree_branch": .string("feature/created-\(fixture.suffix)")
+        ])
+        let createdObject = try XCTUnwrap(createdValue.objectValue)
+        let createdBindings = try XCTUnwrap(createdObject["worktree_bindings"]?.arrayValue)
+        XCTAssertEqual(createdBindings.count, 1)
+        let createdBindingObject = try XCTUnwrap(createdBindings.first?.objectValue)
+        XCTAssertNotEqual(createdBindingObject["worktree_id"]?.stringValue, parentBinding.worktreeID)
+        XCTAssertNotEqual(createdBindingObject["worktree_root_path"]?.stringValue, parentWorktree.path)
+        let createdSessionObject = try XCTUnwrap(createdObject["session"]?.objectValue)
+        let createdTabID = try XCTUnwrap(
+            try UUID(uuidString: XCTUnwrap(createdSessionObject["context_id"]?.stringValue))
+        )
+        let createdChild = viewModel.session(for: createdTabID)
+        XCTAssertEqual(createdChild.parentSessionID, createdParentID)
+        XCTAssertEqual(createdChild.worktreeBindings.count, 1)
+        XCTAssertFalse(createdChild.worktreeBindings.contains { $0.worktreeID == parentBinding.worktreeID })
+
+        await window.promptManager.createBlankComposeTab(createAgentSession: false)
         let exploreSourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let exploreParentID = UUID()
         installParentAgentSession(
@@ -1788,6 +1845,126 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             expectedPath: fixture.repo,
             descriptors: descriptors
         ))
+        await agentModeVM.mcpDiscardSessionTarget(target)
+    }
+
+    func testCoordinatorCreateCarriesReceiptIntoEligibleOwnershipPreparation() async throws {
+        let defaults = UserDefaults.standard
+        let previousObserve = defaults.object(forKey: WorktreeStartupFeatureFlags.observeDefaultsKey)
+        let previousServe = defaults.object(forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
+        defaults.set(false, forKey: WorktreeStartupFeatureFlags.observeDefaultsKey)
+        defaults.set(false, forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
+        defer {
+            if let previousObserve {
+                defaults.set(previousObserve, forKey: WorktreeStartupFeatureFlags.observeDefaultsKey)
+            } else {
+                defaults.removeObject(forKey: WorktreeStartupFeatureFlags.observeDefaultsKey)
+            }
+            if let previousServe {
+                defaults.set(previousServe, forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
+            } else {
+                defaults.removeObject(forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
+            }
+        }
+
+        let fixture = try lifecycleFixture.makeGitFixture(populateRepository: false)
+        let window = try await lifecycleFixture.makeWindow(root: fixture.repo, loadRoot: false)
+        try lifecycleFixture.populateGitFixture(fixture)
+        let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: fixture.repo.path
+        )
+        let store = window.promptManager.workspaceFileContextStore
+        let loadedRoots = await store.rootRefs(scope: .visibleWorkspace)
+        let logicalRoot = try XCTUnwrap(loadedRoots.first)
+        XCTAssertEqual(logicalRoot.id, loadedRoot.id)
+        XCTAssertEqual(logicalRoot.standardizedFullPath, fixture.repo.standardizedFileURL.path)
+        let admission = try await store.admitReusableSnapshotForLoadedRoot(
+            rootID: logicalRoot.id,
+            expectedStandardizedPath: logicalRoot.standardizedFullPath
+        )
+        guard case let .admitted(snapshotIdentity) = admission else {
+            return XCTFail("Expected the loaded production root to admit reusable evidence, got \(admission)")
+        }
+
+        let agentModeVM = window.agentModeViewModel
+        let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
+            tabID: nil,
+            sessionID: nil,
+            createIfNeeded: true,
+            sessionName: nil
+        )
+        let sessionID = try XCTUnwrap(target.sessionID)
+        let expectedGeneration = await store.nextSessionWorktreeOwnershipGeneration(ownerID: sessionID)
+        let correlationID = UUID()
+        let startupContext = WorktreeStartupContext(
+            agentSessionID: sessionID,
+            correlationID: correlationID,
+            flags: WorktreeStartupFeatureFlags(observeDiffSeededWorktreeStartup: true)
+        )
+        let recorder = WorktreeTransitionRecorder()
+        let coordinator = AgentMCPStartWorktreeCoordinator(
+            operationName: "agent_run.start",
+            vcsService: .shared,
+            gitTargetResolver: .init(),
+            transitionObserver: { sessionID, bindings, startupContext, hints in
+                recorder.record(
+                    sessionID: sessionID,
+                    bindings: bindings,
+                    startupContext: startupContext,
+                    initializationHintsByBindingID: hints
+                )
+            }
+        )
+        let request = try coordinator.parseRequest(args: [
+            "worktree_create": .bool(true),
+            "worktree_branch": .string("feature/receipt-\(fixture.suffix)")
+        ])
+
+        WorktreeStartupInstrumentation.resetForTesting()
+        try await coordinator.prepare(
+            request: request,
+            target: target,
+            targetWindow: window,
+            startupContext: startupContext
+        )
+
+        XCTAssertEqual(recorder.observations.count, 1)
+        let observation = try XCTUnwrap(recorder.observations.first)
+        XCTAssertEqual(observation.sessionID, sessionID)
+        XCTAssertEqual(observation.startupContext, startupContext)
+        XCTAssertEqual(observation.bindings.count, 1)
+        let binding = try XCTUnwrap(observation.bindings.first)
+        let hint = try XCTUnwrap(observation.initializationHintsByBindingID[binding.id])
+        let receipt = hint.creationReceipt
+        XCTAssertEqual(receipt.parentSnapshotIdentity, snapshotIdentity)
+        XCTAssertEqual(receipt.agentSessionID, sessionID)
+        XCTAssertEqual(receipt.expectedOwnerBindingGeneration, expectedGeneration)
+        XCTAssertEqual(receipt.correlationID, correlationID)
+        XCTAssertEqual(hint.agentSessionID, sessionID)
+        XCTAssertEqual(hint.expectedOwnerBindingGeneration, expectedGeneration)
+        XCTAssertEqual(hint.correlationID, correlationID)
+        XCTAssertEqual(hint.bindingID, binding.id)
+        XCTAssertEqual(hint.standardizedTargetPath, binding.worktreeRootPath)
+        XCTAssertNil(hint.validationFallbackReason)
+        XCTAssertEqual(agentModeVM.worktreeBindings(forAgentSessionID: sessionID), [binding])
+        let nextGeneration = await store.nextSessionWorktreeOwnershipGeneration(ownerID: sessionID)
+        XCTAssertEqual(nextGeneration, expectedGeneration &+ 1)
+        let installedRoots = await store.installedSessionWorktreeRoots(
+            ownerID: sessionID,
+            bindingFingerprint: AgentWorkspaceLookupContextSource.worktreeBindingFingerprint([binding]),
+            physicalRootPaths: [binding.worktreeRootPath]
+        )
+        XCTAssertEqual(installedRoots?.map(\.standardizedFullPath), [binding.worktreeRootPath])
+
+        let instrumentation = WorktreeStartupInstrumentation.snapshot()
+        XCTAssertEqual(instrumentation.fallbackCounts[.noReceipt] ?? 0, 0)
+        XCTAssertEqual(instrumentation.routeCounts[.diffSeedObservation], 1)
+        XCTAssertEqual(instrumentation.shadow.inventoryComparisons, 1)
+        XCTAssertEqual(instrumentation.shadow.inventoryMatches, 1)
+        XCTAssertTrue(instrumentation.events.allSatisfy {
+            $0.agentSessionID == sessionID && $0.correlationID == correlationID
+        })
         await agentModeVM.mcpDiscardSessionTarget(target)
     }
 
@@ -2223,7 +2400,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             return directory.standardizedFileURL
         }
 
-        func makeGitFixture() throws -> GitFixture {
+        func makeGitFixture(populateRepository: Bool = true) throws -> GitFixture {
             let suffix = UUID().uuidString.prefix(8).lowercased()
             let sandbox = FileManager.default.temporaryDirectory
                 .appendingPathComponent("AgentRunWorktreeStartTests-\(suffix)", isDirectory: true)
@@ -2236,11 +2413,17 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             gitFixtures.append(fixture)
 
             try FileManager.default.createDirectory(at: fixture.sandbox, withIntermediateDirectories: true)
-            try seedRepository.copyRepository(to: fixture.repo)
+            if populateRepository {
+                try seedRepository.copyRepository(to: fixture.repo)
+            }
             return fixture
         }
 
-        func makeWindow(root: URL) async throws -> WindowState {
+        func populateGitFixture(_ fixture: GitFixture) throws {
+            try seedRepository.copyRepository(to: fixture.repo)
+        }
+
+        func makeWindow(root: URL, loadRoot: Bool = true) async throws -> WindowState {
             let window = WindowState()
             let ownership = WindowOwnership(window: window)
             windows.append(ownership)
@@ -2259,10 +2442,12 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             )
             let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
             window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
-            _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
-                in: window,
-                path: root.path
-            )
+            if loadRoot {
+                _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                    in: window,
+                    path: root.path
+                )
+            }
             return window
         }
 
@@ -2438,6 +2623,31 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         case cancellation
     }
 
+    private final class WorktreeTransitionRecorder {
+        struct Observation {
+            let sessionID: UUID
+            let bindings: [AgentSessionWorktreeBinding]
+            let startupContext: WorktreeStartupContext?
+            let initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint]
+        }
+
+        private(set) var observations: [Observation] = []
+
+        func record(
+            sessionID: UUID,
+            bindings: [AgentSessionWorktreeBinding],
+            startupContext: WorktreeStartupContext?,
+            initializationHintsByBindingID: [String: WorkspaceRootMaterializationHint]
+        ) {
+            observations.append(Observation(
+                sessionID: sessionID,
+                bindings: bindings,
+                startupContext: startupContext,
+                initializationHintsByBindingID: initializationHintsByBindingID
+            ))
+        }
+    }
+
     private final class ExploreStartRecorder {
         struct Observation {
             let sessionID: UUID
@@ -2547,7 +2757,11 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         )
     }
 
-    private func makeAgentRunStartService(window: WindowState, sourceTabID: UUID?) -> AgentRunMCPToolService {
+    private func makeAgentRunStartService(
+        window: WindowState,
+        sourceTabID: UUID?,
+        fallbackParentSessionID: UUID? = nil
+    ) -> AgentRunMCPToolService {
         var service = AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
             captureRequestMetadata: {
@@ -2556,13 +2770,20 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             requireTargetWindow: { window },
             resolveRequestedTabID: { _ in nil },
             resolveSpawnParentSourceTabID: { _ in sourceTabID },
-            resolveSpawnParentSessionID: { _, _ in nil },
+            resolveSpawnParentSessionID: { _, _ in fallbackParentSessionID },
             bindCurrentRequestToTab: { _, _ in },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _ in
+            startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, _, _, _ in
                 guard let sessionID = target.sessionID else {
                     throw MCPError.internalError("Test start target did not resolve a session ID.")
                 }
+                try await agentModeVM.mcpActivateControlContext(
+                    forTabID: target.tabID,
+                    sessionID: sessionID,
+                    originatingConnectionID: nil,
+                    taskLabelKind: taskLabelKind,
+                    startPending: true
+                )
                 let bindings = agentModeVM.worktreeBindings(forAgentSessionID: sessionID, tabID: target.tabID)
                 let session = agentModeVM.session(for: target.tabID)
                 let snapshot = AgentRunMCPSnapshot(

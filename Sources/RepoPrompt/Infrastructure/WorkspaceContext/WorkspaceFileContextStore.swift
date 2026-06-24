@@ -4663,6 +4663,102 @@ actor WorkspaceFileContextStore {
             .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
     }
 
+    private struct LoadedRootReusableSnapshotCurrentness {
+        let rootID: UUID
+        let lifetimeID: UUID
+        let standardizedPath: String
+        let catalogGeneration: UInt64
+        let appliedIndexGeneration: UInt64
+        let acceptedWatcherWatermark: UInt64
+        let acceptedServicePublicationSequence: UInt64
+    }
+
+    private func loadedRootReusableSnapshotCurrentnessIsValid(
+        _ currentness: LoadedRootReusableSnapshotCurrentness
+    ) -> Bool {
+        guard !Task.isCancelled,
+              let state = rootStatesByID[currentness.rootID],
+              state.lifetimeID == currentness.lifetimeID,
+              state.root.standardizedFullPath == currentness.standardizedPath,
+              catalogGenerationsByRootID[currentness.rootID] == currentness.catalogGeneration,
+              appliedIndexGenerationsByRootID[currentness.rootID] == currentness.appliedIndexGeneration,
+              state.service.captureAcceptedWatcherWatermark().rawValue == currentness.acceptedWatcherWatermark
+        else { return false }
+        let ingress = publisherIngressCoordinator.appliedSnapshot(rootID: currentness.rootID)
+        return ingress.acceptedServicePublicationSequence == currentness.acceptedServicePublicationSequence
+            && ingress.appliedServicePublicationSequence >= currentness.acceptedServicePublicationSequence
+            && ingress.appliedWatcherWatermark.rawValue >= currentness.acceptedWatcherWatermark
+    }
+
+    func admitReusableSnapshotForLoadedRoot(
+        rootID: UUID,
+        expectedStandardizedPath: String
+    ) async throws -> WorkspaceRootReusableSnapshotCoordinator.ObservationResult {
+        try Task.checkCancellation()
+        guard let initialState = rootStatesByID[rootID],
+              initialState.root.standardizedFullPath == expectedStandardizedPath
+        else {
+            return .failed
+        }
+        let initialLifetimeID = initialState.lifetimeID
+        let rootRef = WorkspaceRootRef(
+            id: initialState.root.id,
+            name: initialState.root.name,
+            fullPath: initialState.root.standardizedFullPath
+        )
+        let ingressSamples = await awaitAppliedIngress(rootRefs: [rootRef])
+        try Task.checkCancellation()
+        guard ingressSamples.count == 1,
+              let ingressSample = ingressSamples.first,
+              ingressSample.rootID == rootID,
+              ingressSample.rootPath == expectedStandardizedPath,
+              let state = rootStatesByID[rootID],
+              state.lifetimeID == initialLifetimeID,
+              state.root.standardizedFullPath == expectedStandardizedPath,
+              let catalogGeneration = catalogGenerationsByRootID[rootID],
+              let appliedIndexGeneration = appliedIndexGenerationsByRootID[rootID]
+        else { return .failed }
+
+        let acceptedWatcherWatermark = state.service.captureAcceptedWatcherWatermark().rawValue
+        let ingress = publisherIngressCoordinator.appliedSnapshot(rootID: rootID)
+        guard ingressSample.appliedWatcherWatermark >= acceptedWatcherWatermark,
+              ingressSample.appliedServicePublicationSequence >= ingress.acceptedServicePublicationSequence,
+              ingress.appliedWatcherWatermark.rawValue >= acceptedWatcherWatermark,
+              ingress.appliedServicePublicationSequence >= ingress.acceptedServicePublicationSequence
+        else { return .failed }
+
+        let currentness = LoadedRootReusableSnapshotCurrentness(
+            rootID: rootID,
+            lifetimeID: initialLifetimeID,
+            standardizedPath: expectedStandardizedPath,
+            catalogGeneration: catalogGeneration,
+            appliedIndexGeneration: appliedIndexGeneration,
+            acceptedWatcherWatermark: acceptedWatcherWatermark,
+            acceptedServicePublicationSequence: ingress.acceptedServicePublicationSequence
+        )
+        guard loadedRootReusableSnapshotCurrentnessIsValid(currentness) else { return .failed }
+        let rootURL = URL(fileURLWithPath: expectedStandardizedPath).standardizedFileURL
+        let authoritativeRelativeFilePaths = Set(state.fileIDsByRelativePath.keys)
+
+        let result = await rootReusableSnapshotCoordinator.observeAuthoritativeFullLoad(
+            rootURL: rootURL,
+            authoritativeRelativeFilePaths: authoritativeRelativeFilePaths,
+            currentnessValidator: { [weak self] in
+                guard let self else { return false }
+                return await loadedRootReusableSnapshotCurrentnessIsValid(currentness)
+            }
+        )
+        guard loadedRootReusableSnapshotCurrentnessIsValid(currentness) else {
+            if case let .admitted(snapshotIdentity) = result {
+                await workspaceStateAuthority.revokeReusableSnapshotAdmissions(
+                    snapshotIdentity: snapshotIdentity
+                )
+            }
+            return .failed
+        }
+        return result
+    }
+
     func folders(inRoot rootID: UUID) -> [WorkspaceFolderRecord] {
         guard let state = rootStatesByID[rootID] else { return [] }
         return state.folderIDsByRelativePath.values
@@ -7935,12 +8031,9 @@ actor WorkspaceFileContextStore {
             affectedRootIDs: [root.id]
         )
         if WorktreeStartupFeatureFlags.current().observeDiffSeededWorktreeStartup {
-            let authoritativeRelativeFilePaths = Set(
-                stagedIndexes.filesByID.values.map(\.standardizedRelativePath)
-            )
-            _ = await rootReusableSnapshotCoordinator.observeAuthoritativeFullLoad(
-                rootURL: rootURL,
-                authoritativeRelativeFilePaths: authoritativeRelativeFilePaths
+            _ = try? await admitReusableSnapshotForLoadedRoot(
+                rootID: root.id,
+                expectedStandardizedPath: root.standardizedFullPath
             )
         }
         #if DEBUG

@@ -11,6 +11,7 @@
         case invalidTransition
         case sampleNotFound
         case startIdentityMismatch
+        case baseSnapshotUnavailable
 
         var code: String {
             switch self {
@@ -23,6 +24,7 @@
             case .invalidTransition: "invalid_transition"
             case .sampleNotFound: "sample_not_found"
             case .startIdentityMismatch: "start_identity_mismatch"
+            case .baseSnapshotUnavailable: "base_snapshot_unavailable"
             }
         }
     }
@@ -171,6 +173,11 @@
             let route: RouteControl
         }
 
+        struct PreparedControlResult: Equatable {
+            let control: ControlResult
+            let baseSnapshotPrepared: Bool
+        }
+
         struct ArmResult: Equatable {
             let token: UUID
             let correlationID: UUID
@@ -282,6 +289,39 @@
                     route: route
                 )
             }
+        }
+
+        func setFlagsPreparingBaseSnapshot(
+            scope: DebugWorktreeStartupBenchmarkScope,
+            observe: Bool,
+            serve: Bool,
+            forceFullCrawl: Bool,
+            expiresSeconds: Int,
+            store: WorkspaceFileContextStore,
+            expectedStandardizedRootPath: String
+        ) async throws -> PreparedControlResult {
+            try WorktreeStartupBenchmarkGate.shared.requireEnabled { _ in }
+            let shouldPrepareBaseSnapshot = (observe || serve) && !forceFullCrawl
+            if shouldPrepareBaseSnapshot {
+                let observation = try await store.admitReusableSnapshotForLoadedRoot(
+                    rootID: scope.rootID,
+                    expectedStandardizedPath: expectedStandardizedRootPath
+                )
+                guard case .admitted = observation else {
+                    throw DebugWorktreeStartupBenchmarkError.baseSnapshotUnavailable
+                }
+            }
+            let control = try setFlags(
+                scope: scope,
+                observe: observe,
+                serve: serve,
+                forceFullCrawl: forceFullCrawl,
+                expiresSeconds: expiresSeconds
+            )
+            return PreparedControlResult(
+                control: control,
+                baseSnapshotPrepared: shouldPrepareBaseSnapshot
+            )
         }
 
         @discardableResult

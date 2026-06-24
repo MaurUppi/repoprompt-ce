@@ -389,13 +389,18 @@ struct AgentRunMCPToolService {
         #endif
 
         let sessionName = normalizedString(args["session_name"])
+        let effectiveParentWorktreeInheritance = worktreeStartRequest.inheritParentWorktreeBindings
+            && !worktreeStartRequest.hasExplicitWorktreeArgs
+        let usesRoutedParentSource = parentSourceTabID != nil
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: resolvedTabID,
             sessionID: nil,
             createIfNeeded: true,
             sessionName: sessionName,
             parentSessionID: spawnParentSessionID,
-            inheritWorktreeBindings: worktreeStartRequest.inheritParentWorktreeBindings
+            inheritWorktreeBindings: usesRoutedParentSource
+                ? false
+                : effectiveParentWorktreeInheritance
         )
         guard let targetSessionID = target.sessionID else {
             await agentModeVM.mcpDiscardSessionTarget(target)
@@ -408,7 +413,18 @@ struct AgentRunMCPToolService {
             servingControl: worktreeStartupServingControl
         )
         WorktreeStartupInstrumentation.record(.agentRunStarted, context: worktreeStartupContext)
+        var expectedRoutedWorktreeBindings: [AgentSessionWorktreeBinding]?
         do {
+            if effectiveParentWorktreeInheritance,
+               let parentSourceTabID,
+               let spawnParentSessionID
+            {
+                expectedRoutedWorktreeBindings = try agentModeVM.mcpReconcileRoutedSpawnWorktreeBindings(
+                    sourceTabID: parentSourceTabID,
+                    expectedParentSessionID: spawnParentSessionID,
+                    target: target
+                )
+            }
             #if DEBUG
                 if let worktreeStartupBenchmarkToken {
                     try await WorktreeStartupBenchmarkDiagnostics.$currentPendingStart.withValue(
@@ -440,6 +456,15 @@ struct AgentRunMCPToolService {
                     startupContext: worktreeStartupContext
                 )
             #endif
+            if let expectedRoutedWorktreeBindings,
+               let spawnParentSessionID
+            {
+                try agentModeVM.mcpRequireRoutedSpawnWorktreeBindings(
+                    expectedRoutedWorktreeBindings,
+                    expectedParentSessionID: spawnParentSessionID,
+                    target: target
+                )
+            }
         } catch {
             WorktreeStartupInstrumentation.record(
                 .failed,

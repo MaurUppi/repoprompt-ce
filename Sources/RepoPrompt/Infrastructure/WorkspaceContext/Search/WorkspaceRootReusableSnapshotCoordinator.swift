@@ -1,6 +1,8 @@
 import Foundation
 
 actor WorkspaceRootReusableSnapshotCoordinator {
+    typealias CurrentnessValidator = @Sendable () async -> Bool
+
     enum ObservationResult: Equatable {
         case admitted(WorkspaceRootReusableSnapshotIdentity)
         case nonGit
@@ -14,6 +16,9 @@ actor WorkspaceRootReusableSnapshotCoordinator {
 
     private let gitService: GitService
     private let authority: GitWorkspaceStateAuthority
+    #if DEBUG
+        private var preparedAdmissionHandlerForTesting: (@Sendable () async -> Void)?
+    #endif
 
     init(
         gitService: GitService = GitService(),
@@ -25,8 +30,10 @@ actor WorkspaceRootReusableSnapshotCoordinator {
 
     func observeAuthoritativeFullLoad(
         rootURL: URL,
-        authoritativeRelativeFilePaths: Set<String>
+        authoritativeRelativeFilePaths: Set<String>,
+        currentnessValidator: @escaping CurrentnessValidator = { true }
     ) async -> ObservationResult {
+        guard await currentnessValidator(), !Task.isCancelled else { return .failed }
         guard let layout = Self.gitLayoutContaining(rootURL) else { return .nonGit }
         guard let prefix = try? Self.rootPrefix(rootURL: rootURL, layout: layout) else {
             return .unsupportedRoot
@@ -40,7 +47,15 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             // the shared watermark and prevents conditional admission.
             let discoveryToken = try await authority.retainMetadataObservation(for: layout)
             discoveryObservation = discoveryToken
+            guard await currentnessValidator(), !Task.isCancelled else {
+                await authority.releaseMetadataObservation(discoveryToken)
+                return .failed
+            }
             let discovery = try await gitService.workspaceAuthoritySnapshot(in: layout, prefix: prefix)
+            guard await currentnessValidator(), !Task.isCancelled else {
+                await authority.releaseMetadataObservation(discoveryToken)
+                return .failed
+            }
             let discoveredExternalPaths = Self.canonicalPathSet(
                 discovery.metadata.resolvedExternalAuthorityPaths
             )
@@ -50,8 +65,17 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 additionalAuthorityPaths: discovery.metadata.resolvedExternalAuthorityPaths
             )
             replacementObservation = observation
+            guard await currentnessValidator(), !Task.isCancelled else {
+                await authority.releaseMetadataObservation(observation)
+                await authority.releaseMetadataObservation(discoveryToken)
+                return .failed
+            }
             await authority.releaseMetadataObservation(discoveryToken)
             discoveryObservation = nil
+            guard await currentnessValidator(), !Task.isCancelled else {
+                await authority.releaseMetadataObservation(observation)
+                return .failed
+            }
 
             let scope = GitWorkspaceAuthorityScopeKey(
                 repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: layout),
@@ -65,15 +89,29 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 await authority.releaseMetadataObservation(observation)
                 return .authorityUnavailable(reason)
             }
+            guard await currentnessValidator(), !Task.isCancelled else {
+                await authority.releaseMetadataObservation(observation)
+                return .failed
+            }
 
             let captured = try await gitService.workspaceAuthoritySnapshot(in: layout, prefix: prefix)
-            guard Self.canonicalPathSet(captured.metadata.resolvedExternalAuthorityPaths) == discoveredExternalPaths,
-                  await authority.metadataObservationIsCurrent(
-                      observation,
-                      for: layout,
-                      additionalAuthorityPaths: captured.metadata.resolvedExternalAuthorityPaths,
-                      expectedAcceptedWatermark: captureToken.acceptedMetadataWatermark
-                  )
+            guard await currentnessValidator(), !Task.isCancelled else {
+                await authority.releaseMetadataObservation(observation)
+                return .failed
+            }
+            guard Self.canonicalPathSet(captured.metadata.resolvedExternalAuthorityPaths) == discoveredExternalPaths else {
+                await authority.releaseMetadataObservation(observation)
+                return .authorityUnavailable(.invalidatedDuringCollection)
+            }
+            let observationIsCurrent = await authority.metadataObservationIsCurrent(
+                observation,
+                for: layout,
+                additionalAuthorityPaths: captured.metadata.resolvedExternalAuthorityPaths,
+                expectedAcceptedWatermark: captureToken.acceptedMetadataWatermark
+            )
+            guard observationIsCurrent,
+                  await currentnessValidator(),
+                  !Task.isCancelled
             else {
                 await authority.releaseMetadataObservation(observation)
                 return .authorityUnavailable(.invalidatedDuringCollection)
@@ -83,6 +121,10 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 in: layout,
                 prefix: prefix
             )
+            guard await currentnessValidator(), !Task.isCancelled else {
+                await authority.releaseMetadataObservation(observation)
+                return .failed
+            }
             let lease: GitWorkspaceAuthorityLease
             switch await authority.install(captured.snapshot, capturedUsing: captureToken) {
             case let .success(installed):
@@ -90,6 +132,10 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             case let .failure(reason):
                 await authority.releaseMetadataObservation(observation)
                 return .authorityUnavailable(reason)
+            }
+            guard await currentnessValidator(), !Task.isCancelled else {
+                await authority.releaseMetadataObservation(observation)
+                return .failed
             }
             guard let snapshot = WorkspaceRootReusableSnapshot.make(
                 authority: captured.snapshot,
@@ -99,13 +145,42 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 await authority.releaseMetadataObservation(observation)
                 return .catalogMismatch
             }
-            replacementObservation = nil
-            let admitted = await authority.admitReusableSnapshot(
+            guard let prepared = await authority.prepareReusableSnapshotAdmission(
                 snapshot,
                 capturedUsing: lease,
                 observationToken: observation
-            )
-            return admitted ? .admitted(snapshot.identity) : .failed
+            ) else {
+                replacementObservation = nil
+                return .failed
+            }
+            replacementObservation = nil
+            #if DEBUG
+                if let preparedAdmissionHandlerForTesting {
+                    await preparedAdmissionHandlerForTesting()
+                }
+            #endif
+            guard await currentnessValidator(),
+                  !Task.isCancelled,
+                  await authority.preparedReusableSnapshotAdmissionIsCurrent(prepared),
+                  await currentnessValidator(),
+                  !Task.isCancelled
+            else {
+                await authority.cancelPreparedReusableSnapshotAdmission(prepared)
+                return .failed
+            }
+            guard let receipt = await authority.admitPreparedReusableSnapshot(prepared) else {
+                return .failed
+            }
+            guard await currentnessValidator(),
+                  !Task.isCancelled,
+                  await authority.reusableSnapshotAdmissionIsCurrent(receipt),
+                  await currentnessValidator(),
+                  !Task.isCancelled
+            else {
+                await authority.revokeReusableSnapshotAdmission(receipt)
+                return .failed
+            }
+            return .admitted(receipt.snapshotIdentity)
         } catch {
             if let discoveryObservation {
                 await authority.releaseMetadataObservation(discoveryObservation)
@@ -116,6 +191,14 @@ actor WorkspaceRootReusableSnapshotCoordinator {
             return .failed
         }
     }
+
+    #if DEBUG
+        func setPreparedAdmissionHandlerForTesting(
+            _ handler: (@Sendable () async -> Void)?
+        ) {
+            preparedAdmissionHandlerForTesting = handler
+        }
+    #endif
 
     private nonisolated static func canonicalPathSet(_ paths: [URL]) -> Set<String> {
         Set(paths.map { $0.resolvingSymlinksInPath().standardizedFileURL.path })

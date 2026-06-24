@@ -192,60 +192,68 @@ final class GitWorktreeCreationReceiptTests: XCTestCase {
         XCTAssertEqual(eligibility, .eligible(snapshotIdentity))
     }
 
-    func testMaterializationHintReachesOwnershipPreparationWhileServingFullCrawl() async throws {
+    func testLoadedRootAdmissionRaceRevokesProvisionalAliasAndCoverage() async throws {
         let fixture = try ReceiptFixture()
         defer { fixture.cleanup() }
-        let authority = GitWorkspaceStateAuthority.shared
-        let git = GitService(workspaceStateAuthority: authority)
-        let coordinator = WorkspaceRootReusableSnapshotCoordinator(gitService: git, authority: authority)
-        guard case .admitted = await coordinator.observeAuthoritativeFullLoad(
-            rootURL: fixture.root,
-            authoritativeRelativeFilePaths: fixture.authoritativeRelativeFilePaths
-        ) else {
-            return XCTFail("Expected reusable parent snapshot")
+        let defaults = UserDefaults.standard
+        let previousObserve = defaults.object(forKey: WorktreeStartupFeatureFlags.observeDefaultsKey)
+        let previousServe = defaults.object(forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
+        defaults.set(false, forKey: WorktreeStartupFeatureFlags.observeDefaultsKey)
+        defaults.set(false, forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
+        defer {
+            if let previousObserve {
+                defaults.set(previousObserve, forKey: WorktreeStartupFeatureFlags.observeDefaultsKey)
+            } else {
+                defaults.removeObject(forKey: WorktreeStartupFeatureFlags.observeDefaultsKey)
+            }
+            if let previousServe {
+                defaults.set(previousServe, forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
+            } else {
+                defaults.removeObject(forKey: WorktreeStartupFeatureFlags.serveDefaultsKey)
+            }
         }
-        let result = try await git.createWorktreeWithResult(
-            request: fixture.createRequest(),
-            at: fixture.root,
-            initializationContext: fixture.initializationContext()
-        )
-        let receipt = try XCTUnwrap(result.initializationReceipt)
-        let binding = fixture.binding(for: result.descriptor)
-        let hint = WorkspaceRootMaterializationHint(
-            bindingID: binding.id,
-            standardizedTargetPath: binding.worktreeRootPath,
-            creationReceipt: receipt,
-            correlationID: fixture.correlationID
-        )
 
         let store = WorkspaceFileContextStore()
-        _ = try await store.loadRoot(path: fixture.root.path)
-        let sessionID = fixture.agentSessionID
-        let materializer = WorkspaceRootBindingProjectionMaterializer(store: store)
-        WorktreeStartupInstrumentation.resetForTesting()
-        let preparation = try await materializer.prepare(
-            sessionID: sessionID,
-            bindings: [binding],
-            startupContext: fixture.startupContext(),
-            initializationHintsByBindingID: [binding.id: hint]
+        let logicalRecord = try await store.loadRoot(path: fixture.root.path)
+        try await store.startWatchingRoot(id: logicalRecord.id)
+        let authority = GitWorkspaceStateAuthority.shared
+        let coordinator = WorkspaceRootReusableSnapshotCoordinator.shared
+        let baselineCache = await authority.snapshotForTesting()
+        let monitor = await authority.metadataMonitorForTesting()
+        let baselineCoverage = await monitor.snapshotForTesting()
+        addTeardownBlock {
+            await coordinator.setPreparedAdmissionHandlerForTesting(nil)
+            await store.stopWatchingRoot(id: logicalRecord.id)
+            await store.unloadRoot(id: logicalRecord.id)
+        }
+
+        await coordinator.setPreparedAdmissionHandlerForTesting {
+            _ = try? await store.acceptWatcherPayloadForTesting(
+                rootID: logicalRecord.id,
+                events: [(
+                    absolutePath: fixture.root.appendingPathComponent("Tracked.swift").path,
+                    flags: FSEventStreamEventFlags(
+                        kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsFile
+                    ),
+                    eventId: 9001
+                )],
+                scheduleDrain: false
+            )
+        }
+        let admission = try await store.admitReusableSnapshotForLoadedRoot(
+            rootID: logicalRecord.id,
+            expectedStandardizedPath: logicalRecord.standardizedFullPath
         )
-        XCTAssertEqual(
-            preparation.ownership.materializationHintObservationsByPhysicalRootPath[result.descriptor.path],
-            .eligible(receipt.parentSnapshotIdentity)
-        )
-        let projection = try await materializer.commit(preparation)
-        XCTAssertEqual(projection?.physicalRootPaths, [result.descriptor.path])
-        let diagnostics = await store.readSearchRootDiagnosticsSnapshot()
-        XCTAssertEqual(
-            diagnostics.first { $0.rootPath == result.descriptor.path }?.crawlCount,
-            1,
-            "eligible observation must still publish only through the full crawler"
-        )
-        let shadow = WorktreeStartupInstrumentation.snapshot().shadow
-        XCTAssertEqual(shadow.inventoryComparisons, 1)
-        XCTAssertEqual(shadow.inventoryMatches, 1)
-        XCTAssertEqual(shadow.inventoryMismatches, 0)
-        await materializer.release(sessionID: sessionID)
+        await coordinator.setPreparedAdmissionHandlerForTesting(nil)
+
+        XCTAssertEqual(admission, .failed)
+        let cache = await authority.snapshotForTesting()
+        let coverage = await monitor.snapshotForTesting()
+        XCTAssertEqual(cache.reusableSnapshotCount, baselineCache.reusableSnapshotCount)
+        XCTAssertEqual(cache.reusableSnapshotAliasCount, baselineCache.reusableSnapshotAliasCount)
+        XCTAssertEqual(cache.reusableSnapshotEstimatedBytes, baselineCache.reusableSnapshotEstimatedBytes)
+        XCTAssertEqual(coverage.retainTokenCount, baselineCoverage.retainTokenCount)
+        XCTAssertEqual(coverage.retainedRepositoryCount, baselineCoverage.retainedRepositoryCount)
     }
 
     func testReceiptFallbackRestartAndConcurrentBindingIsolationMatrix() async throws {

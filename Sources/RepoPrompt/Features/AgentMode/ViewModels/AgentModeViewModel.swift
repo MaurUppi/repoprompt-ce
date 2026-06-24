@@ -5254,6 +5254,62 @@ final class AgentModeViewModel: ObservableObject {
         return ensureSessionBoundToTab(sourceSession)
     }
 
+    func mcpReconcileRoutedSpawnWorktreeBindings(
+        sourceTabID: UUID,
+        expectedParentSessionID: UUID,
+        target: MCPSessionTarget
+    ) throws -> [AgentSessionWorktreeBinding] {
+        guard let sourceSession = sessions[sourceTabID],
+              sourceSession.activeAgentSessionID == expectedParentSessionID,
+              sourceSession.mcpControlContext?.sessionID == expectedParentSessionID
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start could not validate the routed source Agent session for worktree inheritance."
+            )
+        }
+        guard sourceSession.hasLoadedPersistedState else {
+            throw MCPError.invalidParams(
+                "agent_run.start cannot inherit worktree bindings before the routed source Agent session is hydrated."
+            )
+        }
+        guard let targetSessionID = target.sessionID,
+              let targetSession = sessions[target.tabID],
+              targetSession.activeAgentSessionID == targetSessionID,
+              targetSession.parentSessionID == expectedParentSessionID
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start could not validate the routed child Agent session for worktree inheritance."
+            )
+        }
+
+        let expectedBindings = sourceSession.worktreeBindings
+        if targetSession.worktreeBindings.isEmpty {
+            _ = commitWorktreeBindings(expectedBindings, to: targetSession)
+        } else if targetSession.worktreeBindings != expectedBindings {
+            throw MCPError.invalidParams(
+                "agent_run.start child worktree bindings conflict with the routed source session."
+            )
+        }
+        return expectedBindings
+    }
+
+    func mcpRequireRoutedSpawnWorktreeBindings(
+        _ expectedBindings: [AgentSessionWorktreeBinding],
+        expectedParentSessionID: UUID,
+        target: MCPSessionTarget
+    ) throws {
+        guard let targetSessionID = target.sessionID,
+              let targetSession = sessions[target.tabID],
+              targetSession.activeAgentSessionID == targetSessionID,
+              targetSession.parentSessionID == expectedParentSessionID,
+              targetSession.worktreeBindings == expectedBindings
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start child worktree bindings changed before provider startup."
+            )
+        }
+    }
+
     func applySpawnParentSessionID(
         _ parentSessionID: UUID?,
         to session: TabSession,
