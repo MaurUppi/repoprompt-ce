@@ -691,6 +691,94 @@ extension FileSystemService {
         return deltas
     }
 
+    /// Produces a standalone, exact namespace manifest through the same streaming
+    /// crawler used by ordinary root loading. This does not publish or seed a root.
+    func workspaceRootNamespaceManifest(
+        in store: WorkspaceRootNamespaceManifestStore,
+        resourcePolicy: WorkspaceRootNamespaceManifestResourcePolicy = .default,
+        chunkSize: Int = 200
+    ) async throws -> WorkspaceRootNamespaceManifestLease {
+        guard pendingIgnoreRulesRebuildCount == 0 else {
+            throw WorkspaceRootNamespaceManifestError.corrupt("workspace ignore rules rebuild pending during enumeration")
+        }
+        let initialRootIdentity = try WorkspaceRootNamespaceRootIdentity(rootURL: rootURL)
+        let initialCatalogPolicyIdentity = catalogPolicyIdentity
+        let initialIgnoreRulesRevision = ignoreRulesRevision
+        let writer = try store.makeWriter(
+            identity: WorkspaceRootNamespaceManifestIdentity(
+                root: initialRootIdentity,
+                catalogPolicy: initialCatalogPolicyIdentity
+            ),
+            resourcePolicy: resourcePolicy
+        )
+
+        do {
+            let stream = loadContentsInChunks(of: rootURL, chunkSize: chunkSize)
+            for try await event in stream {
+                try Task.checkCancellation()
+                switch event {
+                case let .preparedItems(chunk):
+                    var records: [WorkspaceRootNamespaceRecord] = []
+                    records.reserveCapacity(chunk.folders.count + chunk.files.count)
+                    for folder in chunk.folders {
+                        records.append(Self.workspaceRootNamespaceRecord(for: folder))
+                    }
+                    for file in chunk.files {
+                        records.append(Self.workspaceRootNamespaceRecord(for: file))
+                    }
+                    try await writer.append(contentsOf: records)
+
+                case let .items(items):
+                    var records: [WorkspaceRootNamespaceRecord] = []
+                    records.reserveCapacity(items.count)
+                    for (item, _) in items {
+                        let relativePath = item.relativePath(rootPath: rootURL.path)
+                        records.append(WorkspaceRootNamespaceRecord(
+                            relativePath: relativePath,
+                            kind: item is Folder ? .directory : .file,
+                            isSymbolicLink: false
+                        ))
+                    }
+                    try await writer.append(contentsOf: records)
+
+                case .totalFileCount:
+                    continue
+                }
+            }
+
+            try Task.checkCancellation()
+            #if DEBUG
+                if let handler = workspaceRootNamespaceEnumerationWillFinishHandler {
+                    await handler()
+                }
+            #endif
+            let lease = try await writer.finish()
+            let finalRootIdentity = try WorkspaceRootNamespaceRootIdentity(rootURL: rootURL)
+            guard finalRootIdentity == initialRootIdentity else {
+                throw WorkspaceRootNamespaceManifestError.corrupt("workspace root changed during enumeration")
+            }
+            guard pendingIgnoreRulesRebuildCount == 0,
+                  catalogPolicyIdentity == initialCatalogPolicyIdentity,
+                  ignoreRulesRevision == initialIgnoreRulesRevision
+            else {
+                throw WorkspaceRootNamespaceManifestError.corrupt("workspace ignore policy changed or rebuild pending during enumeration")
+            }
+            return lease
+        } catch {
+            await writer.cancel()
+            throw error
+        }
+    }
+
+    static func workspaceRootNamespaceRecord(for item: FSItemDTO) -> WorkspaceRootNamespaceRecord {
+        WorkspaceRootNamespaceRecord(
+            relativePathBytes: item.relativePathBytes,
+            kind: item.isDirectory ? .directory : .file,
+            isSymbolicLink: item.isSymbolicLink,
+            fileSystemMode: item.fileSystemMode
+        )
+    }
+
     public func loadContentsInChunks(
         of folderURL: URL,
         chunkSize: Int = 200
@@ -816,6 +904,7 @@ extension FileSystemService {
     struct DirectoryContext {
         let absPath: String
         let relPath: String
+        let relPathBytes: Data
         let hierarchy: Int
         let rules: IgnoreRulesSnapshot
         let chain: DirChain?
@@ -878,6 +967,10 @@ extension FileSystemService {
             if name == ".git" { continue }
             if Self.isRepoPromptTempFilename(name) { continue }
             let relativePath = context.relPath.isEmpty ? name : "\(context.relPath)/\(name)"
+            let relativePathBytes = Self.joinRelativePathBytes(
+                base: context.relPathBytes,
+                child: entry.nameBytes
+            )
             guard !relativePath.isEmpty else { continue }
             let hierarchy = context.hierarchy + 1
             let comps = componentsCache.components(for: relativePath)
@@ -917,8 +1010,11 @@ extension FileSystemService {
                 folders.append(
                     FSItemDTO(
                         relativePath: relativePath,
+                        relativePathBytes: relativePathBytes,
                         isDirectory: true,
-                        hierarchy: hierarchy
+                        hierarchy: hierarchy,
+                        isSymbolicLink: entry.isSym,
+                        fileSystemMode: entry.fileSystemMode
                     )
                 )
 
@@ -934,6 +1030,7 @@ extension FileSystemService {
                         DirectoryContext(
                             absPath: absolutePath,
                             relPath: relativePath,
+                            relPathBytes: relativePathBytes,
                             hierarchy: hierarchy,
                             rules: effectiveRulesSnapshot,
                             chain: childChain
@@ -944,6 +1041,7 @@ extension FileSystemService {
                         DirectoryContext(
                             absPath: absolutePath,
                             relPath: relativePath,
+                            relPathBytes: relativePathBytes,
                             hierarchy: hierarchy,
                             rules: effectiveRulesSnapshot,
                             chain: nil
@@ -954,8 +1052,11 @@ extension FileSystemService {
                 files.append(
                     FSItemDTO(
                         relativePath: relativePath,
+                        relativePathBytes: relativePathBytes,
                         isDirectory: false,
-                        hierarchy: hierarchy
+                        hierarchy: hierarchy,
+                        isSymbolicLink: entry.isSym,
+                        fileSystemMode: entry.fileSystemMode
                     )
                 )
             }
@@ -979,6 +1080,14 @@ extension FileSystemService {
             return root + relative
         }
         return root + "/" + relative
+    }
+
+    static func joinRelativePathBytes(base: Data, child: Data) -> Data {
+        guard !base.isEmpty else { return child }
+        var result = base
+        result.append(UInt8(ascii: "/"))
+        result.append(child)
+        return result
     }
 
     func walkPosixRecursivelyEmitChunks(
@@ -1012,6 +1121,7 @@ extension FileSystemService {
             DirectoryContext(
                 absPath: rootFullPath,
                 relPath: "",
+                relPathBytes: Data(),
                 hierarchy: -1,
                 rules: parentRules.snapshot(),
                 chain: rootChain
@@ -1327,6 +1437,7 @@ extension FileSystemService {
             DirectoryContext(
                 absPath: rootPath,
                 relPath: baseRelativePath,
+                relPathBytes: Data(baseRelativePath.utf8),
                 hierarchy: -1,
                 rules: parentRulesSnapshot,
                 chain: rootChain

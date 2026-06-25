@@ -150,6 +150,9 @@ actor FileSystemService {
         /// Test-only hook invoked inside each real-filesystem parallel folder enumeration worker.
         var parallelFolderEnumerationHookForTesting: (@Sendable (String) async throws -> Void)?
 
+        /// Test-only barrier immediately before namespace-manifest authority fencing.
+        var workspaceRootNamespaceEnumerationWillFinishHandler: (@Sendable () async -> Void)?
+
         /// Test-only gate invoked from the detached mutation worker immediately before filesystem I/O.
         var mutationIOWillBeginHandler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
 
@@ -384,6 +387,16 @@ actor FileSystemService {
 
         func setMoveItemToTrashIOForTesting(_ operation: (@Sendable (URL) throws -> Void)?) {
             moveItemToTrashIOForTesting = operation
+        }
+
+        func setWorkspaceRootNamespaceEnumerationWillFinishHandlerForTesting(
+            _ handler: (@Sendable () async -> Void)?
+        ) {
+            workspaceRootNamespaceEnumerationWillFinishHandler = handler
+        }
+
+        func setPendingIgnoreRulesRebuildCountForTesting(_ count: Int) {
+            pendingIgnoreRulesRebuildCount = count
         }
 
         func pendingMutationWaiterCountForTesting() -> Int {
