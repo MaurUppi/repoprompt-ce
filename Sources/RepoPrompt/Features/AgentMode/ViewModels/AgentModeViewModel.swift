@@ -753,6 +753,10 @@ final class AgentModeViewModel: ObservableObject {
             pendingAssistantPresentationByTabID.count
         }
 
+        func test_installLiveSession(_ session: TabSession) {
+            sessions[session.tabID] = session
+        }
+
         func test_installPersistentSessionBinding(
             sessionID: UUID?,
             on session: TabSession,
@@ -2779,6 +2783,10 @@ final class AgentModeViewModel: ObservableObject {
         await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
         cancelPendingInstruction(for: session)
         await teardownMCPControl(for: session, cleanupSessionStore: true)
+        if session.runState.isActive {
+            await cancelAgentRun(tabID: session.tabID)
+        }
+        await cleanupACPStateForDeletedSession(session)
         session.agentTask?.cancel()
         session.agentTask = nil
         let provider = session.provider
@@ -10565,6 +10573,9 @@ final class AgentModeViewModel: ObservableObject {
                     await cancelAgentRun(tabID: tabID)
                 }
 
+                // All compose-tab removal reasons detach the live TabSession owner from `sessions`.
+                // Release retained ACP runtimes before that controller handle can become unreachable.
+                await cleanupACPStateForDeletedSession(session)
                 await codexCoordinator.shutdownCodexSession(session)
                 await claudeCoordinator.shutdownClaudeSession(session)
 
