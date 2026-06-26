@@ -30,6 +30,7 @@ from typing import Any, Iterable
 
 
 SCHEMA_VERSION = 1
+DIAGNOSTIC_SCHEMA_VERSION = 5
 DEBUG_TOOL = "__repoprompt_debug_diagnostics"
 WORKSPACE_PREFIXES = ("RPCE 8E Bench ", "RPCE Search Bench ")
 DEFAULT_OUTPUT_ROOT = "/tmp/rpce-worktree-startup/v1"
@@ -87,9 +88,34 @@ METRICS = (
     "materialize_to_root_ready",
     "materialize_to_first_search",
     "materialize_to_first_read",
+    "interactive_readiness_us",
 )
-TOOL_METRICS = ("first_search", "first_read")
+TOOL_METRICS = ("first_search", "first_read", "first_codemap", "warm_codemap", "passive_tree", "selection")
 ALL_METRICS = METRICS + TOOL_METRICS
+DURATION_METRICS = tuple(metric for metric in ALL_METRICS if metric != "interactive_readiness_us")
+REQUIRED_BOUNDARY_KEYS = (
+    "bindingTransitionStarted", "rootReady",
+    "firstBenchmarkSearchStarted", "firstBenchmarkSearchCompleted",
+    "firstBenchmarkReadStarted", "firstBenchmarkReadCompleted",
+    "firstBenchmarkCodemapStarted", "firstBenchmarkCodemapCompleted",
+    "warmBenchmarkCodemapStarted", "warmBenchmarkCodemapCompleted",
+    "passiveBenchmarkTreeStarted", "passiveBenchmarkTreeCompleted",
+    "benchmarkSelectionStarted", "benchmarkSelectionCompleted",
+)
+BOUNDARY_DURATION_PAIRS = {
+    "materialize_to_root_ready": ("bindingTransitionStarted", "rootReady"),
+    "materialize_to_first_search": ("bindingTransitionStarted", "firstBenchmarkSearchCompleted"),
+    "materialize_to_first_read": ("bindingTransitionStarted", "firstBenchmarkReadCompleted"),
+    "first_search": ("firstBenchmarkSearchStarted", "firstBenchmarkSearchCompleted"),
+    "first_read": ("firstBenchmarkReadStarted", "firstBenchmarkReadCompleted"),
+    "first_codemap": ("firstBenchmarkCodemapStarted", "firstBenchmarkCodemapCompleted"),
+    "warm_codemap": ("warmBenchmarkCodemapStarted", "warmBenchmarkCodemapCompleted"),
+    "passive_tree": ("passiveBenchmarkTreeStarted", "passiveBenchmarkTreeCompleted"),
+    "selection": ("benchmarkSelectionStarted", "benchmarkSelectionCompleted"),
+}
+FIXED_WARMUPS = 1
+FIXED_RETAINED_SAMPLES = 5
+PRIMARY_CV_CONFIRMATION_THRESHOLD = 0.50
 CODEMAP_GATE_MINIMUM_SUPPORTED_FILES = 5_000
 CODEMAP_GATE_MINIMUM_COLD_SAMPLES = 20
 CODEMAP_GATE_MINIMUM_WARM_SAMPLES = 40
@@ -308,6 +334,56 @@ def binding_root_paths(value: Any) -> list[str] | None:
     return [str(Path(path).expanduser().resolve(strict=False)) for path in paths]
 
 
+def validate_worktree_scope(
+    record: dict[str, Any],
+    *,
+    expected_logical_root_path: str,
+    expected_worktree_id: str,
+    expected_physical_worktree_path: str,
+) -> dict[str, Any]:
+    """Validate CE's logical display identity against an exact physical binding.
+
+    Filesystem tools intentionally display the logical workspace root. The physical
+    app-managed path is proven by the agent-start binding and correlated here by the
+    exact worktree ID; CE redacts effective_root_path as ``session-bound``.
+    """
+    scope = record.get("worktree_scope")
+    if not isinstance(scope, dict):
+        raise BenchmarkError("tool response omitted structured worktree_scope")
+    if (
+        scope.get("kind") != "session_bound_worktree"
+        or scope.get("display_identity") != "logical_canonical_root"
+        or scope.get("effective_identity") != "bound_worktree_root"
+    ):
+        raise BenchmarkError("tool response reported the wrong worktree_scope identities")
+    mappings = scope.get("root_mappings")
+    if not isinstance(mappings, list):
+        raise BenchmarkError("tool response omitted worktree_scope root mappings")
+    logical_root = Path(expected_logical_root_path).expanduser().resolve(strict=False)
+    logical_labels = {logical_root.name, str(logical_root)}
+    matches = [
+        item for item in mappings
+        if isinstance(item, dict)
+        and item.get("worktree_id") == expected_worktree_id
+        and item.get("logical_root_path") in logical_labels
+        and item.get("effective_root_path") in {
+            "session-bound",
+            str(Path(expected_physical_worktree_path).expanduser().resolve(strict=False)),
+        }
+    ]
+    if len(matches) != 1:
+        raise BenchmarkError("tool worktree_scope did not match the exact physical binding")
+    return {
+        "worktree_id": expected_worktree_id,
+        "physical_worktree_path": str(
+            Path(expected_physical_worktree_path).expanduser().resolve(strict=False)
+        ),
+        "logical_root_path": str(logical_root),
+        "display_identity": scope["display_identity"],
+        "effective_identity": scope["effective_identity"],
+    }
+
+
 def tool_payload(value: Any, tool: str) -> dict[str, Any]:
     signatures = {
         "file_search": lambda item: isinstance(item.get("total_matches"), int)
@@ -346,12 +422,24 @@ def structured_mcp_record(
     expected_root_id: str,
     expected_root_path: str,
     expected_root_type: str,
+    expected_worktree_id: str | None = None,
+    expected_physical_worktree_path: str | None = None,
 ) -> dict[str, Any]:
     record = tool_payload(value, tool)
     canonical_root_path = str(Path(expected_root_path).expanduser().resolve(strict=False))
     bound_paths = binding_root_paths(value)
     if bound_paths is not None and canonical_root_path not in bound_paths:
         raise BenchmarkError(f"{tool} binding did not include the expected root")
+    if (expected_worktree_id is None) != (expected_physical_worktree_path is None):
+        raise BenchmarkError("worktree_scope validation requires ID and physical path together")
+    worktree_scope: dict[str, Any] | None = None
+    if expected_worktree_id is not None and expected_physical_worktree_path is not None:
+        worktree_scope = validate_worktree_scope(
+            record,
+            expected_logical_root_path=canonical_root_path,
+            expected_worktree_id=expected_worktree_id,
+            expected_physical_worktree_path=expected_physical_worktree_path,
+        )
     expected_root = {
         "id": str(uuid.UUID(expected_root_id)).upper(),
         "path": canonical_root_path,
@@ -435,6 +523,8 @@ def structured_mcp_record(
     result["status"] = record.get("status") or "success"
     result["root"] = expected_root
     result["files"] = files
+    if worktree_scope is not None:
+        result["validated_worktree_scope"] = worktree_scope
     return result
 
 
@@ -492,6 +582,8 @@ def require_structured_success(
     expected_content: str | None = None,
     require_only_file: bool = True,
     allow_other_roots: bool = False,
+    expected_worktree_id: str | None = None,
+    expected_physical_worktree_path: str | None = None,
 ) -> dict[str, Any]:
     if not call_succeeded(value):
         raise BenchmarkError(f"{tool} transport/tool call failed")
@@ -501,6 +593,8 @@ def require_structured_success(
     record = structured_mcp_record(
         value, tool, expected_root_id=expected_root_id,
         expected_root_path=expected_root_path, expected_root_type=expected_root_type,
+        expected_worktree_id=expected_worktree_id,
+        expected_physical_worktree_path=expected_physical_worktree_path,
     )
     if record.get("status") not in {"ok", "complete", "completed", "ready", "success"}:
         raise BenchmarkError(f"{tool} returned non-success status")
@@ -665,7 +759,13 @@ def require_structured_removed(
 def structured_success_evidence(value: Any, tool: str, **expected: Any) -> dict[str, Any]:
     try:
         record = require_structured_success(value, tool, **expected)
-        return {"ok": True, "status": record["status"], "root": record["root"], "files": record["files"]}
+        return {
+            "ok": True,
+            "status": record["status"],
+            "root": record["root"],
+            "files": record["files"],
+            "worktree_scope": record.get("validated_worktree_scope"),
+        }
     except BenchmarkError as error:
         return {"ok": False, "error": str(error)}
 
@@ -775,6 +875,14 @@ def response_worktree_binding_set(value: Any) -> set[tuple[str, str]]:
             continue
         bindings.add((raw_id, str(Path(raw_path).resolve(strict=False))))
     return bindings
+
+
+def exact_response_worktree_binding(value: Any, expected_path: Path) -> tuple[str, str]:
+    canonical = str(expected_path.expanduser().resolve(strict=False))
+    matches = [item for item in response_worktree_binding_set(value) if item[1] == canonical]
+    if len(matches) != 1:
+        raise BenchmarkError("agent response omitted one exact physical worktree binding")
+    return matches[0]
 
 
 def child_inheritance_evidence(
@@ -889,6 +997,33 @@ def stats(
         "reliability": "high" if cv is not None and cv <= 0.10 else "moderate" if cv is not None and cv <= 0.20 else "low",
         "min": ordered[0],
         "max": ordered[-1],
+    }
+
+
+def comparison_direction(control_p95: float, candidate_p95: float, minimum_improvement: float) -> str:
+    control = strict_telemetry_number(control_p95, positive=True, label="control p95")
+    candidate = strict_telemetry_number(candidate_p95, positive=True, label="candidate p95")
+    improvement = (control - candidate) / control
+    return "pass" if improvement >= minimum_improvement else "fail"
+
+
+def confirmation_policy(
+    primary: dict[str, Any], confirmation: dict[str, Any] | None, *, minimum_improvement: float
+) -> dict[str, Any]:
+    direction = comparison_direction(primary["control_p95"], primary["candidate_p95"], minimum_improvement)
+    high_variance = max(float(primary["control_cv"]), float(primary["candidate_cv"])) > PRIMARY_CV_CONFIRMATION_THRESHOLD
+    if not high_variance:
+        return {"status": direction, "direction": direction, "confirmation_required": False}
+    if confirmation is None:
+        return {"status": "high-variance/inconclusive", "direction": direction, "confirmation_required": True}
+    confirmation_direction = comparison_direction(
+        confirmation["control_p95"], confirmation["candidate_p95"], minimum_improvement
+    )
+    return {
+        "status": direction if direction == confirmation_direction else "high-variance/inconclusive",
+        "direction": direction,
+        "confirmation_direction": confirmation_direction,
+        "confirmation_required": True,
     }
 
 
@@ -1017,16 +1152,22 @@ def ownership_marker_path(root: Path) -> Path:
 
 
 def create_marker_command(args: argparse.Namespace) -> int:
-    if not args.confirm_disposable_root:
-        raise BenchmarkError("create-marker requires --confirm-disposable-root")
     root = Path(args.root_path).expanduser().resolve(strict=True)
-    if root == repository_root():
-        raise BenchmarkError("the development checkout cannot be marked as a disposable benchmark root")
+    real_repository = root == repository_root().resolve()
+    if real_repository:
+        if not args.confirm_real_repository_benchmark or not args.confirm_dedicated_workspace:
+            raise BenchmarkError(
+                "marking the real repository requires --confirm-real-repository-benchmark "
+                "and --confirm-dedicated-workspace"
+            )
+    elif not args.confirm_disposable_root:
+        raise BenchmarkError("create-marker requires --confirm-disposable-root")
     marker = ownership_marker_path(root)
     payload = {
         "schema_version": SCHEMA_VERSION,
         "purpose": "rpce-worktree-startup-live-benchmark",
-        "disposable": True,
+        "disposable": not real_repository,
+        "target_kind": "real-repository-dedicated" if real_repository else "disposable-fixture",
         "workspace_id": validate_uuid(args.workspace_id, "workspace-id"),
         "root_id": validate_uuid(args.root_id, "root-id"),
         "canonical_root": str(root),
@@ -1054,14 +1195,17 @@ def validate_ownership_marker(
     root_id: str,
     owner_token: str | None = None,
     expected_sha256: str | None = None,
+    allow_real_repository: bool = False,
 ) -> tuple[Path, dict[str, Any], str]:
-    if root.resolve() == repository_root():
+    real_repository = root.resolve() == repository_root().resolve()
+    if real_repository and not allow_real_repository:
         raise BenchmarkError("the development checkout is not a disposable benchmark target")
     marker_path, marker, digest = load_ownership_marker(root)
     expected = {
         "schema_version": SCHEMA_VERSION,
         "purpose": "rpce-worktree-startup-live-benchmark",
-        "disposable": True,
+        "disposable": not real_repository,
+        "target_kind": "real-repository-dedicated" if real_repository else "disposable-fixture",
         "workspace_id": workspace_id,
         "root_id": root_id,
         "canonical_root": str(root.resolve()),
@@ -1279,12 +1423,23 @@ def plan_command(args: argparse.Namespace) -> int:
     if not args.workspace_name.startswith(WORKSPACE_PREFIXES):
         allowed = ", ".join(repr(prefix) for prefix in WORKSPACE_PREFIXES)
         raise BenchmarkError(f"workspace-name must start with one of: {allowed}")
-    if args.asserted_file_count < 100_000:
-        raise BenchmarkError("asserted-file-count must be at least 100000 for the large-workspace lane")
-    if args.retained_samples < 3:
-        raise BenchmarkError("retained-samples must be at least 3")
-    if args.warmups < 1:
-        raise BenchmarkError("warmups must be at least 1")
+    real_repository = args.confirm_real_repository_benchmark
+    tracked_files = run_local(["git", "ls-files", "-z"], root).stdout.count("\0")
+    if real_repository:
+        if root != repository_root().resolve() or not args.confirm_dedicated_workspace:
+            raise BenchmarkError(
+                "real-repository benchmarking requires this exact checkout plus --confirm-dedicated-workspace"
+            )
+        if args.asserted_file_count != tracked_files:
+            raise BenchmarkError(
+                f"asserted-file-count must equal observed tracked count {tracked_files} for the real repository"
+            )
+    elif args.asserted_file_count < 100_000:
+        raise BenchmarkError("disposable large-workspace asserted-file-count must be at least 100000")
+    if args.retained_samples != FIXED_RETAINED_SAMPLES:
+        raise BenchmarkError("readiness plans require exactly five retained samples")
+    if args.warmups != FIXED_WARMUPS:
+        raise BenchmarkError("readiness plans require exactly one excluded warmup")
     if args.invocations_per_series < 1:
         raise BenchmarkError("invocations-per-series must be at least 1")
     base_commit_oid = resolve_commit_oid(root, args.base_ref)
@@ -1297,7 +1452,9 @@ def plan_command(args: argparse.Namespace) -> int:
         workspace_id=validate_uuid(args.workspace_id, "workspace-id"),
         root_id=validate_uuid(args.root_id, "root-id"),
         owner_token=validate_uuid(args.owner_token, "owner-token"),
+        allow_real_repository=real_repository,
     )
+    owner_token = marker["owner_token"]
     plan: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "created_at": utc_now(),
@@ -1308,13 +1465,16 @@ def plan_command(args: argparse.Namespace) -> int:
             "context_id": validate_uuid(args.context_id, "context-id"),
             "root_id": validate_uuid(args.root_id, "root-id"),
             "root_path": str(root),
+            "target_kind": "real-repository-dedicated" if real_repository else "disposable-fixture",
+            "explicit_real_repository_confirmation": real_repository,
             "ownership_marker": str(marker_path),
             "ownership_marker_sha256": marker_sha256,
-            "owner_token": marker["owner_token"],
+            "owner_token": owner_token,
         },
         "dataset": {
             "label": args.dataset_label,
             "asserted_file_count": args.asserted_file_count,
+            "observed_tracked_file_count": tracked_files,
             "base_ref": args.base_ref,
             "base_commit_oid": base_commit_oid,
             "search_marker": args.search_marker,
@@ -1324,10 +1484,10 @@ def plan_command(args: argparse.Namespace) -> int:
             "code_file_type": args.code_file_type,
         },
         "matrix": {
-            "process_states": ["cold", "warm", "aged"],
+            "process_states": ["warm", "aged"],
             "checkout_kinds": ["linked-worktree"],
             "routes": list(ROUTES),
-            "widths": [1, 2, 4, 8],
+            "widths": [1, 4, 8],
             "warmups_per_series": args.warmups,
             "retained_samples_per_series": args.retained_samples,
             "invocations_per_series": args.invocations_per_series,
@@ -1344,8 +1504,8 @@ def plan_command(args: argparse.Namespace) -> int:
         "thresholds": {
             "correctness_mismatches": 0,
             "eligible_warm_fallbacks": 0,
-            "projected_p95_improvement_minimum": 0.40,
-            "other_p95_regression_maximum": 0.05,
+            "projected_p95_improvement_minimum": 0.30,
+            "other_p95_regression_maximum": 0.10,
             "peak_memory_regression_maximum": 0.10,
         },
         "synthetic_hooks": {
@@ -1354,7 +1514,7 @@ def plan_command(args: argparse.Namespace) -> int:
             "environment": "REPOPROMPT_NAMESPACE_MANIFEST_SCALE_ENTRY_COUNT",
             "test_filter": "RepoPromptTests.WorkspaceRootNamespaceManifestTests/testSyntheticHundredThousandEntriesRemainWithinConfiguredBatchBytes",
         },
-        "scoreboard": "prompt-exports/optimize-content-addressed-codemaps-runs.md",
+        "scoreboard": "prompt-exports/optimize-worktree-interactive-readiness-runs.md",
     }
     plan["plan_sha256"] = plan_digest(plan)
     output = Path(args.output).expanduser().resolve()
@@ -1399,6 +1559,7 @@ def self_test_command(_args: argparse.Namespace) -> int:
             "schema_version": SCHEMA_VERSION,
             "purpose": "rpce-worktree-startup-live-benchmark",
             "disposable": True,
+            "target_kind": "disposable-fixture",
             "workspace_id": workspace_id,
             "root_id": root_id,
             "canonical_root": str(root),
@@ -1719,6 +1880,37 @@ def self_test_command(_args: argparse.Namespace) -> int:
         "tree": tree_fixture_text, "text": tree_fixture_text,
         "uses_legend": True, "was_truncated": False,
     }, payload={"type": "files", "mode": "full", "path": ".", "max_depth": 1})
+    physical_worktree_fixture = Path("/tmp/rpce-app-managed/session-bound-worktree")
+    worktree_scope_fixture = {
+        "kind": "session_bound_worktree",
+        "display_identity": "logical_canonical_root",
+        "effective_identity": "bound_worktree_root",
+        "root_mappings": [{
+            "logical_root_name": fixture_root.name,
+            "logical_root_path": fixture_root.name,
+            "effective_root_name": physical_worktree_fixture.name,
+            "effective_root_path": "session-bound",
+            "worktree_id": "wt_exact_fixture",
+        }],
+    }
+    scoped_search = json.loads(json.dumps(actual_search))
+    scoped_search["_benchmark_response"]["worktree_scope"] = worktree_scope_fixture
+    checks["logical_display_exact_physical_scope_accepted"] = structured_success_evidence(
+        scoped_search, "file_search", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), expected_file_type="file", expected_content=marker,
+        expected_worktree_id="wt_exact_fixture",
+        expected_physical_worktree_path=str(physical_worktree_fixture),
+    )["ok"]
+    wrong_scope = json.loads(json.dumps(scoped_search))
+    wrong_scope["_benchmark_response"]["worktree_scope"]["root_mappings"][0]["worktree_id"] = "wt_wrong"
+    checks["logical_display_wrong_physical_scope_rejected"] = not structured_success_evidence(
+        wrong_scope, "file_search", expected_root_id=fixture_root_id,
+        expected_root_path=str(fixture_root), expected_root_type="linkedWorktree",
+        expected_file_path=str(fixture_file), expected_file_type="file", expected_content=marker,
+        expected_worktree_id="wt_exact_fixture",
+        expected_physical_worktree_path=str(physical_worktree_fixture),
+    )["ok"]
     checks["tree_exact_context_parent_full_path"] = codemap_tree_marker_evidence(
         actual_tree, expected_context_id=fixture_context,
         expected_root_path=str(fixture_root), requested_parent=".",
@@ -1953,7 +2145,24 @@ def self_test_command(_args: argparse.Namespace) -> int:
     )["ok"]
 
     def export_fixture(route: str) -> dict[str, Any]:
+        boundaries = {
+            "bindingTransitionStarted": 0, "rootReady": 100,
+            "firstBenchmarkSearchStarted": 110, "firstBenchmarkReadStarted": 120,
+            "firstBenchmarkSearchCompleted": 210, "firstBenchmarkReadCompleted": 220,
+            "firstBenchmarkCodemapStarted": 230, "firstBenchmarkCodemapCompleted": 330,
+            "warmBenchmarkCodemapStarted": 340, "warmBenchmarkCodemapCompleted": 440,
+            "passiveBenchmarkTreeStarted": 450, "passiveBenchmarkTreeCompleted": 550,
+            "benchmarkSelectionStarted": 560, "benchmarkSelectionCompleted": 660,
+        }
+        durations = {
+            "materialize_to_root_ready": 100,
+            "materialize_to_first_search": 210,
+            "materialize_to_first_read": 220,
+            "first_search": 100, "first_read": 100, "first_codemap": 100,
+            "warm_codemap": 100, "passive_tree": 100, "selection": 100,
+        }
         return {
+            "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
             "sample": {
                 "valid": True,
                 "configured_route": ROUTES[route]["expected"],
@@ -1963,7 +2172,11 @@ def self_test_command(_args: argparse.Namespace) -> int:
                 "ordinal": 1,
                 "route_counts": EXPECTED_ACTUAL_ROUTE_COUNTS[route],
                 "fallback_counts": {},
-                "durations_us": {metric: 100 for metric in ALL_METRICS},
+                "durations_us": durations,
+                "interactive_readiness_us": 220,
+                "operation_boundaries_us": boundaries,
+                "boundary_evidence_available": True,
+                "boundary_invalid_reasons": [],
             },
             "git": {
                 "available": True, "command_count": 1, "families": {"test": 1},
@@ -1974,7 +2187,21 @@ def self_test_command(_args: argparse.Namespace) -> int:
                 "filesystem": {
                     "available": True, "operation_count": 1, "duration_us": 1,
                     "item_count": 1,
-                }
+                },
+                "planner": {
+                    phase: {"count": 1, "duration_us": 1, "item_count": 1}
+                    for phase in ("targetNamespace", "treeEvidence", "indexEvidence", "statusEvidence", "reconcile")
+                },
+                "mutation_lock": {
+                    "available": True, "count": 1, "queue_wait_us": 0, "held_us": 1,
+                    "mutation_us": 1, "post_mutation_finalization_us": 1,
+                },
+                "passive_tree": {"available": True, "operation_count": 1, "duration_us": 100},
+                "marker_publications": [{
+                    "root_id": str(uuid.uuid4()), "root_lifetime_id": str(uuid.uuid4()),
+                    "revision": 1, "effective_change_count": 1,
+                    "source": "warmReplay", "timestamp_us": 550,
+                }],
             },
         }
 
@@ -1992,6 +2219,44 @@ def self_test_command(_args: argparse.Namespace) -> int:
             expected_correlation=correlation, expected_session=session,
             expected_invocation=1, expected_ordinal=1,
         )
+
+    schema_export = export_fixture("baseline")
+    schema_export["schema_version"] = 4
+    checks["schema_v4_rejected"] = "diagnostic_schema_mismatch" in validate_export(
+        schema_export, "baseline", {"search": True, "read": True},
+        expected_correlation=correlation, expected_session=session,
+        expected_invocation=1, expected_ordinal=1,
+    )
+    nested_schema_export = export_fixture("baseline")
+    nested_schema_export.pop("schema_version")
+    nested_schema_export["nested"] = {"schema_version": DIAGNOSTIC_SCHEMA_VERSION}
+    checks["nested_schema_v5_does_not_satisfy_top_level_contract"] = (
+        "diagnostic_schema_mismatch" in validate_export(
+            nested_schema_export, "baseline", {"search": True, "read": True},
+            expected_correlation=correlation, expected_session=session,
+            expected_invocation=1, expected_ordinal=1,
+        )
+    )
+    invalid_boundary_export = export_fixture("baseline")
+    invalid_boundary_export["sample"]["operation_boundaries_us"][
+        "firstBenchmarkReadCompleted"
+    ] = 119
+    checks["non_monotonic_boundary_rejected"] = (
+        "non_monotonic_operation_boundaries" in validate_export(
+            invalid_boundary_export, "baseline", {"search": True, "read": True},
+            expected_correlation=correlation, expected_session=session,
+            expected_invocation=1, expected_ordinal=1,
+        )
+    )
+    inconsistent_duration_export = export_fixture("baseline")
+    inconsistent_duration_export["sample"]["durations_us"]["selection"] = 98
+    checks["inconsistent_boundary_duration_rejected"] = (
+        "inconsistent_selection_duration" in validate_export(
+            inconsistent_duration_export, "baseline", {"search": True, "read": True},
+            expected_correlation=correlation, expected_session=session,
+            expected_invocation=1, expected_ordinal=1,
+        )
+    )
 
     def export_failures(export: dict[str, Any], route: str = "baseline") -> list[str]:
         return validate_export(
@@ -2038,9 +2303,12 @@ def self_test_command(_args: argparse.Namespace) -> int:
             "git": {
                 **export_fixture("baseline")["git"], "queue_wait_us": 0.5, "duration_us": 1.5,
             },
-            "work": {"filesystem": {
-                **export_fixture("baseline")["work"]["filesystem"], "duration_us": 1.25,
-            }},
+            "work": {
+                **export_fixture("baseline")["work"],
+                "filesystem": {
+                    **export_fixture("baseline")["work"]["filesystem"], "duration_us": 1.25,
+                },
+            },
         },
         "baseline", {"search": True, "read": True}, expected_correlation=correlation,
         expected_session=session, expected_invocation=1, expected_ordinal=1,
@@ -2331,18 +2599,79 @@ def self_test_command(_args: argparse.Namespace) -> int:
             return self.responses.pop(0)
 
     started_memory_id = str(uuid.uuid4()).upper()
-    start_memory_runner = MemoryRunnerFixture([{
-        "ok": True, "op": "large_workspace_memory", "action": "start",
-        "running": True, "session_id": started_memory_id,
-        "session": {"id": started_memory_id, "label": cleanup_artifact_name,
-                    "running": True},
-    }])
+    start_memory_runner = MemoryRunnerFixture([
+        {
+            "ok": True, "op": "large_workspace_memory", "action": "current",
+            "running": False,
+        },
+        {
+            "ok": True, "op": "large_workspace_memory", "action": "start",
+            "running": True, "session_id": started_memory_id,
+            "session": {"id": started_memory_id, "label": cleanup_artifact_name,
+                        "running": True},
+        },
+    ])
+    start_acquisition = MemorySamplerAcquisition(label=cleanup_artifact_name)
     returned_memory_id, _ = start_owned_memory_sampler(
-        start_memory_runner, cleanup_artifact_name
+        start_memory_runner, cleanup_artifact_name, start_acquisition
     )
     checks["memory_start_returns_owner_without_reset_takeover"] = (
         returned_memory_id == started_memory_id
-        and "reset" not in start_memory_runner.payloads[0]
+        and start_acquisition.session_id == started_memory_id
+        and start_acquisition.acquisition_uncertain is False
+        and [payload["action"] for payload in start_memory_runner.payloads]
+        == ["current", "start"]
+        and all("reset" not in payload for payload in start_memory_runner.payloads)
+    )
+
+    partial_memory_id = str(uuid.uuid4()).upper()
+    partial_memory_runner = MemoryRunnerFixture([
+        {
+            "ok": True, "op": "large_workspace_memory", "action": "current",
+            "running": False,
+        },
+        {
+            "ok": True, "op": "large_workspace_memory", "action": "start",
+            "running": True, "session_id": partial_memory_id,
+            "session": {"label": cleanup_artifact_name, "running": True},
+        },
+        {
+            "ok": True, "op": "large_workspace_memory", "action": "current",
+            "running": True, "session_id": partial_memory_id,
+            "session": {"id": partial_memory_id, "label": cleanup_artifact_name,
+                        "running": True},
+        },
+        {
+            "ok": True, "op": "large_workspace_memory", "action": "stop",
+            "running": False, "session_id": partial_memory_id,
+            "session": {"id": partial_memory_id, "label": cleanup_artifact_name,
+                        "running": False},
+        },
+    ])
+    partial_acquisition = MemorySamplerAcquisition(label=cleanup_artifact_name)
+    try:
+        start_owned_memory_sampler(
+            partial_memory_runner, cleanup_artifact_name, partial_acquisition
+        )
+        partial_start_rejected = False
+    except BenchmarkError:
+        partial_start_rejected = True
+    partial_cleanup, _ = cleanup_memory_sampler_acquisition(
+        partial_memory_runner, partial_acquisition,
+        label=cleanup_artifact_name, settle_seconds=0,
+    )
+    checks["memory_start_success_parse_failure_recovers_only_proven_owner"] = (
+        partial_start_rejected
+        and partial_acquisition.preflight_inactive_proven is True
+        and partial_acquisition.start_attempted is True
+        and partial_acquisition.acquisition_uncertain is True
+        and partial_acquisition.session_id is None
+        and partial_cleanup.get("ownership_proven") is True
+        and partial_cleanup.get("recovered_uncertain_acquisition") is True
+        and partial_cleanup.get("verified_stopped") is True
+        and [payload["action"] for payload in partial_memory_runner.payloads]
+        == ["current", "start", "current", "stop"]
+        and partial_memory_runner.payloads[-1].get("session_id") == partial_memory_id
     )
 
     foreign_memory_id = str(uuid.uuid4()).upper()
@@ -2424,6 +2753,59 @@ def self_test_command(_args: argparse.Namespace) -> int:
         [dict(item, verified_stopped=False) if item["action"] == "stop_memory_sampler" else item for item in run_cleanup],
         run_artifact=True, expected_agent_count=1, expected_worktree_count=1,
     )
+    setup_failure_cleanup = [
+        {"action": "stop_memory_sampler", "ok": True, "verified_stopped": True,
+         "reason": "not_acquired"},
+        {"action": "restore_route", "ok": True, "reason": "not_acquired"},
+        {"action": "reset_diagnostics", "ok": True},
+        {"action": "preserve_benchmark_setting", "ok": True},
+        {"action": "restore_workspace_roots", "ok": True},
+    ]
+    checks["setup_failure_cleanup_is_complete_without_owned_resources"] = validate_cleanup_evidence(
+        setup_failure_cleanup, run_artifact=True,
+        expected_agent_count=0, expected_worktree_count=0,
+    )
+    frozen_matrix_fixture = {
+        "matrix": {
+            "process_states": ["warm", "aged"],
+            "checkout_kinds": ["linked-worktree"],
+            "routes": ["baseline", "forced-full", "projected"],
+            "widths": [1, 4, 8],
+        },
+        "thresholds": {
+            "projected_p95_improvement_minimum": 0.30,
+            "other_p95_regression_maximum": 0.10,
+            "peak_memory_regression_maximum": 0.10,
+        },
+    }
+    frozen_keys = configured_required_matrix_keys(frozen_matrix_fixture)
+    checks["aggregate_uses_exact_frozen_matrix_variants"] = (
+        len(frozen_keys) == 18
+        and all(key.split("/")[0] in {"warm", "aged"} for key in frozen_keys)
+        and all(key.rsplit("/", 1)[1] in {"1", "4", "8"} for key in frozen_keys)
+        and not any("/cold/" in f"/{key}/" or key.endswith("/2") for key in frozen_keys)
+        and frozen_matrix_fixture["thresholds"]["projected_p95_improvement_minimum"] == 0.30
+        and frozen_matrix_fixture["thresholds"]["other_p95_regression_maximum"] == 0.10
+    )
+    fixed_stats = stats([100, 200, 300, 400, 500], positive=True, label="fixed readiness")
+    checks["fixed_percentiles"] = fixed_stats["p50"] == 300 and fixed_stats["p95"] == 500
+    checks["fixed_cv"] = math.isclose(float(fixed_stats["cv"]), math.sqrt(25_000) / 300)
+    checks["confirmation_not_required_at_boundary"] = confirmation_policy(
+        {"control_p95": 100, "candidate_p95": 70, "control_cv": 0.50, "candidate_cv": 0.10},
+        None, minimum_improvement=0.30,
+    )["status"] == "pass"
+    checks["high_variance_requires_confirmation"] = confirmation_policy(
+        {"control_p95": 100, "candidate_p95": 70, "control_cv": 0.51, "candidate_cv": 0.10},
+        None, minimum_improvement=0.30,
+    )["status"] == "high-variance/inconclusive"
+    checks["directional_confirmation_agrees"] = confirmation_policy(
+        {"control_p95": 100, "candidate_p95": 70, "control_cv": 0.51, "candidate_cv": 0.10},
+        {"control_p95": 200, "candidate_p95": 130}, minimum_improvement=0.30,
+    )["status"] == "pass"
+    checks["directional_confirmation_disagrees"] = confirmation_policy(
+        {"control_p95": 100, "candidate_p95": 70, "control_cv": 0.51, "candidate_cv": 0.10},
+        {"control_p95": 200, "candidate_p95": 150}, minimum_improvement=0.30,
+    )["status"] == "high-variance/inconclusive"
     if not all(checks.values()):
         raise BenchmarkError(f"self-test failed: {[name for name, ok in checks.items() if not ok]}")
     print(json.dumps({"status": "completed", "checks": checks}, indent=2, sort_keys=True))
@@ -2490,12 +2872,21 @@ def verify_disposable_target(
 ) -> dict[str, Any]:
     scope = plan["scope"]
     root = Path(scope["root_path"]).resolve(strict=True)
+    real_repository = scope.get("target_kind") == "real-repository-dedicated"
+    if real_repository:
+        if (
+            scope.get("explicit_real_repository_confirmation") is not True
+            or root != repository_root().resolve()
+            or not str(scope.get("workspace_name", "")).startswith("RPCE Search Bench ")
+        ):
+            raise BenchmarkError("real repository target lost its strict dedicated-workspace identity")
     validate_ownership_marker(
         root,
         workspace_id=scope["workspace_id"],
         root_id=scope["root_id"],
         owner_token=scope["owner_token"],
         expected_sha256=scope["ownership_marker_sha256"],
+        allow_real_repository=real_repository,
     )
     inventory = runner.call(
         "workspace-identity", "manage_workspaces", {"action": "list", "include_hidden": True}
@@ -2540,6 +2931,8 @@ def preflight_command(args: argparse.Namespace) -> int:
         raise BenchmarkError("pass --confirm-live-debug-app after verifying the dedicated DEBUG app is already running")
     plan_path = Path(args.plan).expanduser().resolve(strict=True)
     plan = load_plan(plan_path)
+    if plan["scope"].get("target_kind") == "real-repository-dedicated" and not args.confirm_dedicated_workspace:
+        raise BenchmarkError("real-repository preflight requires --confirm-dedicated-workspace")
     cli = resolve_cli(args.cli)
     root = Path(plan["scope"]["root_path"])
     dataset = plan["dataset"]
@@ -2671,28 +3064,141 @@ def first_search_read(
     runner: CLIRunner,
     plan: dict[str, Any],
     correlation: str,
-    context_id: str | None,
-) -> dict[str, bool]:
-    routed = {"context_id": context_id} if context_id else {}
+    context_id: str,
+    worktree_path: Path,
+    worktree_id: str,
+) -> tuple[dict[str, bool], dict[str, Any], dict[str, str]]:
+    routed = {"context_id": context_id}
+    runtime = runner.call(
+        "first-tools-root-identity", DEBUG_TOOL,
+        {"op": "mcp_read_search_runtime_snapshot", "window_id": plan["scope"]["window_id"],
+         "recent_publication_limit": 0, "root_limit": 256}, check=False, context_id=context_id,
+    )
+    physical_root_identity = runtime_root_identity(runtime, str(worktree_path))
+    root_identity = {
+        "id": plan["scope"]["root_id"],
+        "path": plan["scope"]["root_path"],
+        "type": "primary_workspace",
+    }
     mark(runner, plan, correlation, "first_search_started")
-    search = runner.call(
-        "first-search", "file_search",
-        {
-            "pattern": plan["dataset"]["search_marker"], "regex": False, "mode": "content",
-            "filter": {"paths": [plan["dataset"]["read_path"]]}, "max_results": 20,
-            **routed,
-        },
-    )
-    mark(runner, plan, correlation, "first_search_completed")
     mark(runner, plan, correlation, "first_read_started")
-    read = runner.call(
-        "first-read", "read_file",
-        {"path": plan["dataset"]["read_path"], "start_line": 1, "limit": 80, **routed},
+    calls: dict[str, TimedCall] = {}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {
+            pool.submit(
+                runner.timed_call, "first-search", "file_search",
+                {"pattern": plan["dataset"]["search_marker"], "regex": False, "mode": "content",
+                 "filter": {"paths": [plan["dataset"]["read_path"]]}, "max_results": 20, **routed},
+                context_id=context_id,
+            ): "search",
+            pool.submit(
+                runner.timed_call, "first-read", "read_file",
+                {"path": plan["dataset"]["read_path"], "start_line": 1, "limit": 80, **routed},
+                context_id=context_id,
+            ): "read",
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            calls[name] = future.result()
+            mark(runner, plan, correlation, f"first_{name}_completed")
+    search_evidence = structured_success_evidence(
+        calls["search"].response, "file_search", expected_root_id=root_identity["id"],
+        expected_root_path=root_identity["path"], expected_root_type=root_identity["type"],
+        expected_file_path=plan["dataset"]["read_path"], expected_file_type="file",
+        expected_content=plan["dataset"]["search_marker"],
+        expected_worktree_id=worktree_id,
+        expected_physical_worktree_path=str(worktree_path),
     )
-    mark(runner, plan, correlation, "first_read_completed")
+    read_evidence = structured_success_evidence(
+        calls["read"].response, "read_file", expected_root_id=root_identity["id"],
+        expected_root_path=root_identity["path"], expected_root_type=root_identity["type"],
+        expected_file_path=plan["dataset"]["read_path"], expected_file_type="file",
+        expected_content=plan["dataset"]["read_marker"],
+        expected_worktree_id=worktree_id,
+        expected_physical_worktree_path=str(worktree_path),
+    )
+    evidence = {
+        "concurrent": max(calls["search"].started_ns, calls["read"].started_ns)
+        <= min(calls["search"].finished_ns, calls["read"].finished_ns),
+        "search_duration_us": (calls["search"].finished_ns - calls["search"].started_ns) / 1000,
+        "read_duration_us": (calls["read"].finished_ns - calls["read"].started_ns) / 1000,
+        "search": search_evidence, "read": read_evidence,
+        "physical_runtime_root": physical_root_identity,
+    }
+    return {"search": search_evidence["ok"], "read": read_evidence["ok"]}, evidence, root_identity
+
+
+def collect_follow_on_evidence(
+    runner: CLIRunner, plan: dict[str, Any], correlation: str, context_id: str,
+    root_identity: dict[str, str], worktree_id: str, worktree_path: Path,
+) -> dict[str, Any]:
+    path = plan["dataset"]["read_path"]
+    parent = str(Path(path).parent)
+    # RepoPrompt intentionally displays the logical canonical root for
+    # session-bound worktree tools. The first search/read probes separately
+    # prove the physical effective worktree; follow-on tools must therefore
+    # validate the logical binding plus their structured worktree_scope.
+    logical_root_id = plan["scope"]["root_id"]
+    logical_root_path = plan["scope"]["root_path"]
+    logical_root_type = "primary_workspace"
+    structures: list[dict[str, Any]] = []
+    for mark_prefix, label in (("first_codemap", "first-codemap"), ("warm_codemap", "warm-codemap")):
+        mark(runner, plan, correlation, f"{mark_prefix}_started")
+        timed = runner.timed_call(
+            label, "get_code_structure", {"scope": "paths", "paths": [path], "context_id": context_id},
+            check=False, context_id=context_id,
+        )
+        mark(runner, plan, correlation, f"{mark_prefix}_completed")
+        item = codemap_structure_evidence(
+            timed.response, expected_root_id=logical_root_id, expected_root_path=logical_root_path,
+            expected_root_type=logical_root_type, expected_file_path=path,
+            expected_marker=plan["dataset"]["read_marker"], expected_file_type=plan["dataset"]["code_file_type"],
+            expected_worktree_id=worktree_id,
+            expected_physical_worktree_path=str(worktree_path),
+        )
+        item["duration_us"] = (timed.finished_ns - timed.started_ns) / 1000
+        structures.append(item)
+    mark(runner, plan, correlation, "passive_tree_started")
+    tree = runner.timed_call(
+        "passive-tree", "get_file_tree",
+        {"type": "files", "mode": "full", "path": parent, "max_depth": 1, "context_id": context_id},
+        check=False, context_id=context_id,
+    )
+    mark(runner, plan, correlation, "passive_tree_completed")
+    try:
+        tree_evidence = codemap_tree_marker_evidence(
+        tree.response, expected_context_id=context_id, expected_root_path=logical_root_path,
+            requested_parent=parent, expected_file_path=path,
+            expected_worktree_id=worktree_id,
+            expected_physical_worktree_path=str(worktree_path),
+        )
+        tree_evidence["ok"] = True
+    except BenchmarkError as error:
+        tree_evidence = {"ok": False, "error": str(error)}
+    tree_evidence["duration_us"] = (tree.finished_ns - tree.started_ns) / 1000
+    mark(runner, plan, correlation, "selection_started")
+    selection = runner.timed_call(
+        "selection-set", "manage_selection",
+        {"op": "set", "paths": [path], "mode": "full", "context_id": context_id},
+        check=False, context_id=context_id,
+    )
+    mark(runner, plan, correlation, "selection_completed")
+    selected = runner.call(
+        "selection-get", "manage_selection", {"op": "get", "view": "files", "context_id": context_id},
+        check=False, context_id=context_id,
+    )
+    selection_evidence = structured_success_evidence(
+        selected, "manage_selection", expected_root_id=logical_root_id,
+        expected_root_path=logical_root_path, expected_root_type=logical_root_type,
+        expected_file_path=path, expected_file_type="file",
+        expected_worktree_id=worktree_id,
+        expected_physical_worktree_path=str(worktree_path),
+    )
     return {
-        "search_marker_present": plan["dataset"]["search_marker"] in response_text(search),
-        "read_marker_present": plan["dataset"]["read_marker"] in response_text(read),
+        "ok": all(item.get("ok") for item in structures) and tree_evidence.get("ok") is True
+        and call_succeeded(selection.response) and selection_evidence.get("ok") is True,
+        "codemap": structures, "tree": tree_evidence,
+        "selection": {**selection_evidence, "duration_us": (selection.finished_ns - selection.started_ns) / 1000},
     }
 
 
@@ -2822,6 +3328,63 @@ def validate_resource_evidence(value: Any) -> list[str]:
     return failures
 
 
+def validate_boundary_evidence(sample: dict[str, Any]) -> list[str]:
+    boundaries = sample.get("operation_boundaries_us")
+    durations = sample.get("durations_us")
+    failures: list[str] = []
+    if sample.get("boundary_evidence_available") is not True:
+        failures.append("boundary_evidence_unavailable")
+    reasons = sample.get("boundary_invalid_reasons")
+    if not isinstance(reasons, list) or reasons:
+        failures.append("boundary_evidence_reported_invalid")
+    if not isinstance(boundaries, dict):
+        return failures + ["invalid_operation_boundaries"]
+    if set(REQUIRED_BOUNDARY_KEYS) - set(boundaries):
+        failures.append("missing_required_operation_boundaries")
+    if any(not finite_number(boundaries.get(key)) for key in REQUIRED_BOUNDARY_KEYS):
+        failures.append("invalid_operation_boundaries")
+        return failures
+
+    def ordered(before: str, after: str) -> bool:
+        return float(boundaries[before]) <= float(boundaries[after])
+
+    ordering = [
+        ("bindingTransitionStarted", "rootReady"),
+        ("rootReady", "firstBenchmarkSearchStarted"),
+        ("rootReady", "firstBenchmarkReadStarted"),
+        ("firstBenchmarkSearchStarted", "firstBenchmarkSearchCompleted"),
+        ("firstBenchmarkReadStarted", "firstBenchmarkReadCompleted"),
+        ("firstBenchmarkSearchCompleted", "firstBenchmarkCodemapStarted"),
+        ("firstBenchmarkReadCompleted", "firstBenchmarkCodemapStarted"),
+        ("firstBenchmarkCodemapStarted", "firstBenchmarkCodemapCompleted"),
+        ("firstBenchmarkCodemapCompleted", "warmBenchmarkCodemapStarted"),
+        ("warmBenchmarkCodemapStarted", "warmBenchmarkCodemapCompleted"),
+        ("warmBenchmarkCodemapCompleted", "passiveBenchmarkTreeStarted"),
+        ("passiveBenchmarkTreeStarted", "passiveBenchmarkTreeCompleted"),
+        ("passiveBenchmarkTreeCompleted", "benchmarkSelectionStarted"),
+        ("benchmarkSelectionStarted", "benchmarkSelectionCompleted"),
+    ]
+    if not all(ordered(before, after) for before, after in ordering):
+        failures.append("non_monotonic_operation_boundaries")
+    if not isinstance(durations, dict):
+        return failures + ["invalid_sample_durations"]
+    for metric, (start, end) in BOUNDARY_DURATION_PAIRS.items():
+        duration = durations.get(metric)
+        if finite_number(duration, positive=True):
+            expected = float(boundaries[end]) - float(boundaries[start])
+            if expected <= 0 or not math.isclose(float(duration), expected, abs_tol=1.0):
+                failures.append(f"inconsistent_{metric}_duration")
+    interactive = sample.get("interactive_readiness_us")
+    if finite_number(interactive, positive=True):
+        expected_interactive = max(
+            float(boundaries["firstBenchmarkSearchCompleted"]),
+            float(boundaries["firstBenchmarkReadCompleted"]),
+        ) - float(boundaries["bindingTransitionStarted"])
+        if not math.isclose(float(interactive), expected_interactive, abs_tol=1.0):
+            failures.append("interactive_readiness_boundary_mismatch")
+    return failures
+
+
 def validate_export(
     export: dict[str, Any],
     route: str,
@@ -2833,7 +3396,9 @@ def validate_export(
     expected_ordinal: int,
 ) -> list[str]:
     failures: list[str] = []
-    sample = find_value(export, "sample")
+    if export.get("schema_version") != DIAGNOSTIC_SCHEMA_VERSION:
+        failures.append("diagnostic_schema_mismatch")
+    sample = export.get("sample")
     if not isinstance(sample, dict):
         return ["missing_sample"]
     if sample.get("valid") is not True:
@@ -2868,14 +3433,72 @@ def validate_export(
         durations = {}
     elif any(not finite_number(value, positive=True) for value in durations.values()):
         failures.append("invalid_sample_durations")
-    for metric in ALL_METRICS:
+    for metric in DURATION_METRICS:
         if metric not in durations:
             failures.append(f"missing_{metric}")
-    git = find_value(export, "git")
+    interactive = sample.get("interactive_readiness_us")
+    if not finite_number(interactive, positive=True):
+        failures.append("invalid_interactive_readiness_us")
+    else:
+        search = durations.get("materialize_to_first_search")
+        read = durations.get("materialize_to_first_read")
+        if finite_number(search, positive=True) and finite_number(read, positive=True):
+            if not math.isclose(float(interactive), max(float(search), float(read)), abs_tol=1.0):
+                failures.append("interactive_readiness_mismatch")
+    failures.extend(validate_boundary_evidence(sample))
+    git = export.get("git")
     failures.extend(validate_git_evidence(git))
-    work = find_value(export, "work")
+    work = export.get("work")
     filesystem = work.get("filesystem") if isinstance(work, dict) else None
     failures.extend(validate_filesystem_evidence(filesystem))
+    planner = work.get("planner") if isinstance(work, dict) else None
+    expected_planner = {"targetNamespace", "treeEvidence", "indexEvidence", "statusEvidence", "reconcile"}
+    if not isinstance(planner, dict):
+        failures.append("invalid_planner_evidence")
+    elif route == "projected" and set(planner) != expected_planner:
+        failures.append("incomplete_planner_evidence")
+    elif any(
+        not isinstance(value, dict)
+        or not nonnegative_integer(value.get("count"))
+        or not finite_number(value.get("duration_us"))
+        or not nonnegative_integer(value.get("item_count"))
+        for value in planner.values()
+    ):
+        failures.append("invalid_planner_evidence")
+    mutation = work.get("mutation_lock") if isinstance(work, dict) else None
+    if not isinstance(mutation, dict) or mutation.get("available") is not True:
+        failures.append("mutation_lock_evidence_unavailable")
+    elif (
+        not positive_integer(mutation.get("count"))
+        or any(not finite_number(mutation.get(field)) for field in (
+            "queue_wait_us", "held_us", "mutation_us", "post_mutation_finalization_us"
+        ))
+    ):
+        failures.append("invalid_mutation_lock_evidence")
+    passive = work.get("passive_tree") if isinstance(work, dict) else None
+    if not isinstance(passive, dict) or not isinstance(passive.get("available"), bool):
+        failures.append("invalid_passive_tree_evidence")
+    elif passive.get("available") is not True or passive.get("operation_count", 0) < 1:
+        failures.append("passive_tree_evidence_unavailable")
+    elif (
+        not nonnegative_integer(passive.get("operation_count"))
+        or not finite_number(passive.get("duration_us"))
+    ):
+        failures.append("invalid_passive_tree_evidence")
+    markers = work.get("marker_publications") if isinstance(work, dict) else None
+    if not isinstance(markers, list) or any(
+        not isinstance(item, dict)
+        or not all(isinstance(item.get(key), str) and item.get(key) for key in (
+            "root_id", "root_lifetime_id", "source"
+        ))
+        or not nonnegative_integer(item.get("revision"))
+        or not positive_integer(item.get("effective_change_count"))
+        or not finite_number(item.get("timestamp_us"))
+        for item in markers
+    ):
+        failures.append("invalid_marker_publication_evidence")
+    elif not markers:
+        failures.append("marker_publication_evidence_unavailable")
     return failures
 
 
@@ -2966,6 +3589,19 @@ def run_command(args: argparse.Namespace) -> int:
         raise BenchmarkError("run requires --confirm-live-debug-app and --confirm-process-state")
     plan_path = Path(args.plan).expanduser().resolve(strict=True)
     plan = load_plan(plan_path)
+    configured_states, configured_checkouts, configured_routes, configured_widths = configured_matrix_variants(plan)
+    if args.process_state not in configured_states:
+        raise BenchmarkError("run process state was not declared by the frozen plan")
+    if args.checkout_kind not in configured_checkouts:
+        raise BenchmarkError("run checkout kind was not declared by the frozen plan")
+    if args.route not in configured_routes:
+        raise BenchmarkError("run route was not declared by the frozen plan")
+    if args.width not in configured_widths:
+        raise BenchmarkError("run width was not declared by the frozen plan")
+    if plan["scope"].get("target_kind") == "real-repository-dedicated" and not args.confirm_dedicated_workspace:
+        raise BenchmarkError("real-repository runs require --confirm-dedicated-workspace")
+    if args.warmups != FIXED_WARMUPS or args.samples != FIXED_RETAINED_SAMPLES:
+        raise BenchmarkError("run requires one excluded warmup and exactly five retained samples")
     cli = resolve_cli(args.cli)
     root = Path(plan["scope"]["root_path"])
     validate_planned_base_commit(plan, root)
@@ -2988,17 +3624,24 @@ def run_command(args: argparse.Namespace) -> int:
         session_count = sum(1 for item in walk_json(inventory) if isinstance(item, dict) and "session_id" in item)
         if session_count < args.minimum_aged_sessions:
             raise BenchmarkError(f"aged cohort requires at least {args.minimum_aged_sessions} existing sessions; found {session_count}")
-    control_id, control_response = set_route(runner, plan, args.route)
-    state["control_id"] = control_id
-    state["control_response"] = control_response
-    save_json(artifact / "state.json", state)
-    memory_session_id, _ = start_owned_memory_sampler(runner, artifact.name)
-    state["memory_session_id"] = memory_session_id
-    save_json(artifact / "state.json", state)
+    control_id: str | None = None
+    memory_session_id: str | None = None
+    memory_acquisition = MemorySamplerAcquisition(label=artifact.name)
     invocation = args.invocation
     sample_records: list[dict[str, Any]] = []
     operational_error: str | None = None
+    cleanup: list[dict[str, Any]] = []
     try:
+        control_id, control_response = set_route(runner, plan, args.route)
+        state["control_id"] = control_id
+        state["control_response"] = control_response
+        save_json(artifact / "state.json", state)
+        memory_session_id, memory_start_response = start_owned_memory_sampler(
+            runner, artifact.name, memory_acquisition
+        )
+        state["memory_session_id"] = memory_session_id
+        state["memory_start_response_recorded"] = call_succeeded(memory_start_response)
+        save_json(artifact / "state.json", state)
         total_groups = args.warmups + args.samples
         global_ordinal = 0
         for group in range(total_groups):
@@ -3032,10 +3675,25 @@ def run_command(args: argparse.Namespace) -> int:
                 if context_id is None:
                     raise BenchmarkError("agent start omitted the child context_id")
                 owned_worktree = discover_owned_worktree(start, root, branch)
+                worktree_id, bound_worktree_path = exact_response_worktree_binding(
+                    start, owned_worktree
+                )
+                if bound_worktree_path != str(owned_worktree):
+                    raise BenchmarkError("agent worktree binding path changed after discovery")
                 state["sessions"].append({"session_id": session_id, "context_id": context_id, "terminal": False})
-                state["worktrees"].append({"path": str(owned_worktree), "owned": True, "branch": branch})
+                state["worktrees"].append({
+                    "path": str(owned_worktree), "worktree_id": worktree_id,
+                    "owned": True, "branch": branch,
+                })
                 save_json(artifact / "state.json", state)
-                correctness = first_search_read(runner, plan, correlation, context_id)
+                correctness, direct_tools, root_identity = first_search_read(
+                    runner, plan, correlation, context_id, owned_worktree, worktree_id
+                )
+                follow_on = collect_follow_on_evidence(
+                    runner, plan, correlation, context_id, root_identity,
+                    worktree_id, owned_worktree
+                )
+                correctness["follow_on"] = follow_on["ok"]
                 exported = runner.call(
                     f"export-{ordinal}", DEBUG_TOOL,
                     diagnostic_payload(plan, "export", correlation_id=correlation),
@@ -3059,6 +3717,7 @@ def run_command(args: argparse.Namespace) -> int:
                     "ordinal": ordinal, "warmup": warmup, "correlation_id": correlation,
                     "session_id": session_id,
                     "context_id": context_id, "correctness": correctness,
+                    "direct_tool_evidence": direct_tools, "follow_on_evidence": follow_on,
                     "valid": not failures, "invalid_reasons": failures, "diagnostic": export_payload,
                 }
                 sample_records.append(record)
@@ -3067,48 +3726,81 @@ def run_command(args: argparse.Namespace) -> int:
     except BaseException as error:
         operational_error = repr(error)
     finally:
-        memory_stopped, resources = stop_owned_memory_sampler(
-            runner, memory_session_id, label="memory-stop",
-        )
+        state["cleanup_entered"] = True
+        try:
+            memory_cleanup, resources = cleanup_memory_sampler_acquisition(
+                runner, memory_acquisition, label=artifact.name,
+            )
+        except BaseException as cleanup_error:
+            memory_cleanup = {
+                "action": "stop_memory_sampler", "ok": False,
+                "verified_stopped": False, "stop_attempted": False,
+                "manual_cleanup": True,
+                "reason": f"memory sampler cleanup failed: {cleanup_error!r}",
+            }
+            resources = {
+                "available": False,
+                "reason": "sampler_cleanup_failed",
+                "error": repr(cleanup_error),
+            }
         save_json(artifact / "resources.json", resources, exclusive=True)
-        state["memory_stopped"] = memory_stopped
-        restore_response = runner.call(
-            "restore-route", DEBUG_TOOL,
-            diagnostic_payload(plan, "restore_flags", control_id=control_id), check=False,
-        )
-        state["route_restored"] = call_succeeded(restore_response)
-        reset_response = runner.call(
-            "reset-scope", DEBUG_TOOL, diagnostic_payload(plan, "reset"), check=False
-        )
-        state["scope_reset"] = call_succeeded(reset_response) and isinstance(find_value(reset_response, "reset"), dict)
+        state["memory_stopped"] = memory_cleanup.get("verified_stopped") is True
+        state["route_restored"] = control_id is None
+        if control_id is not None:
+            try:
+                restore_response = runner.call(
+                    "restore-route", DEBUG_TOOL,
+                    diagnostic_payload(plan, "restore_flags", control_id=control_id), check=False,
+                )
+                state["route_restored"] = call_succeeded(restore_response)
+            except BaseException:
+                state["route_restored"] = False
+        try:
+            reset_response = runner.call(
+                "reset-scope", DEBUG_TOOL, diagnostic_payload(plan, "reset"), check=False
+            )
+            state["scope_reset"] = call_succeeded(reset_response) and isinstance(
+                find_value(reset_response, "reset"), dict
+            )
+        except BaseException:
+            state["scope_reset"] = False
         try:
             require_benchmark_gate(runner)
             state["benchmark_gate_unchanged"] = True
         except BenchmarkError:
             state["benchmark_gate_unchanged"] = False
-        cleanup: list[dict[str, Any]] = []
         for session in state["sessions"]:
-            if not session.get("terminal"):
-                session["status"] = terminalize(runner, session["session_id"])
-                session["terminal"] = session["status"] in TERMINAL_STATES
+            try:
+                if not session.get("terminal"):
+                    session["status"] = terminalize(runner, session["session_id"])
+                    session["terminal"] = session["status"] in TERMINAL_STATES
+            except BaseException as cleanup_error:
+                session["status"] = f"cleanup_error:{cleanup_error!r}"
+                session["terminal"] = False
             cleanup.append({
                 "action": "terminalize_agent", "session_id": session["session_id"],
                 "status": session.get("status"), "terminal": session.get("terminal") is True,
             })
         cleanup.extend([
+            memory_cleanup,
             {
-                "action": "stop_memory_sampler", "ok": state["memory_stopped"],
-                "verified_stopped": state["memory_stopped"],
+                "action": "restore_route", "ok": state["route_restored"],
+                "reason": "not_acquired" if control_id is None else None,
             },
-            {"action": "restore_route", "ok": state["route_restored"]},
             {"action": "reset_diagnostics", "ok": state["scope_reset"]},
             {"action": "preserve_benchmark_setting", "ok": state["benchmark_gate_unchanged"]},
         ])
         for worktree in {item["path"]: item for item in state["worktrees"]}.values():
-            cleanup.append(clean_owned_worktree(
-                root, worktree["path"], all(item.get("terminal") for item in state["sessions"]),
-                expected_branch=worktree.get("branch"),
-            ))
+            try:
+                cleanup.append(clean_owned_worktree(
+                    root, worktree["path"], all(item.get("terminal") for item in state["sessions"]),
+                    expected_branch=worktree.get("branch"),
+                ))
+            except BaseException as cleanup_error:
+                cleanup.append({
+                    "action": "remove_worktree", "path": worktree["path"],
+                    "removed": False, "reason": f"cleanup_error:{cleanup_error!r}",
+                })
         final_target_ok = False
         try:
             verify_disposable_target(runner, plan, require_only_planned_root=True)
@@ -3578,6 +4270,8 @@ def codemap_structure_evidence(
     expected_file_path: str,
     expected_marker: str,
     expected_file_type: str,
+    expected_worktree_id: str | None = None,
+    expected_physical_worktree_path: str | None = None,
 ) -> dict[str, Any]:
     if not call_succeeded(value):
         raise BenchmarkError("get_code_structure transport/tool call failed")
@@ -3587,6 +4281,8 @@ def codemap_structure_evidence(
         expected_root_id=expected_root_id,
         expected_root_path=expected_root_path,
         expected_root_type=expected_root_type,
+        expected_worktree_id=expected_worktree_id,
+        expected_physical_worktree_path=expected_physical_worktree_path,
     )
     if record.get("status") != "ready":
         raise BenchmarkError(f"get_code_structure returned {record.get('status')!r}, not ready")
@@ -3625,6 +4321,8 @@ def codemap_tree_marker_evidence(
     expected_root_path: str,
     requested_parent: str,
     expected_file_path: str,
+    expected_worktree_id: str | None = None,
+    expected_physical_worktree_path: str | None = None,
 ) -> dict[str, Any]:
     if not call_succeeded(value):
         raise BenchmarkError("get_file_tree transport/tool call failed")
@@ -3657,6 +4355,13 @@ def codemap_tree_marker_evidence(
     if canonical_file.parent != canonical_parent:
         raise BenchmarkError("get_file_tree expected file was not a direct child of its parent")
     payload = tool_payload(value, "get_file_tree")
+    if expected_worktree_id is not None and expected_physical_worktree_path is not None:
+        validate_worktree_scope(
+            payload,
+            expected_logical_root_path=expected_root_path,
+            expected_worktree_id=expected_worktree_id,
+            expected_physical_worktree_path=expected_physical_worktree_path,
+        )
     tree = payload.get("tree")
     if not isinstance(tree, str) or payload.get("uses_legend") is not True:
         raise BenchmarkError("get_file_tree omitted its exact codemap marker legend")
@@ -5118,8 +5823,8 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
     active_hold: str | None = None
     active_hold_target_root_id: str | None = None
     watcher_paths: list[str] = []
-    memory_started = False
     memory_session_id: str | None = None
+    memory_acquisition = MemorySamplerAcquisition(label=artifact.name)
     operational_error: str | None = None
     resources: Any = {}
 
@@ -5136,10 +5841,11 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             raise BenchmarkError("codemap root identity snapshot failed")
         root_identity = runtime_root_identity(runtime, str(root))
         start_snapshot = codemap_debug_action(runner, plan, "codemap_projection_snapshot")["snapshot"]
-        memory_session_id, _ = start_owned_memory_sampler(runner, artifact.name)
+        memory_session_id, _ = start_owned_memory_sampler(
+            runner, artifact.name, memory_acquisition
+        )
         state["memory_session_id"] = memory_session_id
         save_json(artifact / "state.json", state)
-        memory_started = True
 
         cold_provenance: list[dict[str, Any]] = []
         for cohort, key in (("individual", "individuals"), ("directory", "directories")):
@@ -6058,7 +6764,8 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         memory_stopped, resources = stop_owned_memory_sampler(
             runner, memory_session_id, label="codemap-memory-stop",
         )
-        memory_started = False
+        memory_acquisition.stop_verified = memory_stopped
+        memory_acquisition.stop_response = resources
         state["memory_stopped"] = memory_stopped
     except BaseException as error:
         operational_error = repr(error)
@@ -6149,15 +6856,23 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             if isinstance(cleaned.get("path"), str):
                 cleaned["path_sha256"] = sha256_bytes(cleaned.pop("path").encode())
             cleanup.append(cleaned)
-        if memory_started and memory_session_id is not None:
-            memory_stopped, resources = stop_owned_memory_sampler(
-                runner, memory_session_id, label="codemap-finally-memory-stop",
+        try:
+            memory_cleanup, resources = cleanup_memory_sampler_acquisition(
+                runner, memory_acquisition, label=artifact.name,
             )
-            state["memory_stopped"] = memory_stopped
-        cleanup.append({
-            "action": "stop_memory_sampler", "ok": state["memory_stopped"],
-            "verified_stopped": state["memory_stopped"],
-        })
+        except BaseException as cleanup_error:
+            memory_cleanup = {
+                "action": "stop_memory_sampler", "ok": False,
+                "verified_stopped": False, "stop_attempted": False,
+                "manual_cleanup": True,
+                "reason": f"memory sampler cleanup failed: {cleanup_error!r}",
+            }
+            resources = {
+                "available": False, "reason": "sampler_cleanup_failed",
+                "error": repr(cleanup_error),
+            }
+        state["memory_stopped"] = memory_cleanup.get("verified_stopped") is True
+        cleanup.append(memory_cleanup)
         try:
             require_benchmark_gate(runner)
             state["benchmark_gate_unchanged"] = True
@@ -6373,6 +7088,18 @@ def diagnostic_number(
     return float(number) if finite_number(number) else None
 
 
+def sample_metric_number(item: dict[str, Any], metric: str) -> float | None:
+    sample = find_value(item.get("diagnostic"), "sample")
+    if not isinstance(sample, dict):
+        return None
+    if metric == "interactive_readiness_us":
+        value = sample.get(metric)
+    else:
+        durations = sample.get("durations_us")
+        value = durations.get(metric) if isinstance(durations, dict) else None
+    return float(value) if finite_number(value, positive=True) else None
+
+
 def absolute_memory_regression(control: Iterable[float], candidate: Iterable[float]) -> float | None:
     control_values = [float(value) for value in control]
     candidate_values = [float(value) for value in candidate]
@@ -6466,7 +7193,36 @@ def memory_sampler_record(value: Any, action: str) -> dict[str, Any]:
     return record
 
 
-def start_owned_memory_sampler(runner: CLIRunner, label: str) -> tuple[str, Any]:
+@dataclass
+class MemorySamplerAcquisition:
+    label: str
+    preflight_inactive_proven: bool = False
+    start_attempted: bool = False
+    session_id: str | None = None
+    acquisition_uncertain: bool = False
+    stop_verified: bool = False
+    stop_response: Any = None
+
+
+def start_owned_memory_sampler(
+    runner: CLIRunner,
+    label: str,
+    acquisition: MemorySamplerAcquisition | None = None,
+) -> tuple[str, Any]:
+    owner = acquisition or MemorySamplerAcquisition(label=label)
+    if owner.label != label or owner.start_attempted:
+        raise BenchmarkError("memory sampler acquisition handle was invalid or already used")
+    current = runner.call(
+        f"{safe_name(label)}-memory-preflight", DEBUG_TOOL,
+        {"op": "large_workspace_memory", "action": "current"},
+        timeout=60, check=False,
+    )
+    current_record = memory_sampler_record(current, "current")
+    if current_record.get("running") is not False:
+        raise BenchmarkError("memory sampler start requires a proven inactive global sampler")
+    owner.preflight_inactive_proven = True
+    owner.start_attempted = True
+    owner.acquisition_uncertain = True
     response = runner.call(
         f"{safe_name(label)}-memory-start", DEBUG_TOOL,
         {"op": "large_workspace_memory", "action": "start", "label": label,
@@ -6476,6 +7232,11 @@ def start_owned_memory_sampler(runner: CLIRunner, label: str) -> tuple[str, Any]
     session_id = validate_uuid(str(record["session_id"]), "memory session-id")
     if record.get("running") is not True:
         raise BenchmarkError("owned memory sampler did not start")
+    session = record.get("session")
+    if not isinstance(session, dict) or session.get("label") != label:
+        raise BenchmarkError("owned memory sampler start returned the wrong owner label")
+    owner.session_id = session_id
+    owner.acquisition_uncertain = False
     return session_id, response
 
 
@@ -6500,6 +7261,98 @@ def stop_owned_memory_sampler(
     except BenchmarkError:
         ok = False
     return ok, response
+
+
+def cleanup_memory_sampler_acquisition(
+    runner: CLIRunner,
+    acquisition: MemorySamplerAcquisition,
+    *,
+    label: str,
+    settle_seconds: float = 2,
+) -> tuple[dict[str, Any], Any]:
+    if acquisition.label != label:
+        return ({
+            "action": "stop_memory_sampler", "ok": False, "verified_stopped": False,
+            "stop_attempted": False, "manual_cleanup": True,
+            "reason": "memory sampler cleanup label did not match the acquisition handle",
+        }, {"available": False, "reason": "acquisition_label_mismatch"})
+    if acquisition.stop_verified:
+        return ({
+            "action": "stop_memory_sampler", "ok": True, "verified_stopped": True,
+            "stop_attempted": True, "ownership_proven": True,
+            "reason": "owned_session_already_stopped",
+        }, acquisition.stop_response)
+    if acquisition.session_id is not None:
+        stopped, response = stop_owned_memory_sampler(
+            runner, acquisition.session_id, label=label,
+            settle_seconds=settle_seconds,
+        )
+        return ({
+            "action": "stop_memory_sampler", "ok": stopped,
+            "verified_stopped": stopped, "stop_attempted": True,
+            "ownership_proven": True,
+            "session_id_sha256": sha256_bytes(acquisition.session_id.encode()),
+        }, response)
+    if not acquisition.start_attempted:
+        return ({
+            "action": "stop_memory_sampler", "ok": True, "verified_stopped": True,
+            "stop_attempted": False, "ownership_proven": True,
+            "reason": "start_not_attempted",
+        }, {"available": False, "reason": "sampler_start_not_attempted"})
+    if not acquisition.preflight_inactive_proven:
+        return ({
+            "action": "stop_memory_sampler", "ok": False, "verified_stopped": False,
+            "stop_attempted": False, "manual_cleanup": True,
+            "reason": "uncertain sampler acquisition lacked an inactive preflight",
+        }, {"available": False, "reason": "sampler_ownership_unproven"})
+
+    current = runner.call(
+        "cleanup-memory-uncertain-current", DEBUG_TOOL,
+        {"op": "large_workspace_memory", "action": "current"},
+        timeout=60, check=False,
+    )
+    try:
+        record = memory_sampler_record(current, "current")
+    except BenchmarkError as error:
+        return ({
+            "action": "stop_memory_sampler", "ok": False, "verified_stopped": False,
+            "stop_attempted": False, "manual_cleanup": True,
+            "reason": f"uncertain sampler acquisition could not be resolved: {error}",
+        }, current)
+    if record.get("running") is False:
+        return ({
+            "action": "stop_memory_sampler", "ok": True, "verified_stopped": True,
+            "stop_attempted": False, "ownership_proven": True,
+            "observed_running": False, "reason": "uncertain_start_observed_inactive",
+        }, current)
+    session = record.get("session")
+    current_id = record.get("session_id")
+    try:
+        proven_id = validate_uuid(str(current_id), "uncertain memory session-id")
+        ownership_proven = (
+            isinstance(session, dict)
+            and session.get("label") == acquisition.label
+            and validate_uuid(str(session.get("id")), "uncertain nested memory session-id")
+            == proven_id
+        )
+    except BenchmarkError:
+        ownership_proven = False
+        proven_id = None
+    if not ownership_proven or proven_id is None:
+        return ({
+            "action": "stop_memory_sampler", "ok": False, "verified_stopped": False,
+            "stop_attempted": False, "manual_cleanup": True,
+            "reason": "uncertain sampler acquisition resolved to a foreign or unproven owner",
+        }, current)
+    stopped, response = stop_owned_memory_sampler(
+        runner, proven_id, label=label, settle_seconds=settle_seconds,
+    )
+    return ({
+        "action": "stop_memory_sampler", "ok": stopped,
+        "verified_stopped": stopped, "stop_attempted": True,
+        "ownership_proven": True, "recovered_uncertain_acquisition": True,
+        "session_id_sha256": sha256_bytes(proven_id.encode()),
+    }, response)
 
 
 def verify_resumed_memory_sampler_inactive(
@@ -6600,6 +7453,34 @@ def render_scoreboard(summary: dict[str, Any]) -> str:
     lines.append(f"- Invalid retained samples: `{summary['invalid_retained_samples']}`")
     lines.append(f"- Artifact directories: `{', '.join(summary['artifacts'])}`")
     return "\n".join(lines) + "\n"
+
+
+def configured_matrix_variants(plan: dict[str, Any]) -> tuple[list[str], list[str], list[str], list[int]]:
+    matrix = plan.get("matrix")
+    if not isinstance(matrix, dict):
+        raise BenchmarkError("plan omitted benchmark matrix")
+    states = matrix.get("process_states")
+    checkouts = matrix.get("checkout_kinds")
+    routes = matrix.get("routes")
+    widths = matrix.get("widths")
+    if (
+        not isinstance(states, list) or not states
+        or not isinstance(checkouts, list) or not checkouts
+        or not isinstance(routes, list) or not routes
+        or not isinstance(widths, list) or not widths
+        or not all(isinstance(item, str) and item for item in states + checkouts + routes)
+        or not all(positive_integer(item) for item in widths)
+    ):
+        raise BenchmarkError("plan benchmark matrix variants were invalid")
+    return states, checkouts, routes, widths
+
+
+def configured_required_matrix_keys(plan: dict[str, Any]) -> set[str]:
+    states, checkouts, routes, widths = configured_matrix_variants(plan)
+    return {
+        f"{state}/{checkout}/{route}/{width}"
+        for state in states for checkout in checkouts for route in routes for width in widths
+    }
 
 
 def aggregate_command(args: argparse.Namespace) -> int:
@@ -6804,11 +7685,9 @@ def aggregate_command(args: argparse.Namespace) -> int:
             "metrics": {
                 metric: stats(
                     (
-                        item["diagnostic"]["sample"]["durations_us"][metric]
+                        value
                         for item in retained
-                        if isinstance(item.get("diagnostic"), dict)
-                        and isinstance(item["diagnostic"].get("sample"), dict)
-                        and metric in (item["diagnostic"]["sample"].get("durations_us") or {})
+                        if (value := sample_metric_number(item, metric)) is not None
                     ),
                     positive=True,
                     label=f"sample {metric}",
@@ -6856,19 +7735,23 @@ def aggregate_command(args: argparse.Namespace) -> int:
     invalid_memory_baseline = False
     expected_comparisons = 0
     expected_memory_comparisons = 0
-    for state in ("cold", "warm", "aged"):
-        for checkout in ("linked-worktree",):
-            for width in (1, 2, 4, 8):
+    states, checkouts, _configured_routes, widths = configured_matrix_variants(plan)
+    thresholds = plan["thresholds"]
+    primary_improvement = float(thresholds["projected_p95_improvement_minimum"])
+    secondary_regression = float(thresholds["other_p95_regression_maximum"])
+    memory_regression = float(thresholds["peak_memory_regression_maximum"])
+    for state in states:
+        for checkout in checkouts:
+            for width in widths:
                 forced = cohorts.get(f"{state}/{checkout}/forced-full/{width}")
                 projected = cohorts.get(f"{state}/{checkout}/projected/{width}")
-                for metric in METRICS:
-                    expected_comparisons += 1
-                    ratio = gate_ratio(
-                        forced and forced["metrics"][metric]["p95"],
-                        projected and projected["metrics"][metric]["p95"],
-                    )
-                    if ratio is not None:
-                        improvement_values.append(ratio)
+                expected_comparisons += 1
+                ratio = gate_ratio(
+                    forced and forced["metrics"]["interactive_readiness_us"]["p95"],
+                    projected and projected["metrics"]["interactive_readiness_us"]["p95"],
+                )
+                if ratio is not None:
+                    improvement_values.append(ratio)
                 for metric in TOOL_METRICS:
                     forced_p95 = forced and forced["metrics"][metric]["p95"]
                     projected_p95 = projected and projected["metrics"][metric]["p95"]
@@ -6890,8 +7773,8 @@ def aggregate_command(args: argparse.Namespace) -> int:
                         memory_regressions.append(regression)
                     elif forced_resources and projected_resources:
                         invalid_memory_baseline = True
-    gates["projected p95 improvement >= 40%"] = (
-        "pass" if len(improvement_values) == expected_comparisons and min(improvement_values) >= 0.40 else
+    gates[f"projected interactive-readiness p95 improvement >= {primary_improvement:.0%}"] = (
+        "pass" if len(improvement_values) == expected_comparisons and min(improvement_values) >= primary_improvement else
         "fail" if len(improvement_values) == expected_comparisons else "incomplete"
     )
     sample_correctness_mismatches = sum(
@@ -6919,23 +7802,18 @@ def aggregate_command(args: argparse.Namespace) -> int:
         and "unexpected_fallback" in sample.get("invalid_reasons", [])
     )
     gates["zero eligible warm fallbacks"] = "pass" if samples and projected_fallbacks == 0 else "fail" if samples else "incomplete"
-    gates["other p95 regression <= 5%"] = (
-        "pass" if len(other_latency_regressions) == 3 * 1 * 4 * len(TOOL_METRICS)
-        and max(other_latency_regressions) <= 0.05 else
-        "fail" if len(other_latency_regressions) == 3 * 1 * 4 * len(TOOL_METRICS) else "incomplete"
+    expected_secondary_comparisons = len(states) * len(checkouts) * len(widths) * len(TOOL_METRICS)
+    gates[f"other p95 regression <= {secondary_regression:.0%}"] = (
+        "pass" if len(other_latency_regressions) == expected_secondary_comparisons
+        and max(other_latency_regressions) <= secondary_regression else
+        "fail" if len(other_latency_regressions) == expected_secondary_comparisons else "incomplete"
     )
-    gates["peak memory regression <= 10%"] = (
+    gates[f"peak memory regression <= {memory_regression:.0%}"] = (
         "fail" if invalid_memory_baseline else
-        "pass" if len(memory_regressions) == expected_memory_comparisons and max(memory_regressions) <= 0.10 else
+        "pass" if len(memory_regressions) == expected_memory_comparisons and max(memory_regressions) <= memory_regression else
         "fail" if len(memory_regressions) == expected_memory_comparisons else "incomplete"
     )
-    required_matrix_keys = {
-        f"{state}/{checkout}/{route}/{width}"
-        for state in ("cold", "warm", "aged")
-        for checkout in ("linked-worktree",)
-        for route in ROUTES
-        for width in (1, 2, 4, 8)
-    }
+    required_matrix_keys = configured_required_matrix_keys(plan)
     retained_per_series = int(plan["matrix"]["retained_samples_per_series"])
     warmups_per_series = int(plan["matrix"]["warmups_per_series"])
     invocations_per_series = int(plan["matrix"].get("invocations_per_series", 0))
@@ -7388,6 +8266,8 @@ def build_parser() -> argparse.ArgumentParser:
     marker.add_argument("--root-id", required=True)
     marker.add_argument("--owner-token", required=True)
     marker.add_argument("--confirm-disposable-root", action="store_true")
+    marker.add_argument("--confirm-real-repository-benchmark", action="store_true")
+    marker.add_argument("--confirm-dedicated-workspace", action="store_true")
     marker.set_defaults(func=create_marker_command)
 
     self_test = sub.add_parser("self-test", help="run deterministic offline contract validation")
@@ -7411,11 +8291,14 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--warmups", type=int, default=1)
     plan.add_argument("--retained-samples", type=int, default=5)
     plan.add_argument("--invocations-per-series", type=int, default=3)
+    plan.add_argument("--confirm-real-repository-benchmark", action="store_true")
+    plan.add_argument("--confirm-dedicated-workspace", action="store_true")
     plan.add_argument("--output", required=True)
     plan.set_defaults(func=plan_command)
 
     preflight = sub.add_parser("preflight", help="discover schemas and verify exact scope")
     add_live_common(preflight)
+    preflight.add_argument("--confirm-dedicated-workspace", action="store_true")
     preflight.set_defaults(func=preflight_command)
 
     evidence = sub.add_parser("record-evidence", help="write one reviewed external-evidence record offline")
@@ -7429,14 +8312,15 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="run one route/process/width cohort")
     add_live_common(run)
     run.add_argument("--route", choices=sorted(ROUTES), required=True)
-    run.add_argument("--process-state", choices=("cold", "warm", "aged"), required=True)
-    run.add_argument("--checkout-kind", choices=("linked-worktree",), default="linked-worktree")
-    run.add_argument("--width", type=int, choices=(1, 2, 4, 8), required=True)
+    run.add_argument("--process-state", required=True)
+    run.add_argument("--checkout-kind", default="linked-worktree")
+    run.add_argument("--width", type=int, required=True)
     run.add_argument("--invocation", type=int, required=True)
     run.add_argument("--warmups", type=int, default=1)
     run.add_argument("--samples", type=int, default=5)
     run.add_argument("--minimum-aged-sessions", type=int, default=32)
     run.add_argument("--confirm-process-state", action="store_true")
+    run.add_argument("--confirm-dedicated-workspace", action="store_true")
     run.set_defaults(func=run_command)
 
     smoke = sub.add_parser("smoke", help="run correctness, watcher, inheritance, and root-churn checks")

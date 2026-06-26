@@ -2325,10 +2325,19 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
         )
         let hookEvents = EngineHookEvents()
+        let lookupCurrentnessGate = EngineAsyncGate()
+        let gatePostLookupCurrentnessValidation = EngineLockedFlag()
         let fixture = try await makeEngineFixture(
             root: root,
             runtime: runtime,
-            hooks: WorkspaceCodemapBindingEngineHooks { hookEvents.record($0) }
+            hooks: WorkspaceCodemapBindingEngineHooks(
+                event: { hookEvents.record($0) },
+                afterPublishedArtifactLookupBeforeCurrentnessValidation: { _ in
+                    if gatePostLookupCurrentnessValidation.value {
+                        await lookupCurrentnessGate.enterAndWait()
+                    }
+                }
+            )
         )
         _ = await fixture.engine.registerRoot(fixture.registration)
         let seedDemand = fixture.demand(path: "Sources/Warm.swift")
@@ -2350,14 +2359,48 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             )
         }
 
-        async let first = fixture.engine.lookupPublishedArtifact(lookupRequest(UUID()))
-        async let second = fixture.engine.lookupPublishedArtifact(lookupRequest(UUID()))
-        for result in await [first, second] {
+        let accountingBeforeWarmLookups = await fixture.engine.accounting()
+        for result in await [
+            fixture.engine.lookupPublishedArtifact(lookupRequest(UUID())),
+            fixture.engine.lookupPublishedArtifact(lookupRequest(UUID()))
+        ] {
             guard case let .hit(hit) = result else {
-                return XCTFail("Concurrent owners must share the published artifact.")
+                return XCTFail("Independent owners must share the published artifact.")
             }
             XCTAssertEqual(hit.source, .projectionCAS)
         }
+        let accountingAfterWarmLookups = await fixture.engine.accounting()
+        XCTAssertEqual(
+            accountingAfterWarmLookups.counters.publishedArtifactProjectionCASHits,
+            accountingBeforeWarmLookups.counters.publishedArtifactProjectionCASHits + 2
+        )
+        XCTAssertEqual(
+            accountingAfterWarmLookups.counters.publishedArtifactLocatorCASHits,
+            accountingBeforeWarmLookups.counters.publishedArtifactLocatorCASHits
+        )
+        XCTAssertEqual(
+            accountingAfterWarmLookups.counters.publishedArtifactLookupMisses,
+            accountingBeforeWarmLookups.counters.publishedArtifactLookupMisses
+        )
+        XCTAssertEqual(accountingAfterWarmLookups.activeRequestCount, 0)
+        XCTAssertEqual(accountingAfterWarmLookups.queuedRequestCount, 0)
+        XCTAssertEqual(accountingAfterWarmLookups.ownerCount, 0)
+        XCTAssertEqual(
+            accountingAfterWarmLookups.counters.classifications,
+            accountingBeforeWarmLookups.counters.classifications
+        )
+        XCTAssertEqual(
+            accountingAfterWarmLookups.counters.manifestAdoptions,
+            accountingBeforeWarmLookups.counters.manifestAdoptions
+        )
+        XCTAssertEqual(
+            accountingAfterWarmLookups.counters.materializations,
+            accountingBeforeWarmLookups.counters.materializations
+        )
+        XCTAssertEqual(
+            accountingAfterWarmLookups.counters.builds,
+            accountingBeforeWarmLookups.counters.builds
+        )
 
         let cancelled = Task {
             await fixture.engine.lookupPublishedArtifact(lookupRequest(UUID()))
@@ -2380,11 +2423,37 @@ final class WorkspaceCodemapBindingEngineTests: XCTestCase {
             $0.publishedArtifactLookupSource == .projectionCAS
         })
 
+        gatePostLookupCurrentnessValidation.set(true)
+        let racedLookup = Task {
+            await fixture.engine.lookupPublishedArtifact(lookupRequest(UUID()))
+        }
+        XCTAssertTrue(lookupCurrentnessGate.waitUntilEntered())
+        let accountingBeforePostLookupInvalidation = await fixture.engine.accounting()
         let invalidation = await fixture.engine.invalidateModified(
             rootEpoch: fixture.rootEpoch,
             standardizedRelativePaths: ["Sources/Warm.swift"]
         )
         XCTAssertFalse(invalidation.manifestWriteFailed)
+        lookupCurrentnessGate.release()
+        guard case let .miss(racedReason) = await racedLookup.value else {
+            return XCTFail("A post-CAS invalidation must reject the stale lookup.")
+        }
+        XCTAssertEqual(racedReason, .currentnessMismatch)
+        let accountingAfterPostLookupInvalidation = await fixture.engine.accounting()
+        XCTAssertEqual(
+            accountingAfterPostLookupInvalidation.counters.publishedArtifactPostLookupCurrentnessRejections,
+            accountingBeforePostLookupInvalidation.counters.publishedArtifactPostLookupCurrentnessRejections + 1
+        )
+        XCTAssertEqual(
+            hookEvents.count(kind: .publishedArtifactPostLookupCurrentnessRejection),
+            1
+        )
+        XCTAssertEqual(
+            hookEvents.values(kind: .publishedArtifactPostLookupCurrentnessRejection).first?
+                .publishedArtifactLookupSource,
+            .projectionCAS
+        )
+        gatePostLookupCurrentnessValidation.set(false)
         guard case let .miss(reason) = await fixture.engine.lookupPublishedArtifact(lookupRequest(UUID())) else {
             return XCTFail("A changed path identity must invalidate its published projection.")
         }

@@ -108,6 +108,25 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
     }
 
     private func executeManageSelection(args: [String: Value]) async throws -> ToolResultDTOs.SelectionReply {
+        #if DEBUG
+            let metadata = await dependencies.captureRequestMetadata()
+            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+            let tag = lookupContext.bindingProjection.map(\.sessionID).flatMap {
+                WorktreeStartupBenchmarkDiagnostics.shared.activeBenchmarkMetricTag(
+                    agentSessionID: $0
+                )
+            }
+            return try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(tag) {
+                try await executeManageSelectionWithRetry(args: args)
+            }
+        #else
+            return try await executeManageSelectionWithRetry(args: args)
+        #endif
+    }
+
+    private func executeManageSelectionWithRetry(
+        args: [String: Value]
+    ) async throws -> ToolResultDTOs.SelectionReply {
         do {
             return try await executeManageSelectionAttempt(args: args)
         } catch is ArtifactCommitConflict {

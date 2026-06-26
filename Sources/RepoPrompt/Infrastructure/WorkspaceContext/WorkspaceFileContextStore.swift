@@ -8184,6 +8184,17 @@ actor WorkspaceFileContextStore {
         lookupContext: WorkspaceLookupContext,
         profile: PathLocateProfile = .uiAssisted
     ) async -> WorkspaceFileTreePresentation {
+        #if DEBUG
+            let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
+            let benchmarkStarted = DispatchTime.now().uptimeNanoseconds
+            defer {
+                let benchmarkFinished = DispatchTime.now().uptimeNanoseconds
+                WorktreeStartupInstrumentation.recordBenchmarkPassiveTree(
+                    tag: benchmarkMetricTag,
+                    durationMicroseconds: (benchmarkFinished - benchmarkStarted) / 1000
+                )
+            }
+        #endif
         let unmarkedSnapshot = await makeFileTreeSelectionSnapshot(
             selection: selection,
             request: request,
@@ -12656,6 +12667,16 @@ actor WorkspaceFileContextStore {
             }
             session.markerReadinessRevision &+= 1
             codemapSessionsByRootEpoch[rootEpoch] = session
+            #if DEBUG
+                WorktreeStartupInstrumentation.recordBenchmarkMarkerPublication(
+                    tag: WorktreeStartupInstrumentation.currentBenchmarkMetricTag,
+                    rootID: rootEpoch.rootID,
+                    rootLifetimeID: rootEpoch.rootLifetimeID,
+                    revision: session.markerReadinessRevision,
+                    effectiveChangeCount: effectiveChanges.count,
+                    source: .warmReplay
+                )
+            #endif
             yieldCodemapMarkerReadiness(WorkspaceCodemapMarkerReadinessEvent(
                 rootEpoch: rootEpoch,
                 revision: session.markerReadinessRevision,
@@ -16267,6 +16288,16 @@ actor WorkspaceFileContextStore {
             changes: appliedChanges
         )
         codemapSessionsByRootEpoch[authority.rootEpoch] = session
+        #if DEBUG
+            WorktreeStartupInstrumentation.recordBenchmarkMarkerPublication(
+                tag: WorktreeStartupInstrumentation.currentBenchmarkMetricTag,
+                rootID: authority.rootEpoch.rootID,
+                rootLifetimeID: authority.rootEpoch.rootLifetimeID,
+                revision: session.markerReadinessRevision,
+                effectiveChangeCount: appliedChanges.count,
+                source: .publishedUpdate
+            )
+        #endif
         yieldCodemapMarkerReadiness(event)
         return true
     }

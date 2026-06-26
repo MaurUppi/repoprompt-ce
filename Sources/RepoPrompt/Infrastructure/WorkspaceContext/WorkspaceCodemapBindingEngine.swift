@@ -876,6 +876,9 @@ actor WorkspaceCodemapBindingEngine {
         }
 
         guard !Task.isCancelled else { return .cancelled }
+        #if DEBUG
+            await hooks.afterPublishedArtifactLookupBeforeCurrentnessValidation(context.rootEpoch)
+        #endif
         guard publishedArtifactLookupIsCurrent(context, request: request),
               (try? VerifiedGitBlobCodeMapLocatorAssociation.revalidatePersisted(
                   identity: context.record.locatorIdentity,
@@ -887,6 +890,15 @@ actor WorkspaceCodemapBindingEngine {
                   manifestOutcome: context.record.outcome
               )
         else {
+            #if DEBUG
+                incrementCounter(\.publishedArtifactPostLookupCurrentnessRejections)
+                emit(
+                    .publishedArtifactPostLookupCurrentnessRejection,
+                    rootEpoch: context.rootEpoch,
+                    artifact: resolution.handle.key,
+                    publishedArtifactLookupSource: source
+                )
+            #endif
             recordPublishedArtifactLookupMiss(request: request, reason: .currentnessMismatch)
             return .miss(.currentnessMismatch)
         }

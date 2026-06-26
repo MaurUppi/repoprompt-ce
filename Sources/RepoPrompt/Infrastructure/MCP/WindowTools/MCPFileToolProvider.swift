@@ -25,6 +25,24 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         ]
     }
 
+    private func withActiveWorktreeStartupBenchmarkTag<T>(
+        _ operation: () async throws -> T
+    ) async rethrows -> T {
+        #if DEBUG
+            let metadata = await dependencies.captureRequestMetadata()
+            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+            let tag = lookupContext.bindingProjection.map(\.sessionID).flatMap {
+                WorktreeStartupBenchmarkDiagnostics.shared.activeBenchmarkMetricTag(
+                    agentSessionID: $0
+                )
+            }
+            return try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag
+                .withValue(tag, operation: operation)
+        #else
+            return try await operation()
+        #endif
+    }
+
     private func fileActionsTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.fileActions,
@@ -157,9 +175,10 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 required: ["scope"]
             )
         ) { [self] _, args in
-            try await MCPToolWorkCountDiagnostics.withGitInvocation(
+            try await withActiveWorktreeStartupBenchmarkTag {
+                try await MCPToolWorkCountDiagnostics.withGitInvocation(
                 operation: MCPWindowToolName.getCodeStructure
-            ) {
+                ) {
                 try Task.checkCancellation()
                 let allowedRootKeys: Set = ["scope", "paths", "expand", "limits"]
                 guard Set(args.keys).isSubset(of: allowedRootKeys) else {
@@ -300,7 +319,8 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     lookupContext
                 )
                 try Task.checkCancellation()
-                return try Value(reply)
+                    return try Value(reply)
+                }
             }
         }
     }
@@ -347,8 +367,9 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 required: []
             )
         ) { [self] _, args in
-            let type = args["type"]?.stringValue ?? "files"
-            switch type {
+            try await withActiveWorktreeStartupBenchmarkTag {
+                let type = args["type"]?.stringValue ?? "files"
+                switch type {
             case "roots":
                 let filePathDisplay = await MainActor.run { dependencies.promptVM.filePathDisplayOption }
                 let metadata = await dependencies.captureRequestMetadata()
@@ -395,8 +416,9 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     wasTruncated: resultAndRootCount.result.wasTruncated,
                     worktreeScope: worktreeScope
                 ))
-            default:
-                throw MCPError.invalidParams("invalid type: \(type)")
+                default:
+                    throw MCPError.invalidParams("invalid type: \(type)")
+                }
             }
         }
     }

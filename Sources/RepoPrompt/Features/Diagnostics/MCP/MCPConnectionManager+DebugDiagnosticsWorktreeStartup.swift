@@ -445,6 +445,14 @@ import MCP
             case "first_search_completed": .firstBenchmarkSearchCompleted
             case "first_read_started": .firstBenchmarkReadStarted
             case "first_read_completed": .firstBenchmarkReadCompleted
+            case "first_codemap_started": .firstBenchmarkCodemapStarted
+            case "first_codemap_completed": .firstBenchmarkCodemapCompleted
+            case "warm_codemap_started": .warmBenchmarkCodemapStarted
+            case "warm_codemap_completed": .warmBenchmarkCodemapCompleted
+            case "passive_tree_started": .passiveBenchmarkTreeStarted
+            case "passive_tree_completed": .passiveBenchmarkTreeCompleted
+            case "selection_started": .benchmarkSelectionStarted
+            case "selection_completed": .benchmarkSelectionCompleted
             default: throw DebugWorktreeStartupBenchmarkRequestError.invalidParameter
             }
         }

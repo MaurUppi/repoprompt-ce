@@ -2718,6 +2718,28 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
         )
         let ready = try await readyResult(settledResult(store: store, ticket: ticket))
         XCTAssertEqual(ready.snapshot.outcome, .readyNoSymbols)
+        _ = await store.cancelCodemapArtifactDemand(ticket)
+        let firstMarkerSnapshotValue = await store.codemapMarkerReadinessSnapshotForTesting(
+            rootEpoch: ticket.rootEpoch
+        )
+        let firstMarkerSnapshot = try XCTUnwrap(firstMarkerSnapshotValue)
+
+        let repeatedTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: file.id)
+        )
+        let repeatedReady = try await readyResult(settledResult(store: store, ticket: repeatedTicket))
+        XCTAssertEqual(repeatedReady.snapshot.outcome, .readyNoSymbols)
+        _ = await store.cancelCodemapArtifactDemand(repeatedTicket)
+        let repeatedMarkerSnapshotValue = await store.codemapMarkerReadinessSnapshotForTesting(
+            rootEpoch: ticket.rootEpoch
+        )
+        let repeatedMarkerSnapshot = try XCTUnwrap(repeatedMarkerSnapshotValue)
+        XCTAssertEqual(
+            repeatedMarkerSnapshot.revision,
+            firstMarkerSnapshot.revision,
+            "Every marker event advances revision; repeated readyNoSymbols must emit neither."
+        )
+        XCTAssertEqual(repeatedMarkerSnapshot.changes, firstMarkerSnapshot.changes)
         let countsBeforeTree = await store.codemapPresentationOperationCountsForTesting()
 
         let tree = await store.makeCurrentSnapshotFileTreePresentation(
@@ -2742,7 +2764,6 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
         let countsAfterTree = await store.codemapPresentationOperationCountsForTesting()
         XCTAssertEqual(countsAfterTree, countsBeforeTree)
 
-        _ = await store.cancelCodemapArtifactDemand(ticket)
         await store.unloadRoot(id: loaded.id)
     }
 

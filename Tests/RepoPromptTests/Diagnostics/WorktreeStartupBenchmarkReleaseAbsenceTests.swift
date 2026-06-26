@@ -18,10 +18,13 @@ final class WorktreeStartupBenchmarkReleaseAbsenceTests: XCTestCase {
         for forbidden in [
             "firstBenchmarkSearchStarted",
             "firstBenchmarkReadCompleted",
+            "firstBenchmarkCodemapStarted",
             "worktree_startup_benchmark",
             "_worktree_startup_benchmark_token",
             "BenchmarkMetricTag",
             "ReceiptDecision",
+            "BenchmarkPlannerPhase",
+            "marker_publications",
             "receipt_decisions",
             "receiptDecisionDigest",
             "worktree_startup_benchmark_diagnostics_enabled"

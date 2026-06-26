@@ -537,7 +537,7 @@ import XCTest
             XCTAssertEqual(duplicate.creationAttemptCount, 2)
         }
 
-        func testReceiptDecisionSchemaV4ExportIsTerminalBoundedAndPathFree() throws {
+        func testReceiptDecisionSchemaV5ExportIsTerminalBoundedPathFreeAndOperationCorrelated() throws {
             WorktreeStartupInstrumentation.resetForTesting()
             WorktreeStartupBenchmarkDiagnostics.setGateEnabled(true)
             defer { WorktreeStartupBenchmarkDiagnostics.setGateEnabled(false) }
@@ -618,14 +618,76 @@ import XCTest
                 flags: consumed.flags,
                 servingControl: consumed.servingControl
             )
+            WorktreeStartupInstrumentation.record(.bindingTransitionStarted, context: context)
             WorktreeStartupInstrumentation.record(.rootReady, context: context, route: .diffSeedServing)
+            try diagnostics.mark(scope: scope, correlationID: arm.correlationID, phase: .firstBenchmarkSearchStarted)
+            try diagnostics.mark(scope: scope, correlationID: arm.correlationID, phase: .firstBenchmarkReadStarted)
+            try diagnostics.mark(scope: scope, correlationID: arm.correlationID, phase: .firstBenchmarkReadCompleted)
+            try diagnostics.mark(scope: scope, correlationID: arm.correlationID, phase: .firstBenchmarkSearchCompleted)
+            try diagnostics.mark(scope: scope, correlationID: arm.correlationID, phase: .firstBenchmarkCodemapStarted)
+            try diagnostics.mark(scope: scope, correlationID: arm.correlationID, phase: .firstBenchmarkCodemapCompleted)
+            try diagnostics.mark(scope: scope, correlationID: arm.correlationID, phase: .warmBenchmarkCodemapStarted)
+            try diagnostics.mark(scope: scope, correlationID: arm.correlationID, phase: .warmBenchmarkCodemapCompleted)
+            try diagnostics.mark(scope: scope, correlationID: arm.correlationID, phase: .passiveBenchmarkTreeStarted)
+            let passiveTag = try XCTUnwrap(
+                diagnostics.activeBenchmarkMetricTag(agentSessionID: consumed.metricTag.agentSessionID)
+            )
+            WorktreeStartupInstrumentation.recordBenchmarkPassiveTree(
+                tag: passiveTag,
+                durationMicroseconds: 13
+            )
+            let markerRootID = UUID()
+            let markerLifetimeID = UUID()
+            WorktreeStartupInstrumentation.recordBenchmarkMarkerPublication(
+                tag: passiveTag,
+                rootID: markerRootID,
+                rootLifetimeID: markerLifetimeID,
+                revision: 4,
+                effectiveChangeCount: 1,
+                source: .warmReplay
+            )
+            try diagnostics.mark(scope: scope, correlationID: arm.correlationID, phase: .passiveBenchmarkTreeCompleted)
+            XCTAssertNil(
+                diagnostics.activeBenchmarkMetricTag(agentSessionID: consumed.metricTag.agentSessionID)
+            )
+            try diagnostics.mark(scope: scope, correlationID: arm.correlationID, phase: .benchmarkSelectionStarted)
+            XCTAssertEqual(
+                diagnostics.activeBenchmarkMetricTag(agentSessionID: consumed.metricTag.agentSessionID),
+                consumed.metricTag
+            )
+            try diagnostics.mark(scope: scope, correlationID: arm.correlationID, phase: .benchmarkSelectionCompleted)
+            XCTAssertThrowsError(
+                try diagnostics.mark(
+                    scope: scope,
+                    correlationID: arm.correlationID,
+                    phase: .firstBenchmarkSearchStarted
+                )
+            ) { error in
+                XCTAssertEqual(error as? DebugWorktreeStartupBenchmarkError, .invalidTransition)
+            }
+            WorktreeStartupInstrumentation.recordBenchmarkPlannerPhase(
+                tag: consumed.metricTag,
+                phase: .targetNamespace,
+                durationMicroseconds: 11,
+                itemCount: 2
+            )
+            WorktreeStartupInstrumentation.recordBenchmarkMutationLock(
+                tag: consumed.metricTag,
+                queueWaitMicroseconds: 3,
+                heldMicroseconds: 7
+            )
+            WorktreeStartupInstrumentation.recordBenchmarkMutationWork(
+                tag: consumed.metricTag,
+                mutationDurationMicroseconds: 5,
+                postMutationFinalizationMicroseconds: 9
+            )
 
             let payload = try diagnostics.snapshotPayload(
                 scope: scope,
                 correlationID: arm.correlationID,
                 export: true
             )
-            XCTAssertEqual(payload["schema_version"] as? Int, 4)
+            XCTAssertEqual(payload["schema_version"] as? Int, 5)
             XCTAssertEqual(payload["bounded"] as? Bool, true)
             XCTAssertEqual(payload["contains_paths"] as? Bool, false)
             XCTAssertEqual(payload["receipt_decision_count"] as? Int, 1)
@@ -634,6 +696,27 @@ import XCTest
             XCTAssertEqual(payload["receipt_decision_ambiguous"] as? Bool, false)
             let sample = try XCTUnwrap(payload["sample"] as? [String: Any])
             XCTAssertEqual(sample["valid"] as? Bool, true)
+            XCTAssertEqual(sample["boundary_evidence_available"] as? Bool, true)
+            XCTAssertEqual(sample["boundary_invalid_reasons"] as? [String], [])
+            XCTAssertNotNil(sample["interactive_readiness_us"] as? UInt64)
+            let durations = try XCTUnwrap(sample["durations_us"] as? [String: UInt64])
+            for key in ["first_search", "first_read", "first_codemap", "warm_codemap", "passive_tree", "selection"] {
+                XCTAssertNotNil(durations[key], key)
+            }
+            let work = try XCTUnwrap(payload["work"] as? [String: Any])
+            let planner = try XCTUnwrap(work["planner"] as? [String: [String: Any]])
+            XCTAssertEqual(planner["targetNamespace"]?["duration_us"] as? UInt64, 11)
+            XCTAssertEqual(planner["targetNamespace"]?["item_count"] as? Int, 2)
+            let mutation = try XCTUnwrap(work["mutation_lock"] as? [String: Any])
+            XCTAssertEqual(mutation["queue_wait_us"] as? UInt64, 3)
+            XCTAssertEqual(mutation["held_us"] as? UInt64, 7)
+            XCTAssertEqual(mutation["mutation_us"] as? UInt64, 5)
+            XCTAssertEqual(mutation["post_mutation_finalization_us"] as? UInt64, 9)
+            let markers = try XCTUnwrap(work["marker_publications"] as? [[String: Any]])
+            XCTAssertEqual(markers.count, 1)
+            XCTAssertEqual(markers.first?["root_id"] as? String, markerRootID.uuidString)
+            XCTAssertEqual(markers.first?["root_lifetime_id"] as? String, markerLifetimeID.uuidString)
+            XCTAssertEqual(markers.first?["source"] as? String, "warmReplay")
             let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
             let exported = try XCTUnwrap(String(data: data, encoding: .utf8))
             XCTAssertFalse(exported.contains(pathSentinel))
@@ -643,6 +726,21 @@ import XCTest
             XCTAssertTrue(exported.contains("\"witness_accepted_destination_event_count\":257"))
             XCTAssertTrue(exported.contains("\"witness_accepted_non_destination_event_count\":43"))
             XCTAssertTrue(exported.contains("\"witness_user_dropped\":false"))
+
+            var boundaryEvents = Dictionary(
+                uniqueKeysWithValues: WorktreeStartupBenchmarkDiagnostics.requiredBoundaryPhasesForTesting
+                    .enumerated().map { index, phase in
+                        (phase, UInt64(10_000 + index * 1_000))
+                    }
+            )
+            boundaryEvents[.rootReady] = 9_999
+            let invalidBoundary = WorktreeStartupBenchmarkDiagnostics.boundaryEvidenceForTesting(
+                boundaryEvents,
+                baseline: 10_000
+            )
+            XCTAssertFalse(invalidBoundary.valid)
+            XCTAssertTrue(invalidBoundary.milestones[WorktreeStartupPhase.rootReady.rawValue] is NSNull)
+            XCTAssertTrue(invalidBoundary.invalidReasons.contains("pre_baseline_rootReady"))
         }
 
         func testReceiptDecisionEvictionInvalidatesBenchmarkSampleAndResetClearsState() throws {

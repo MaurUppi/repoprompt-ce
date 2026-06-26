@@ -251,6 +251,7 @@
             var agentSessionID: UUID?
             var startAttemptID: UUID?
             var metricTag: WorktreeStartupInstrumentation.BenchmarkMetricTag?
+            var activeBenchmarkPhases: Set<WorktreeStartupPhase> = []
 
             var scope: DebugWorktreeStartupBenchmarkScope {
                 expectedStart.rootIdentity.scope
@@ -541,9 +542,12 @@
             try WorktreeStartupBenchmarkGate.shared.requireEnabled { _ in
                 let context: WorktreeStartupContext
                 lock.lock()
-                let sample = samplesByCorrelationID[correlationID]
+                let storedSample = samplesByCorrelationID[correlationID]
                 let instrumentation = WorktreeStartupInstrumentation.snapshot()
-                guard let sample, sample.scope == scope, let sessionID = sample.agentSessionID else {
+                guard var sample = storedSample,
+                      sample.scope == scope,
+                      let sessionID = sample.agentSessionID
+                else {
                     lock.unlock()
                     throw DebugWorktreeStartupBenchmarkError.sampleNotFound
                 }
@@ -552,22 +556,63 @@
                         .filter { $0.correlationID == correlationID }
                         .map(\.phase)
                 )
-                let valid = switch phase {
-                case .firstBenchmarkSearchStarted:
-                    !phases.contains(.firstBenchmarkSearchStarted)
-                case .firstBenchmarkSearchCompleted:
-                    phases.contains(.firstBenchmarkSearchStarted) && !phases.contains(.firstBenchmarkSearchCompleted)
-                case .firstBenchmarkReadStarted:
-                    phases.contains(.firstBenchmarkSearchCompleted) && !phases.contains(.firstBenchmarkReadStarted)
-                case .firstBenchmarkReadCompleted:
-                    phases.contains(.firstBenchmarkReadStarted) && !phases.contains(.firstBenchmarkReadCompleted)
-                default:
+                let valid: Bool = if phases.contains(.failed) {
                     false
+                } else {
+                    switch phase {
+                    case .firstBenchmarkSearchStarted:
+                        !phases.contains(.firstBenchmarkSearchStarted)
+                    case .firstBenchmarkSearchCompleted:
+                        phases.contains(.firstBenchmarkSearchStarted) && !phases.contains(.firstBenchmarkSearchCompleted)
+                    case .firstBenchmarkReadStarted:
+                        !phases.contains(.firstBenchmarkReadStarted)
+                    case .firstBenchmarkReadCompleted:
+                        phases.contains(.firstBenchmarkReadStarted) && !phases.contains(.firstBenchmarkReadCompleted)
+                    case .firstBenchmarkCodemapStarted:
+                        !phases.contains(.firstBenchmarkCodemapStarted)
+                    case .firstBenchmarkCodemapCompleted:
+                        phases.contains(.firstBenchmarkCodemapStarted) && !phases.contains(.firstBenchmarkCodemapCompleted)
+                    case .warmBenchmarkCodemapStarted:
+                        !phases.contains(.warmBenchmarkCodemapStarted)
+                    case .warmBenchmarkCodemapCompleted:
+                        phases.contains(.warmBenchmarkCodemapStarted) && !phases.contains(.warmBenchmarkCodemapCompleted)
+                    case .passiveBenchmarkTreeStarted:
+                        !phases.contains(.passiveBenchmarkTreeStarted)
+                    case .passiveBenchmarkTreeCompleted:
+                        phases.contains(.passiveBenchmarkTreeStarted) && !phases.contains(.passiveBenchmarkTreeCompleted)
+                    case .benchmarkSelectionStarted:
+                        !phases.contains(.benchmarkSelectionStarted)
+                    case .benchmarkSelectionCompleted:
+                        phases.contains(.benchmarkSelectionStarted) && !phases.contains(.benchmarkSelectionCompleted)
+                    default:
+                        false
+                    }
                 }
                 guard valid else {
                     lock.unlock()
                     throw DebugWorktreeStartupBenchmarkError.invalidTransition
                 }
+                switch phase {
+                case .firstBenchmarkSearchStarted, .firstBenchmarkReadStarted,
+                     .firstBenchmarkCodemapStarted, .warmBenchmarkCodemapStarted,
+                     .passiveBenchmarkTreeStarted, .benchmarkSelectionStarted:
+                    sample.activeBenchmarkPhases.insert(phase)
+                case .firstBenchmarkSearchCompleted:
+                    sample.activeBenchmarkPhases.remove(.firstBenchmarkSearchStarted)
+                case .firstBenchmarkReadCompleted:
+                    sample.activeBenchmarkPhases.remove(.firstBenchmarkReadStarted)
+                case .firstBenchmarkCodemapCompleted:
+                    sample.activeBenchmarkPhases.remove(.firstBenchmarkCodemapStarted)
+                case .warmBenchmarkCodemapCompleted:
+                    sample.activeBenchmarkPhases.remove(.warmBenchmarkCodemapStarted)
+                case .passiveBenchmarkTreeCompleted:
+                    sample.activeBenchmarkPhases.remove(.passiveBenchmarkTreeStarted)
+                case .benchmarkSelectionCompleted:
+                    sample.activeBenchmarkPhases.remove(.benchmarkSelectionStarted)
+                default:
+                    break
+                }
+                samplesByCorrelationID[correlationID] = sample
                 context = WorktreeStartupContext(
                     agentSessionID: sessionID,
                     correlationID: correlationID,
@@ -577,6 +622,20 @@
                 lock.unlock()
                 WorktreeStartupInstrumentation.record(phase, context: context)
             }
+        }
+
+        func activeBenchmarkMetricTag(
+            agentSessionID: UUID
+        ) -> WorktreeStartupInstrumentation.BenchmarkMetricTag? {
+            lock.lock()
+            defer { lock.unlock() }
+            let matches = samplesByCorrelationID.values.compactMap { sample -> WorktreeStartupInstrumentation.BenchmarkMetricTag? in
+                guard sample.agentSessionID == agentSessionID,
+                      !sample.activeBenchmarkPhases.isEmpty
+                else { return nil }
+                return sample.metricTag
+            }
+            return matches.count == 1 ? matches[0] : nil
         }
 
         func snapshotPayload(
@@ -620,10 +679,17 @@
                 let git = metrics?.gitCommands ?? []
                 let gitFamilies = Dictionary(grouping: git, by: { $0.family.rawValue }).mapValues(\.count)
                 let gitPriorities = Dictionary(grouping: git, by: { String(describing: $0.priority) }).mapValues(\.count)
+                let boundaryEvidence = Self.boundaryEvidence(
+                    eventTimes,
+                    baseline: sample.armedAtNanoseconds
+                )
+                let milestones = boundaryEvidence.milestones
+                let durations = Self.durationPayload(eventTimes)
+                let interactiveReadiness = Self.interactiveReadinessMicroseconds(eventTimes)
 
                 var payload: [String: Any] = [
                     "ok": true,
-                    "schema_version": 4,
+                    "schema_version": 5,
                     "action": export ? "export" : "snapshot",
                     "scope": [
                         "window_id": scope.windowID,
@@ -645,10 +711,15 @@
                         "first_read_complete": eventTimes[.firstBenchmarkReadCompleted] != nil,
                         "route_counts": routeCounts,
                         "fallback_counts": fallbackCounts,
-                        "milestones_us": Self.milestonePayload(eventTimes, baseline: sample.armedAtNanoseconds),
-                        "durations_us": Self.durationPayload(eventTimes),
+                        "milestones_us": milestones,
+                        "operation_boundaries_us": milestones,
+                        "boundary_evidence_available": boundaryEvidence.valid,
+                        "boundary_invalid_reasons": boundaryEvidence.invalidReasons,
+                        "durations_us": durations,
+                        "interactive_readiness_us": interactiveReadiness.map { $0 as Any } ?? NSNull(),
                         "event_buffer_evicted": eventEvicted,
-                        "valid": !eventEvicted && sample.metricTag != nil && receiptDecisionValid
+                        "valid": !eventEvicted && sample.metricTag != nil
+                            && receiptDecisionValid && boundaryEvidence.valid
                     ],
                     "receipt_decision_count": receiptDecisions.count,
                     "terminal_receipt_decision_count": terminalReceiptDecisionCount,
@@ -967,10 +1038,24 @@
                 return [
                     "filesystem": ["available": false],
                     "content_read_admission": ["available": false],
-                    "codemap": ["available": false]
+                    "codemap": ["available": false],
+                    "planner": [:],
+                    "mutation_lock": ["available": false],
+                    "passive_tree": ["available": false],
+                    "marker_publications": []
                 ]
             }
             let codemapAvailable = metrics.codemapAttribution == .exact
+            let planner = Dictionary(uniqueKeysWithValues: metrics.plannerPhases.map { phase, metric in
+                (
+                    phase.rawValue,
+                    [
+                        "count": metric.count,
+                        "duration_us": metric.durationMicroseconds,
+                        "item_count": metric.itemCount
+                    ] as [String: Any]
+                )
+            })
             return [
                 "filesystem": [
                     "available": metrics.filesystemOperationCount > 0,
@@ -992,7 +1077,31 @@
                     "build_count": codemapAvailable ? metrics.codemapBuildCount as Any : NSNull(),
                     "queue_us": codemapAvailable ? metrics.codemapQueueMicroseconds as Any : NSNull(),
                     "permit_wait_us": codemapAvailable ? metrics.codemapPermitWaitMicroseconds as Any : NSNull()
-                ]
+                ],
+                "planner": planner,
+                "mutation_lock": [
+                    "available": metrics.mutationLockCount > 0,
+                    "count": metrics.mutationLockCount,
+                    "queue_wait_us": metrics.mutationLockQueueMicroseconds,
+                    "held_us": metrics.mutationLockHeldMicroseconds,
+                    "mutation_us": metrics.mutationDurationMicroseconds,
+                    "post_mutation_finalization_us": metrics.postMutationFinalizationMicroseconds
+                ],
+                "passive_tree": [
+                    "available": metrics.passiveTreeCount > 0,
+                    "operation_count": metrics.passiveTreeCount,
+                    "duration_us": metrics.passiveTreeDurationMicroseconds
+                ],
+                "marker_publications": metrics.markerPublications.map {
+                    [
+                        "root_id": $0.rootID.uuidString,
+                        "root_lifetime_id": $0.rootLifetimeID.uuidString,
+                        "revision": $0.revision,
+                        "effective_change_count": $0.effectiveChangeCount,
+                        "source": $0.source.rawValue,
+                        "timestamp_us": $0.timestampNanoseconds / 1000
+                    ] as [String: Any]
+                }
             ]
         }
 
@@ -1005,13 +1114,91 @@
             path == container || path.hasPrefix(container.hasSuffix("/") ? container : container + "/")
         }
 
-        private static func milestonePayload(
+        private static let requiredBoundaryPhases: [WorktreeStartupPhase] = [
+            .bindingTransitionStarted,
+            .rootReady,
+            .firstBenchmarkSearchStarted,
+            .firstBenchmarkSearchCompleted,
+            .firstBenchmarkReadStarted,
+            .firstBenchmarkReadCompleted,
+            .firstBenchmarkCodemapStarted,
+            .firstBenchmarkCodemapCompleted,
+            .warmBenchmarkCodemapStarted,
+            .warmBenchmarkCodemapCompleted,
+            .passiveBenchmarkTreeStarted,
+            .passiveBenchmarkTreeCompleted,
+            .benchmarkSelectionStarted,
+            .benchmarkSelectionCompleted
+        ]
+
+        private struct BoundaryEvidence {
+            let milestones: [String: Any]
+            let valid: Bool
+            let invalidReasons: [String]
+        }
+
+        private static func boundaryEvidence(
             _ events: [WorktreeStartupPhase: UInt64],
             baseline: UInt64
-        ) -> [String: UInt64] {
-            Dictionary(uniqueKeysWithValues: events.map { phase, timestamp in
-                (phase.rawValue, timestamp >= baseline ? (timestamp - baseline) / 1000 : 0)
-            })
+        ) -> BoundaryEvidence {
+            var milestones: [String: Any] = [:]
+            var invalidReasons: [String] = []
+            for phase in Set(events.keys).union(requiredBoundaryPhases) {
+                guard let timestamp = events[phase] else {
+                    milestones[phase.rawValue] = NSNull()
+                    invalidReasons.append("missing_\(phase.rawValue)")
+                    continue
+                }
+                guard timestamp >= baseline else {
+                    milestones[phase.rawValue] = NSNull()
+                    invalidReasons.append("pre_baseline_\(phase.rawValue)")
+                    continue
+                }
+                milestones[phase.rawValue] = (timestamp - baseline) / 1000
+            }
+
+            func requireOrder(_ before: WorktreeStartupPhase, _ after: WorktreeStartupPhase) {
+                guard let beforeTime = events[before], let afterTime = events[after] else { return }
+                if beforeTime > afterTime {
+                    invalidReasons.append("non_monotonic_\(before.rawValue)_\(after.rawValue)")
+                }
+            }
+            let requiredOrdering: [(WorktreeStartupPhase, WorktreeStartupPhase)] = [
+                (WorktreeStartupPhase.bindingTransitionStarted, .rootReady),
+                (.rootReady, .firstBenchmarkSearchStarted),
+                (.rootReady, .firstBenchmarkReadStarted),
+                (.firstBenchmarkSearchStarted, .firstBenchmarkSearchCompleted),
+                (.firstBenchmarkReadStarted, .firstBenchmarkReadCompleted),
+                (.firstBenchmarkSearchCompleted, .firstBenchmarkCodemapStarted),
+                (.firstBenchmarkReadCompleted, .firstBenchmarkCodemapStarted),
+                (.firstBenchmarkCodemapStarted, .firstBenchmarkCodemapCompleted),
+                (.firstBenchmarkCodemapCompleted, .warmBenchmarkCodemapStarted),
+                (.warmBenchmarkCodemapStarted, .warmBenchmarkCodemapCompleted),
+                (.warmBenchmarkCodemapCompleted, .passiveBenchmarkTreeStarted),
+                (.passiveBenchmarkTreeStarted, .passiveBenchmarkTreeCompleted),
+                (.passiveBenchmarkTreeCompleted, .benchmarkSelectionStarted),
+                (.benchmarkSelectionStarted, .benchmarkSelectionCompleted)
+            ]
+            for pair in requiredOrdering {
+                requireOrder(pair.0, pair.1)
+            }
+            return BoundaryEvidence(
+                milestones: milestones,
+                valid: invalidReasons.isEmpty,
+                invalidReasons: invalidReasons.sorted()
+            )
+        }
+
+        static func boundaryEvidenceForTesting(
+            _ events: [WorktreeStartupPhase: UInt64],
+            baseline: UInt64
+        ) -> (milestones: [String: Any], valid: Bool, invalidReasons: [String]) {
+            let evidence = boundaryEvidence(events, baseline: baseline)
+            return (evidence.milestones, evidence.valid, evidence.invalidReasons)
+        }
+
+        static var requiredBoundaryPhasesForTesting: [WorktreeStartupPhase] {
+            requiredBoundaryPhases
         }
 
         private static func durationPayload(_ events: [WorktreeStartupPhase: UInt64]) -> [String: UInt64] {
@@ -1027,7 +1214,27 @@
             add("root_ready_to_first_search", .rootReady, .firstBenchmarkSearchCompleted)
             add("first_search", .firstBenchmarkSearchStarted, .firstBenchmarkSearchCompleted)
             add("first_read", .firstBenchmarkReadStarted, .firstBenchmarkReadCompleted)
+            add("materialize_to_first_codemap", .bindingTransitionStarted, .firstBenchmarkCodemapCompleted)
+            add("first_codemap", .firstBenchmarkCodemapStarted, .firstBenchmarkCodemapCompleted)
+            add("warm_codemap", .warmBenchmarkCodemapStarted, .warmBenchmarkCodemapCompleted)
+            add("passive_tree", .passiveBenchmarkTreeStarted, .passiveBenchmarkTreeCompleted)
+            add("selection", .benchmarkSelectionStarted, .benchmarkSelectionCompleted)
+            add("seed_watcher_attach_to_replay_fence", .seedWatcherAttached, .seedReplayFenced)
+            add("seed_replay_fence_to_ready", .seedReplayFenced, .seedReadyForCommit)
+            add("seed_ready_to_publish", .seedReadyForCommit, .seedPublished)
             return values
+        }
+
+        private static func interactiveReadinessMicroseconds(
+            _ events: [WorktreeStartupPhase: UInt64]
+        ) -> UInt64? {
+            guard let start = events[.bindingTransitionStarted],
+                  let search = events[.firstBenchmarkSearchCompleted],
+                  let read = events[.firstBenchmarkReadCompleted]
+            else { return nil }
+            let completed = max(search, read)
+            guard completed >= start else { return nil }
+            return (completed - start) / 1000
         }
     }
 

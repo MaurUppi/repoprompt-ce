@@ -520,13 +520,36 @@ actor GitWorktreeMutationCoordinator {
         key: String,
         operation: @Sendable () async throws -> T
     ) async throws -> T {
+        #if DEBUG
+            let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
+            let waitStarted = DispatchTime.now().uptimeNanoseconds
+        #endif
         try await acquire(key: key)
+        #if DEBUG
+            let acquired = DispatchTime.now().uptimeNanoseconds
+        #endif
         do {
             try Task.checkCancellation()
             let value = try await operation()
+            #if DEBUG
+                let finished = DispatchTime.now().uptimeNanoseconds
+                WorktreeStartupInstrumentation.recordBenchmarkMutationLock(
+                    tag: benchmarkMetricTag,
+                    queueWaitMicroseconds: (acquired - waitStarted) / 1000,
+                    heldMicroseconds: (finished - acquired) / 1000
+                )
+            #endif
             release(key: key)
             return value
         } catch {
+            #if DEBUG
+                let finished = DispatchTime.now().uptimeNanoseconds
+                WorktreeStartupInstrumentation.recordBenchmarkMutationLock(
+                    tag: benchmarkMetricTag,
+                    queueWaitMicroseconds: (acquired - waitStarted) / 1000,
+                    heldMicroseconds: (finished - acquired) / 1000
+                )
+            #endif
             release(key: key)
             throw error
         }

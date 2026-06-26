@@ -740,10 +740,17 @@ actor GitService {
                     args.append(request.path.standardizedFileURL.path)
                     if let baseRef = request.baseRef, !baseRef.isEmpty { args.append(baseRef) }
 
+                    #if DEBUG
+                        let benchmarkMutationStarted = DispatchTime.now().uptimeNanoseconds
+                    #endif
                     let (_, stderr, exitCode) = try await runGit(args, at: repoURL)
                     guard exitCode == 0 else {
                         throw GitError(message: "git worktree add failed: \(stderr)")
                     }
+                    #if DEBUG
+                        let benchmarkMutationFinished = DispatchTime.now().uptimeNanoseconds
+                        let benchmarkPostMutationStarted = benchmarkMutationFinished
+                    #endif
 
                     await clearLayoutCache()
                     let createdPath = request.path.standardizedFileURL.path
@@ -964,6 +971,18 @@ actor GitService {
                                 decision: receiptDecision
                             )
                         }
+                    #endif
+                    #if DEBUG
+                        let benchmarkPostMutationFinished = DispatchTime.now().uptimeNanoseconds
+                        WorktreeStartupInstrumentation.recordBenchmarkMutationWork(
+                            tag: WorktreeStartupInstrumentation.currentBenchmarkMetricTag,
+                            mutationDurationMicroseconds: (
+                                benchmarkMutationFinished - benchmarkMutationStarted
+                            ) / 1000,
+                            postMutationFinalizationMicroseconds: (
+                                benchmarkPostMutationFinished - benchmarkPostMutationStarted
+                            ) / 1000
+                        )
                     #endif
                     return GitWorktreeCreateResult(
                         descriptor: created,

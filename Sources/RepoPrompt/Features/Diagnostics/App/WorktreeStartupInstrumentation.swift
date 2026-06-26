@@ -120,6 +120,14 @@ enum WorktreeStartupPhase: String, Equatable {
         case firstBenchmarkSearchCompleted
         case firstBenchmarkReadStarted
         case firstBenchmarkReadCompleted
+        case firstBenchmarkCodemapStarted
+        case firstBenchmarkCodemapCompleted
+        case warmBenchmarkCodemapStarted
+        case warmBenchmarkCodemapCompleted
+        case passiveBenchmarkTreeStarted
+        case passiveBenchmarkTreeCompleted
+        case benchmarkSelectionStarted
+        case benchmarkSelectionCompleted
     #endif
     case failed
 }
@@ -342,6 +350,34 @@ enum WorktreeStartupInstrumentation {
             case exact
         }
 
+        enum BenchmarkPlannerPhase: String, CaseIterable {
+            case targetNamespace
+            case treeEvidence
+            case indexEvidence
+            case statusEvidence
+            case reconcile
+        }
+
+        enum BenchmarkMarkerPublicationSource: String, Equatable {
+            case publishedUpdate
+            case warmReplay
+        }
+
+        struct BenchmarkPhaseMetric: Equatable {
+            var count = 0
+            var durationMicroseconds: UInt64 = 0
+            var itemCount = 0
+        }
+
+        struct BenchmarkMarkerPublication: Equatable {
+            let rootID: UUID
+            let rootLifetimeID: UUID
+            let revision: UInt64
+            let effectiveChangeCount: Int
+            let source: BenchmarkMarkerPublicationSource
+            let timestampNanoseconds: UInt64
+        }
+
         struct BenchmarkMetricSnapshot: Equatable {
             var gitCommands: [GitCommandMetric] = []
             var filesystemOperationCount = 0
@@ -356,6 +392,15 @@ enum WorktreeStartupInstrumentation {
             var codemapQueueMicroseconds: UInt64 = 0
             var codemapPermitWaitMicroseconds: UInt64 = 0
             var codemapAttribution: BenchmarkMetricAttribution = .unavailable
+            var plannerPhases: [BenchmarkPlannerPhase: BenchmarkPhaseMetric] = [:]
+            var mutationLockCount = 0
+            var mutationLockQueueMicroseconds: UInt64 = 0
+            var mutationLockHeldMicroseconds: UInt64 = 0
+            var mutationDurationMicroseconds: UInt64 = 0
+            var postMutationFinalizationMicroseconds: UInt64 = 0
+            var passiveTreeCount = 0
+            var passiveTreeDurationMicroseconds: UInt64 = 0
+            var markerPublications: [BenchmarkMarkerPublication] = []
         }
 
         @TaskLocal static var currentBenchmarkMetricTag: BenchmarkMetricTag?
@@ -480,6 +525,7 @@ enum WorktreeStartupInstrumentation {
     private static var seedCounters = SeedCounters()
     #if DEBUG
         private static let maximumReceiptDecisionCount = 128
+        private static let maximumBenchmarkMarkerPublicationCount = 128
         private static var eventEvictionCount = 0
         private static var gitCommandEvictionCount = 0
         private static var storedReceiptDecisions: [ReceiptDecision] = []
@@ -750,6 +796,104 @@ enum WorktreeStartupInstrumentation {
                     )
                 }
             }
+            benchmarkMetricsByTag[tag] = metrics
+            lock.unlock()
+        }
+
+        static func recordBenchmarkPlannerPhase(
+            tag: BenchmarkMetricTag?,
+            phase: BenchmarkPlannerPhase,
+            durationMicroseconds: UInt64,
+            itemCount: Int
+        ) {
+            guard let tag else { return }
+            lock.lock()
+            var metrics = benchmarkMetricsByTag[tag] ?? BenchmarkMetricSnapshot()
+            var phaseMetric = metrics.plannerPhases[phase] ?? BenchmarkPhaseMetric()
+            phaseMetric.count = incremented(phaseMetric.count)
+            phaseMetric.durationMicroseconds = adding(phaseMetric.durationMicroseconds, durationMicroseconds)
+            phaseMetric.itemCount = added(phaseMetric.itemCount, itemCount)
+            metrics.plannerPhases[phase] = phaseMetric
+            benchmarkMetricsByTag[tag] = metrics
+            lock.unlock()
+        }
+
+        static func recordBenchmarkMutationLock(
+            tag: BenchmarkMetricTag?,
+            queueWaitMicroseconds: UInt64,
+            heldMicroseconds: UInt64
+        ) {
+            guard let tag else { return }
+            lock.lock()
+            var metrics = benchmarkMetricsByTag[tag] ?? BenchmarkMetricSnapshot()
+            metrics.mutationLockCount = incremented(metrics.mutationLockCount)
+            metrics.mutationLockQueueMicroseconds = adding(
+                metrics.mutationLockQueueMicroseconds,
+                queueWaitMicroseconds
+            )
+            metrics.mutationLockHeldMicroseconds = adding(metrics.mutationLockHeldMicroseconds, heldMicroseconds)
+            benchmarkMetricsByTag[tag] = metrics
+            lock.unlock()
+        }
+
+        static func recordBenchmarkMutationWork(
+            tag: BenchmarkMetricTag?,
+            mutationDurationMicroseconds: UInt64,
+            postMutationFinalizationMicroseconds: UInt64
+        ) {
+            guard let tag else { return }
+            lock.lock()
+            var metrics = benchmarkMetricsByTag[tag] ?? BenchmarkMetricSnapshot()
+            metrics.mutationDurationMicroseconds = adding(
+                metrics.mutationDurationMicroseconds,
+                mutationDurationMicroseconds
+            )
+            metrics.postMutationFinalizationMicroseconds = adding(
+                metrics.postMutationFinalizationMicroseconds,
+                postMutationFinalizationMicroseconds
+            )
+            benchmarkMetricsByTag[tag] = metrics
+            lock.unlock()
+        }
+
+        static func recordBenchmarkPassiveTree(
+            tag: BenchmarkMetricTag?,
+            durationMicroseconds: UInt64
+        ) {
+            guard let tag else { return }
+            lock.lock()
+            var metrics = benchmarkMetricsByTag[tag] ?? BenchmarkMetricSnapshot()
+            metrics.passiveTreeCount = incremented(metrics.passiveTreeCount)
+            metrics.passiveTreeDurationMicroseconds = adding(
+                metrics.passiveTreeDurationMicroseconds,
+                durationMicroseconds
+            )
+            benchmarkMetricsByTag[tag] = metrics
+            lock.unlock()
+        }
+
+        static func recordBenchmarkMarkerPublication(
+            tag: BenchmarkMetricTag?,
+            rootID: UUID,
+            rootLifetimeID: UUID,
+            revision: UInt64,
+            effectiveChangeCount: Int,
+            source: BenchmarkMarkerPublicationSource
+        ) {
+            guard let tag, effectiveChangeCount > 0 else { return }
+            lock.lock()
+            var metrics = benchmarkMetricsByTag[tag] ?? BenchmarkMetricSnapshot()
+            if metrics.markerPublications.count == maximumBenchmarkMarkerPublicationCount {
+                metrics.markerPublications.removeFirst()
+            }
+            metrics.markerPublications.append(BenchmarkMarkerPublication(
+                rootID: rootID,
+                rootLifetimeID: rootLifetimeID,
+                revision: revision,
+                effectiveChangeCount: bounded(effectiveChangeCount),
+                source: source,
+                timestampNanoseconds: DispatchTime.now().uptimeNanoseconds
+            ))
             benchmarkMetricsByTag[tag] = metrics
             lock.unlock()
         }

@@ -207,6 +207,80 @@ separate distributions.
 This is a runtime diagnostic, not XCTest coverage. It does not add executable
 test IDs and must not change the curated test ledger.
 
+### Interactive-readiness iteration 0 campaign
+
+The worktree interactive-readiness campaign uses additive DEBUG diagnostic
+schema 5. Production route behavior is unchanged. Its authoritative iteration-0
+root is the real RepoPrompt CE main checkout in the dedicated
+`RPCE Search Bench Main 20260618` workspace (or a clearly owned equivalent real
+clone), never the active development tab/workspace. Synthetic repositories are
+allowed only by `self-test` and are labeled non-authoritative.
+
+Each route/width/process series is predeclared as exactly one excluded warmup
+plus five retained samples. Keep every valid slow sample and never replace an
+ordinal. The primary value is the app-monotonic interval from
+`bindingTransitionStarted` to the later successful direct `file_search` or
+`read_file` completion. Search/read start concurrently. Report the five raw
+values, p50, nearest-rank p95, and sample CV. CV above 50% requires a distinct
+predeclared confirmation plan with another one-plus-five series; do not pool the
+series, and accept a direction only when both agree.
+
+Plan and preflight the real root with explicit ownership and dedicated-workspace
+confirmation:
+
+```bash
+OWNER_TOKEN="$(uuidgen)"
+python3 Scripts/worktree_startup_live_benchmark.py create-marker \
+  --root-path /Users/pvncher/Documents/Git/repoprompt-ce-release \
+  --workspace-id '<workspace-uuid>' --root-id '<root-uuid>' \
+  --owner-token "$OWNER_TOKEN" \
+  --confirm-real-repository-benchmark --confirm-dedicated-workspace
+
+python3 Scripts/worktree_startup_live_benchmark.py plan \
+  --workspace-name 'RPCE Search Bench Main 20260618' \
+  --window-id '<window-id>' --workspace-id '<workspace-uuid>' \
+  --context-id '<context-uuid>' --root-id '<root-uuid>' \
+  --root-path /Users/pvncher/Documents/Git/repoprompt-ce-release \
+  --owner-token "$OWNER_TOKEN" --dataset-label rpce-real-readiness-iteration-0 \
+  --asserted-file-count '<exact-git-ls-files-count>' --base-ref HEAD \
+  --search-marker WorkspaceRootSeedPlanner \
+  --read-path Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/WorkspaceRootSeedPlanner.swift \
+  --read-marker WorkspaceRootSeedPlanner --invocations-per-series 1 \
+  --confirm-real-repository-benchmark --confirm-dedicated-workspace \
+  --output /tmp/rpce-real-readiness-iteration-0.json
+
+python3 Scripts/worktree_startup_live_benchmark.py preflight \
+  --plan /tmp/rpce-real-readiness-iteration-0.json \
+  --confirm-live-debug-app --confirm-dedicated-workspace
+```
+
+Run width 1 forced-full, then projected. Do not run widths 4/8 or aged until
+width-1 projected has exactly `{"diffSeedServing":1}` and an empty fallback map:
+
+```bash
+for ROUTE in forced-full projected; do
+  python3 Scripts/worktree_startup_live_benchmark.py run \
+    --plan /tmp/rpce-real-readiness-iteration-0.json \
+    --route "$ROUTE" --process-state warm --checkout-kind linked-worktree \
+    --width 1 --invocation 1 --warmups 1 --samples 5 \
+    --confirm-live-debug-app --confirm-process-state \
+    --confirm-dedicated-workspace
+done
+```
+
+Timing evidence comes from correlation-bound diagnostics and direct structured
+tool results, not inference wall time or assistant prose. Session-bound tools
+must keep CE's logical canonical root display while `worktree_scope` proves the
+exact physical binding by worktree ID; never require the displayed root path to
+equal the app-managed worktree path. Schema-v5 samples require every readiness
+boundary, monotonic phase order, duration consistency, attributed passive-tree
+work, and configured marker-publication evidence. The small inference gate
+separately checks exact raw tool-call/result order and forbidden-tool absence.
+Retain root/search/read, first and warm codemap, passive tree, selection,
+Git/filesystem/planner/lock, CPU/RSS/physical-footprint, cleanup, and actual-route
+evidence. Append iteration results to
+`prompt-exports/optimize-worktree-interactive-readiness-runs.md`.
+
 ### Dedicated workspace and plan
 
 Use a disposable workspace whose name starts with `RPCE 8E Bench ` or the
@@ -269,13 +343,15 @@ rejected.
 `asserted_file_count` is operator-supplied provenance, not an app measurement.
 The plan freezes the ownership-marker digest; do not recreate or edit the marker
 between cohorts.
-The plan records the complete required matrix: baseline, forced-full, and
-projected routes; cold, warm, and aged processes; main checkout and linked
-worktree; widths 1/2/4/8; nested inherited-worktree Agent Mode; selection and
-`get_code_structure`; exact-root/cross-root negatives; non-Git behavior;
-watcher create/edit/rename/delete; and ordinary/worktree root churn while
-agents remain active and while file/search/selection/codemap calls are in
-flight.
+The plan is the sole source of truth for required route/process/checkout/width
+cells and aggregate thresholds. The current interactive-readiness plan freezes
+baseline, forced-full, and projected routes; warm and aged linked-worktree
+process states; widths 1/4/8; a 30% primary improvement gate; and a 10%
+secondary-regression gate. Cold/main-root evidence is recorded separately as
+external provenance. Do not add implicit cold, width-2, 40%, or 5% requirements
+in the runner or aggregate. Correctness scenarios still cover nested inherited
+Agent Mode, selection and `get_code_structure`, exact-root/cross-root negatives,
+non-Git behavior, watcher changes, and ordinary/worktree root churn.
 
 Run schema discovery and exact-scope verification before mutation:
 

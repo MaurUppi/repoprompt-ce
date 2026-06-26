@@ -496,6 +496,9 @@ enum WorkspaceCodemapBindingEngineHookKind: String {
     case invalidation
     case publishedArtifactLookupHit
     case publishedArtifactLookupMiss
+    #if DEBUG
+        case publishedArtifactPostLookupCurrentnessRejection
+    #endif
     case rootUnload
     case projectionPreloadScheduled
     case projectionPreloadStarted
@@ -565,6 +568,12 @@ struct WorkspaceCodemapBindingEngineHookEvent {
 struct WorkspaceCodemapBindingEngineHooks {
     let event: @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void
     let afterManifestStoreWriteBeforeCompletion: @Sendable (WorkspaceCodemapRootEpoch) async -> Void
+    #if DEBUG
+        /// Deterministic race seam, structurally absent from non-DEBUG products.
+        let afterPublishedArtifactLookupBeforeCurrentnessValidation: @Sendable (
+            WorkspaceCodemapRootEpoch
+        ) async -> Void
+    #endif
 
     init(
         event: @escaping @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void = { _ in },
@@ -572,7 +581,27 @@ struct WorkspaceCodemapBindingEngineHooks {
     ) {
         self.event = event
         self.afterManifestStoreWriteBeforeCompletion = afterManifestStoreWriteBeforeCompletion
+        #if DEBUG
+            afterPublishedArtifactLookupBeforeCurrentnessValidation = { _ in }
+        #endif
     }
+
+    #if DEBUG
+        init(
+            event: @escaping @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void = { _ in },
+            afterManifestStoreWriteBeforeCompletion: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch
+            ) async -> Void = { _ in },
+            afterPublishedArtifactLookupBeforeCurrentnessValidation: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch
+            ) async -> Void
+        ) {
+            self.event = event
+            self.afterManifestStoreWriteBeforeCompletion = afterManifestStoreWriteBeforeCompletion
+            self.afterPublishedArtifactLookupBeforeCurrentnessValidation =
+                afterPublishedArtifactLookupBeforeCurrentnessValidation
+        }
+    #endif
 
     static let none = WorkspaceCodemapBindingEngineHooks()
 }
@@ -606,6 +635,9 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
     var publishedArtifactProjectionCASHits: UInt64 = 0
     var publishedArtifactLocatorCASHits: UInt64 = 0
     var publishedArtifactLookupMisses: UInt64 = 0
+    #if DEBUG
+        var publishedArtifactPostLookupCurrentnessRejections: UInt64 = 0
+    #endif
     var projectionPreloadsScheduled: UInt64 = 0
     var projectionPreloadsStarted: UInt64 = 0
     var projectionFirstSegments: UInt64 = 0
@@ -671,6 +703,9 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
         publishedArtifactProjectionCASHits = initialValue
         publishedArtifactLocatorCASHits = initialValue
         publishedArtifactLookupMisses = initialValue
+        #if DEBUG
+            publishedArtifactPostLookupCurrentnessRejections = initialValue
+        #endif
         projectionPreloadsScheduled = initialValue
         projectionPreloadsStarted = initialValue
         projectionFirstSegments = initialValue

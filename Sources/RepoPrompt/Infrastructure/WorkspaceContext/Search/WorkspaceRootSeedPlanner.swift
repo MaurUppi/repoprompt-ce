@@ -434,10 +434,23 @@ actor WorkspaceRootSeedPlanner {
         let attemptID = UUID()
         let provenance = Self.creationCutProvenance(receipt)
 
+        #if DEBUG
+            let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
+            var benchmarkPhaseStarted = DispatchTime.now().uptimeNanoseconds
+        #endif
         let namespace = try await service.workspaceRootNamespaceManifest(
             in: namespaceStore,
             resourcePolicy: namespaceResourcePolicy
         )
+        #if DEBUG
+            var benchmarkPhaseFinished = DispatchTime.now().uptimeNanoseconds
+            WorktreeStartupInstrumentation.recordBenchmarkPlannerPhase(
+                tag: benchmarkMetricTag,
+                phase: .targetNamespace,
+                durationMicroseconds: (benchmarkPhaseFinished - benchmarkPhaseStarted) / 1000,
+                itemCount: Int(clamping: namespace.footer.recordCount)
+            )
+        #endif
         let expectedNamespaceRoot = try WorkspaceRootNamespaceRootIdentity(
             rootURL: URL(fileURLWithPath: hint.standardizedTargetPath, isDirectory: true)
         )
@@ -445,6 +458,9 @@ actor WorkspaceRootSeedPlanner {
               namespace.header.identity.root == expectedNamespaceRoot
         else { throw PlanningFailure.fallback(.changedIgnoreAuthority) }
 
+        #if DEBUG
+            benchmarkPhaseStarted = DispatchTime.now().uptimeNanoseconds
+        #endif
         let tree = try await gitService.writeTreeDeltaEvidence(
             baseTreeOID: snapshot.compatibilityKey.treeOID,
             in: receipt.targetLayout,
@@ -455,6 +471,16 @@ actor WorkspaceRootSeedPlanner {
             store: evidenceStore,
             evidenceResourcePolicy: evidenceResourcePolicy
         )
+        #if DEBUG
+            benchmarkPhaseFinished = DispatchTime.now().uptimeNanoseconds
+            WorktreeStartupInstrumentation.recordBenchmarkPlannerPhase(
+                tag: benchmarkMetricTag,
+                phase: .treeEvidence,
+                durationMicroseconds: (benchmarkPhaseFinished - benchmarkPhaseStarted) / 1000,
+                itemCount: Int(clamping: tree.footer.recordCount)
+            )
+            benchmarkPhaseStarted = DispatchTime.now().uptimeNanoseconds
+        #endif
         let index = try await gitService.writeIndexEvidence(
             in: receipt.targetLayout,
             prefix: receipt.repositoryRelativeRootPrefix,
@@ -464,6 +490,16 @@ actor WorkspaceRootSeedPlanner {
             store: evidenceStore,
             evidenceResourcePolicy: evidenceResourcePolicy
         )
+        #if DEBUG
+            benchmarkPhaseFinished = DispatchTime.now().uptimeNanoseconds
+            WorktreeStartupInstrumentation.recordBenchmarkPlannerPhase(
+                tag: benchmarkMetricTag,
+                phase: .indexEvidence,
+                durationMicroseconds: (benchmarkPhaseFinished - benchmarkPhaseStarted) / 1000,
+                itemCount: Int(clamping: index.footer.recordCount)
+            )
+            benchmarkPhaseStarted = DispatchTime.now().uptimeNanoseconds
+        #endif
         let status = try await gitService.writeStatusEvidence(
             in: receipt.targetLayout,
             prefix: receipt.repositoryRelativeRootPrefix,
@@ -473,7 +509,19 @@ actor WorkspaceRootSeedPlanner {
             store: evidenceStore,
             evidenceResourcePolicy: evidenceResourcePolicy
         )
+        #if DEBUG
+            benchmarkPhaseFinished = DispatchTime.now().uptimeNanoseconds
+            WorktreeStartupInstrumentation.recordBenchmarkPlannerPhase(
+                tag: benchmarkMetricTag,
+                phase: .statusEvidence,
+                durationMicroseconds: (benchmarkPhaseFinished - benchmarkPhaseStarted) / 1000,
+                itemCount: Int(clamping: status.footer.recordCount)
+            )
+        #endif
         let evidence = try GitTargetEvidenceBundleLease(treeDelta: tree, index: index, status: status)
+        #if DEBUG
+            benchmarkPhaseStarted = DispatchTime.now().uptimeNanoseconds
+        #endif
         let plan = try await Self.reconcile(
             snapshot: snapshot,
             targetTreeOID: fence.snapshot.treeOID,
@@ -483,6 +531,15 @@ actor WorkspaceRootSeedPlanner {
             planStore: planStore,
             resourcePolicy: planResourcePolicy
         )
+        #if DEBUG
+            benchmarkPhaseFinished = DispatchTime.now().uptimeNanoseconds
+            WorktreeStartupInstrumentation.recordBenchmarkPlannerPhase(
+                tag: benchmarkMetricTag,
+                phase: .reconcile,
+                durationMicroseconds: (benchmarkPhaseFinished - benchmarkPhaseStarted) / 1000,
+                itemCount: Int(clamping: plan.footer.recordCount)
+            )
+        #endif
         return try WorkspaceRootTargetSeedPlanHandle(
             snapshot: snapshot,
             namespaceManifest: namespace,
