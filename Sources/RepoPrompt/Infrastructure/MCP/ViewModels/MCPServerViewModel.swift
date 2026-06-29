@@ -639,9 +639,11 @@ final class MCPServerViewModel: ObservableObject {
 
     private func agentRunOracleReviewLaunchSelectionStillMatches(
         snapshot: AgentRunOracleReviewLaunchSnapshot,
-        liveSelection: StoredSelection
+        liveSelection: StoredSelection,
+        liveRevision: UInt64
     ) -> Bool {
-        AgentRunOracleReviewSelectionIdentity.normalizedSourceSelectionIdentities(liveSelection)
+        liveRevision == snapshot.selectionRevision
+            || AgentRunOracleReviewSelectionIdentity.normalizedSourceSelectionIdentities(liveSelection)
             == snapshot.normalizedSourceSelectionIdentities
     }
 
@@ -714,9 +716,14 @@ final class MCPServerViewModel: ObservableObject {
                 sourceRunID
             )
         }
+        let initialSelectionRevision = manager.selectionRevisionForMCP(
+            workspaceID: snapshot.workspaceID,
+            tabID: sourceTabID
+        )
         guard agentRunOracleReviewLaunchSelectionStillMatches(
             snapshot: snapshot,
-            liveSelection: initial.snapshot.selection
+            liveSelection: initial.snapshot.selection,
+            liveRevision: initialSelectionRevision
         ) else {
             return unavailable(
                 "The launching tab changed after its review selection was frozen.",
@@ -776,9 +783,14 @@ final class MCPServerViewModel: ObservableObject {
                     sourceRunID
                 )
             }
+            let latestSelectionRevision = manager.selectionRevisionForMCP(
+                workspaceID: snapshot.workspaceID,
+                tabID: sourceTabID
+            )
             guard agentRunOracleReviewLaunchSelectionStillMatches(
                 snapshot: snapshot,
-                liveSelection: latest.snapshot.selection
+                liveSelection: latest.snapshot.selection,
+                liveRevision: latestSelectionRevision
             ) else {
                 return unavailable(
                     "The launching selection changed while its frozen review capability was being created.",
