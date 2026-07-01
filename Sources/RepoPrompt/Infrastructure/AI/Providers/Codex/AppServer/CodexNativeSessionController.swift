@@ -468,8 +468,9 @@ final class CodexNativeSessionController {
         var approvalReviewerProvider: () -> CodexAgentToolPreferences.ApprovalReviewer = { CodexAgentToolPreferences.approvalReviewer() }
         var authTokensRefreshHandler: ChatgptAuthTokensRefreshHandler?
         /// Process-level reasoning summary override for app-server launch.
+        /// Nil preserves Codex process defaults; non-nil values are explicit process overrides.
         /// Agent Mode omits this so thread start/resume config is authoritative.
-        var processModelReasoningSummary: CodexOverrides.ReasoningSummary? = .auto
+        var processModelReasoningSummary: CodexOverrides.ReasoningSummary? = nil
         var goalSupportEnabledProvider: @MainActor () -> Bool = { false }
         var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }

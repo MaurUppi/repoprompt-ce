@@ -138,7 +138,8 @@ actor CodexAppServerClient {
         let workingDirectory: String?
         let processFeaturePolicy: CodexOverrides.FeaturePolicy
         /// Process-level `model_reasoning_summary` override for app-server launch.
-        /// Use nil when callers provide per-thread config and need Codex defaults untouched.
+        /// Nil preserves Codex CLI process defaults; pass a value only for an intentional process override.
+        /// Agent Mode should prefer per-thread config instead of process launch config.
         let processModelReasoningSummary: CodexOverrides.ReasoningSummary?
 
         init(
@@ -148,7 +149,7 @@ actor CodexAppServerClient {
             requestTimeout: TimeInterval? = nil,
             workingDirectory: String? = nil,
             processFeaturePolicy: CodexOverrides.FeaturePolicy = .defaultDisabled,
-            processModelReasoningSummary: CodexOverrides.ReasoningSummary? = .auto
+            processModelReasoningSummary: CodexOverrides.ReasoningSummary? = nil
         ) {
             self.commandName = commandName
             self.additionalPathHints = additionalPathHints
