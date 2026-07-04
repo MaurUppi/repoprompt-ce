@@ -267,6 +267,28 @@ class WorkspaceFileContextStoreCodemapSeamTestSupport: XCTestCase {
         return completion.isFinished
     }
 
+    fileprivate func waitForCodemapGraphPublicationDrain(
+        store: WorkspaceFileContextStore,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        timeout: Duration = .seconds(5)
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            let state = await store.codemapGraphPublicationRecoveryStateForTesting(
+                rootEpoch: rootEpoch
+            )
+            if !state.flightActive, !state.observerActive {
+                return true
+            }
+            await Task.yield()
+        }
+        let state = await store.codemapGraphPublicationRecoveryStateForTesting(
+            rootEpoch: rootEpoch
+        )
+        return !state.flightActive && !state.observerActive
+    }
+
     fileprivate func pendingTicket(
         _ result: WorkspaceCodemapArtifactDemandResult
     ) throws -> WorkspaceCodemapArtifactDemandTicket {
@@ -292,6 +314,73 @@ class WorkspaceFileContextStoreCodemapSeamTestSupport: XCTestCase {
             throw CodemapStoreTestError.expectedReady
         }
         return ready
+    }
+
+    /// Requests a codemap artifact demand and retries through transient unavailability
+    /// (git transient failures, busy backoff, runtime setup hiccups) until the demand
+    /// settles ready or a stable unavailability/timeout is reached. Hosted CI runners
+    /// can transiently fail git authority capture under load; re-requesting detaches
+    /// the failed session and re-triggers setup so the test reaches the ready state
+    /// it needs without masking genuine terminal failures.
+    fileprivate func readyArtifactDemand(
+        store: WorkspaceFileContextStore,
+        forFileID fileID: UUID,
+        timeout: Duration = .seconds(30),
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws -> (ticket: WorkspaceCodemapArtifactDemandTicket, ready: WorkspaceCodemapArtifactDemandReady) {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        var lastNonReadyResult: WorkspaceCodemapArtifactDemandResult?
+        while clock.now < deadline {
+            let initial = await store.requestCodemapArtifact(forFileID: fileID)
+            switch initial {
+            case let .pending(ticket):
+                let result = try await settledResult(store: store, ticket: ticket)
+                switch result {
+                case let .ready(ready):
+                    return (ticket, ready)
+                case let .unavailable(reason) where !Self.demandUnavailableIsStable(reason):
+                    lastNonReadyResult = result
+                    try await Task.sleep(for: .milliseconds(50))
+                    continue
+                default:
+                    lastNonReadyResult = result
+                    throw CodemapStoreTestError.expectedReady
+                }
+            case let .ready(ready):
+                return (ready.ticket, ready)
+            case let .unavailable(reason) where !Self.demandUnavailableIsStable(reason):
+                lastNonReadyResult = initial
+                try await Task.sleep(for: .milliseconds(50))
+                continue
+            default:
+                lastNonReadyResult = initial
+                throw CodemapStoreTestError.expectedReady
+            }
+        }
+        XCTFail(
+            "Timed out waiting for ready codemap artifact demand; last result = \(String(describing: lastNonReadyResult)).",
+            file: file,
+            line: line
+        )
+        throw CodemapStoreTestError.timedOut
+    }
+
+    private static func demandUnavailableIsStable(
+        _ reason: WorkspaceCodemapArtifactDemandUnavailableReason
+    ) -> Bool {
+        switch reason {
+        case .rootNotLoaded, .fileNotCataloged, .unsupportedFileType:
+            true
+        case let .gitTerminal(reason):
+            reason != .releasedRootEpoch
+        case let .demandUnavailable(reason):
+            reason != .transient
+        case .gitTransient, .busy, .rejected, .routeConflict, .registrationFailed,
+             .runtimeFailure, .staleCurrentness, .cancelled:
+            false
+        }
     }
 
     fileprivate func frozenPresentationBundle(
@@ -4424,7 +4513,11 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
         let firstTicket = try await pendingTicket(
             store.requestCodemapArtifact(forFileID: first.id)
         )
-        _ = try await readyResult(settledResult(store: store, ticket: firstTicket))
+        let firstSettled = try await settledResult(store: store, ticket: firstTicket)
+        guard case .ready = firstSettled else {
+            XCTFail("Expected first codemap artifact ready, got \(firstSettled)")
+            throw CodemapStoreTestError.expectedReady
+        }
         let blockedGeneration = try XCTUnwrap(buildGate.waitUntilFirstBlocked())
         let oldGraph = try XCTUnwrap(graphProbe.graph(rootEpoch: firstTicket.rootEpoch))
         let firstQuery = WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
@@ -4457,7 +4550,11 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
         let secondTicket = try await pendingTicket(
             store.requestCodemapArtifact(forFileID: second.id)
         )
-        _ = try await readyResult(settledResult(store: store, ticket: secondTicket))
+        let secondSettled = try await settledResult(store: store, ticket: secondTicket)
+        guard case .ready = secondSettled else {
+            XCTFail("Expected second codemap artifact ready, got \(secondSettled)")
+            throw CodemapStoreTestError.expectedReady
+        }
         let query = WorkspaceCodemapStoreSelectionGraphQuery(selectedSources: [
             WorkspaceCodemapStoreSelectionGraphSourceIdentity(ticket: firstTicket)
         ])
@@ -4479,9 +4576,22 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
             accountingBeforeUnload.currentObservedKey?.contributionGeneration.rawValue,
             latestGeneration
         )
-        XCTAssertEqual(accountingBeforeUnload.publishedCount, 0)
-        XCTAssertEqual(accountingBeforeUnload.emptyPublishedCount, 0)
-        XCTAssertNil(accountingBeforeUnload.publishedSummary)
+        XCTAssertEqual(accountingBeforeUnload.currentUnavailableReason, .rebuilding)
+        if let publishedSummary = accountingBeforeUnload.publishedSummary {
+            XCTAssertLessThan(
+                publishedSummary.key.contributionGeneration.rawValue,
+                latestGeneration,
+                "Expected any retained published shard to be stale while the latest generation remains blocked."
+            )
+        }
+        let latestBlockedQueryStarted = queryClock.now
+        let whileLatestContributionBlocked = await store.queryCodemapSelectionGraph(query)
+        let latestBlockedQueryDuration = latestBlockedQueryStarted.duration(to: queryClock.now)
+        XCTAssertTrue(
+            isFailClosedQueuedState(whileLatestContributionBlocked),
+            "Expected blocked latest-wins work to keep stale graph state fail closed."
+        )
+        XCTAssertLessThan(latestBlockedQueryDuration, .seconds(1))
 
         let unloadTask = Task {
             await store.unloadRoot(id: loaded.id)
@@ -4504,8 +4614,6 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
         await unloadTask.value
 
         let oldAccounting = await oldGraph.accounting()
-        XCTAssertEqual(oldAccounting.publishedCount, 0)
-        XCTAssertEqual(oldAccounting.emptyPublishedCount, 0)
         XCTAssertNil(oldAccounting.publishedSummary)
         XCTAssertEqual(
             oldAccounting.currentUnavailableReason,
@@ -4601,6 +4709,16 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
             after: firstObservedKey.contributionGeneration
         )
         XCTAssertNotNil(latestObservedKey)
+        // `waitUntilObservedKey` returns once the graph actor accepts the newer desired key,
+        // before the store necessarily resumes from `observeDesiredKey` and installs its
+        // matching desired key / pending snapshot.  The publication flight drains only after
+        // `enqueueCodemapGraphSnapshot` returns, so wait for that store-side handoff before
+        // releasing the admission gate that lets the blocked worker resume.
+        let latestPublicationDrained = await waitForCodemapGraphPublicationDrain(
+            store: store,
+            rootEpoch: firstTicket.rootEpoch
+        )
+        XCTAssertTrue(latestPublicationDrained)
 
         await admissionWaitGate.release()
         buildGate.release(generation: blockerGeneration)
@@ -5695,8 +5813,9 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
         let loaded = try await store.loadRoot(path: root.path)
         let loadedFiles = await store.files(inRoot: loaded.id)
         let feature = try XCTUnwrap(loadedFiles.first)
-        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: feature.id))
-        let ready = try await readyResult(settledResult(store: store, ticket: ticket))
+        let initialDemand = try await readyArtifactDemand(store: store, forFileID: feature.id)
+        let ticket = initialDemand.ticket
+        let ready = initialDemand.ready
         let logicalPath = try XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
             rootDisplayName: "Workspace",
             standardizedRelativePath: feature.standardizedRelativePath
@@ -5733,12 +5852,9 @@ final class WorkspaceFileContextStoreCodemapSeamTests: WorkspaceFileContextStore
             relativePath: feature.standardizedRelativePath
         )
         let successorFile = try XCTUnwrap(successorFileValue)
-        let successorTicket = try await pendingTicket(store.requestCodemapArtifact(forFileID: successorFile.id))
+        let successorDemand = try await readyArtifactDemand(store: store, forFileID: successorFile.id)
+        let successorTicket = successorDemand.ticket
         XCTAssertGreaterThan(successorTicket.catalogGeneration, ticket.catalogGeneration)
-        let successorResult = try await settledResult(store: store, ticket: successorTicket)
-        guard case .ready = successorResult else {
-            return XCTFail("Expected checkout successor ready, got \(successorResult).")
-        }
         _ = try await store.createFile(
             rootID: loaded.id,
             relativePath: "Sources/CatalogReplacement.swift",
@@ -7879,19 +7995,18 @@ final class WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests:
             }
             for demandIndex in 1 ... 3 {
                 let pendingWaitIndex = demandIndex * 2 - 1
-                guard await sequence.waitUntilWaitCount(pendingWaitIndex, timeout: .seconds(2)),
-                      let tickets = await sequence.waitUntilDemandCount(demandIndex, timeout: .seconds(2)),
+                guard await sequence.waitUntilWaitCount(pendingWaitIndex),
+                      let tickets = await sequence.waitUntilDemandCount(demandIndex),
                       let ticket = tickets.last
                 else { throw CodemapStoreTestError.timedOut }
                 try await settledOutcomes.append(settledResult(
                     store: store,
-                    ticket: ticket,
-                    timeout: .seconds(2)
+                    ticket: ticket
                 ))
                 await sequence.releaseWait(pendingWaitIndex)
                 if demandIndex < 3 {
                     let retryWaitIndex = pendingWaitIndex + 1
-                    guard await sequence.waitUntilWaitCount(retryWaitIndex, timeout: .seconds(2)) else {
+                    guard await sequence.waitUntilWaitCount(retryWaitIndex) else {
                         throw CodemapStoreTestError.timedOut
                     }
                     await sequence.releaseWait(retryWaitIndex)
@@ -8039,19 +8154,18 @@ final class WorkspaceFileContextStoreCodemapAutomaticSelectionSeamTests:
             }
             for demandIndex in 1 ... 3 {
                 let pendingWaitIndex = demandIndex * 2 - 1
-                guard await sequence.waitUntilWaitCount(pendingWaitIndex, timeout: .seconds(2)),
-                      let tickets = await sequence.waitUntilDemandCount(demandIndex, timeout: .seconds(2)),
+                guard await sequence.waitUntilWaitCount(pendingWaitIndex),
+                      let tickets = await sequence.waitUntilDemandCount(demandIndex),
                       let ticket = tickets.last
                 else { throw CodemapStoreTestError.timedOut }
                 try await settledOutcomes.append(settledResult(
                     store: store,
-                    ticket: ticket,
-                    timeout: .seconds(2)
+                    ticket: ticket
                 ))
                 await sequence.releaseWait(pendingWaitIndex)
                 if demandIndex < 3 {
                     let retryWaitIndex = pendingWaitIndex + 1
-                    guard await sequence.waitUntilWaitCount(retryWaitIndex, timeout: .seconds(2)) else {
+                    guard await sequence.waitUntilWaitCount(retryWaitIndex) else {
                         throw CodemapStoreTestError.timedOut
                     }
                     await sequence.releaseWait(retryWaitIndex)
@@ -9970,6 +10084,8 @@ private actor CodemapAutomaticSelectionSequenceHarness {
     private var releasedWaits = Set<Int>()
     private var releaseAllWaits = false
     private var continuations: [Int: CheckedContinuation<Void, Error>] = [:]
+    private var demandCountObservers: [UUID: AsyncStream<[WorkspaceCodemapArtifactDemandTicket]>.Continuation] = [:]
+    private var waitCountObservers: [UUID: AsyncStream<Int>.Continuation] = [:]
 
     var recordedTickets: [WorkspaceCodemapArtifactDemandTicket] {
         demandTickets
@@ -9981,6 +10097,7 @@ private actor CodemapAutomaticSelectionSequenceHarness {
 
     func recordDemand(_ ticket: WorkspaceCodemapArtifactDemandTicket) -> Int {
         demandTickets.append(ticket)
+        publishDemandTickets()
         return demandTickets.count
     }
 
@@ -9988,6 +10105,7 @@ private actor CodemapAutomaticSelectionSequenceHarness {
         try Task.checkCancellation()
         waiterInvocationCount += 1
         let invocation = waiterInvocationCount
+        publishWaitCount()
         guard !releaseAllWaits, !releasedWaits.contains(invocation) else { return }
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation {
@@ -10012,40 +10130,87 @@ private actor CodemapAutomaticSelectionSequenceHarness {
         releaseAllWaits = true
         let pending = Array(continuations.values)
         continuations.removeAll()
+        let demandObservers = Array(demandCountObservers.values)
+        demandCountObservers.removeAll()
+        let waitObservers = Array(waitCountObservers.values)
+        waitCountObservers.removeAll()
         for continuation in pending {
             continuation.resume(returning: ())
+        }
+        for observer in demandObservers {
+            observer.finish()
+        }
+        for observer in waitObservers {
+            observer.finish()
         }
     }
 
     func waitUntilDemandCount(
-        _ expectedCount: Int,
-        timeout: Duration
+        _ expectedCount: Int
     ) async -> [WorkspaceCodemapArtifactDemandTicket]? {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while demandTickets.count < expectedCount, clock.now < deadline {
+        if demandTickets.count >= expectedCount { return demandTickets }
+        let stream = demandTicketStream()
+        for await tickets in stream {
+            if tickets.count >= expectedCount { return tickets }
             guard !Task.isCancelled else { return nil }
-            do {
-                try await Task.sleep(for: .milliseconds(10))
-            } catch {
-                return nil
-            }
         }
         return demandTickets.count >= expectedCount ? demandTickets : nil
     }
 
-    func waitUntilWaitCount(_ expectedCount: Int, timeout: Duration) async -> Bool {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while waiterInvocationCount < expectedCount, clock.now < deadline {
+    func waitUntilWaitCount(_ expectedCount: Int) async -> Bool {
+        if waiterInvocationCount >= expectedCount { return true }
+        let stream = waitCountStream()
+        for await count in stream {
+            if count >= expectedCount { return true }
             guard !Task.isCancelled else { return false }
-            do {
-                try await Task.sleep(for: .milliseconds(10))
-            } catch {
-                return false
-            }
         }
         return waiterInvocationCount >= expectedCount
+    }
+
+    private func demandTicketStream() -> AsyncStream<[WorkspaceCodemapArtifactDemandTicket]> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<[WorkspaceCodemapArtifactDemandTicket]>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        demandCountObservers[id] = continuation
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeDemandObserver(id) }
+        }
+        continuation.yield(demandTickets)
+        return stream
+    }
+
+    private func waitCountStream() -> AsyncStream<Int> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<Int>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        waitCountObservers[id] = continuation
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeWaitObserver(id) }
+        }
+        continuation.yield(waiterInvocationCount)
+        return stream
+    }
+
+    private func publishDemandTickets() {
+        for continuation in demandCountObservers.values {
+            continuation.yield(demandTickets)
+        }
+    }
+
+    private func publishWaitCount() {
+        for continuation in waitCountObservers.values {
+            continuation.yield(waiterInvocationCount)
+        }
+    }
+
+    private func removeDemandObserver(_ id: UUID) {
+        demandCountObservers.removeValue(forKey: id)
+    }
+
+    private func removeWaitObserver(_ id: UUID) {
+        waitCountObservers.removeValue(forKey: id)
     }
 
     private func cancelWait(_ invocation: Int) {

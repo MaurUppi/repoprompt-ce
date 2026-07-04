@@ -620,6 +620,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         registerExpansionTracking(for: folder)
         // Mark snapshot cache as dirty
         invalidateStaticSnapshot(forRootFullPath: folder.standardizedFullPath)
+        publishRootShellProjectionsChanged()
     }
 
     @MainActor
@@ -645,6 +646,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         if rootFolders.isEmpty {
             allFoldersUnloadedPublisher.send(())
         }
+        publishRootShellProjectionsChanged()
     }
 
     @MainActor
@@ -727,6 +729,42 @@ class WorkspaceFilesViewModel: ObservableObject {
     var enableHierarchicalIgnores: Bool = true
 
     var onRootFoldersChanged: (() -> Void)?
+    private let rootShellProjectionsChangedSubject = PassthroughSubject<Void, Never>()
+    private var rootShellProjectionChangeBatchDepth = 0
+    private var hasPendingRootShellProjectionChange = false
+
+    var rootShellProjectionsChangedPublisher: AnyPublisher<Void, Never> {
+        rootShellProjectionsChangedSubject.eraseToAnyPublisher()
+    }
+
+    @MainActor
+    func beginRootShellProjectionChangeBatch() {
+        rootShellProjectionChangeBatchDepth += 1
+    }
+
+    @MainActor
+    func endRootShellProjectionChangeBatch() {
+        guard rootShellProjectionChangeBatchDepth > 0 else { return }
+        rootShellProjectionChangeBatchDepth -= 1
+        guard rootShellProjectionChangeBatchDepth == 0, hasPendingRootShellProjectionChange else { return }
+        hasPendingRootShellProjectionChange = false
+        publishRootShellProjectionsChanged()
+    }
+
+    @MainActor
+    private func publishRootFoldersChanged() {
+        onRootFoldersChanged?()
+    }
+
+    @MainActor
+    private func publishRootShellProjectionsChanged() {
+        if rootShellProjectionChangeBatchDepth > 0 {
+            hasPendingRootShellProjectionChange = true
+            return
+        }
+        publishRootFoldersChanged()
+        rootShellProjectionsChangedSubject.send(())
+    }
 
     @Published private var selectedFileIDs: Set<UUID> = []
     private var isSelectionBatching = false
@@ -2207,6 +2245,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             return false
         }
 
+        var needsIndexRebuild = useCanonicalSnapshotMetadata
         var topologyChanged = false
         var dirtyFolders: [UUID: FolderViewModel] = [:]
         var removedSubtrees: [RemovedFolderSubtree] = []
@@ -2277,10 +2316,33 @@ class WorkspaceFilesViewModel: ObservableObject {
                 if let parent = removed.formerParentFolder ?? parentFolderForRelativePath(path, under: targetRootVM) {
                     dirtyFolders[parent.id] = parent
                 }
+            } else {
+                let fullPath = StandardizedPath.join(
+                    standardizedRoot: rootKey,
+                    standardizedRelativePath: path
+                )
+                let matcher = RemovedFolderPathMatcher(removedFolderPaths: [fullPath])
+                let standardizedRootKey = StandardizedPath.absolute(rootKey)
+                let hasIndexedDescendantFiles = if let ownedFilePaths = fileHierarchyIndex.filePathsByRoot[standardizedRootKey] {
+                    ownedFilePaths.contains {
+                        matcher.containsPathEqualToOrInsideRemovedFolder($0)
+                    }
+                } else {
+                    fileHierarchyIndex.filesByFullPath.values.contains { file in
+                        file.standardizedRootFolderPath == standardizedRootKey
+                            && matcher.containsPathEqualToOrInsideRemovedFolder(file.standardizedFullPath)
+                    }
+                }
+                if fileHierarchyIndex.foldersByFullPath[fullPath] != nil || hasIndexedDescendantFiles {
+                    needsIndexRebuild = true
+                }
             }
         }
         if !removedSubtrees.isEmpty {
-            _ = performBatchedIncrementalRemovedSubtreeCleanup(removedSubtrees, rootKey: rootKey)
+            let cleanupOutcome = performBatchedIncrementalRemovedSubtreeCleanup(removedSubtrees, rootKey: rootKey)
+            if !cleanupOutcome.succeeded {
+                needsIndexRebuild = true
+            }
         }
 
         for fileID in event.modifiedFileIDs {
@@ -2334,9 +2396,11 @@ class WorkspaceFilesViewModel: ObservableObject {
             } else {
                 recomputeAncestorStates(startingAtFolders: Array(dirtyFolders.values))
             }
+        }
+        if needsIndexRebuild {
             rebuildFileHierarchyIndex(for: targetRootVM)
         }
-        onRootFoldersChanged?()
+        publishRootFoldersChanged()
         fileSystemDeltasAppliedPublisher.send(FileSystemDeltasAppliedEvent(rootKey: rootKey, deltas: []))
         invalidateStaticSnapshot(forRootFullPath: targetRootVM.standardizedFullPath)
         return true
@@ -2705,7 +2769,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             currentWorkspaceID = workspaceID
         }
         if notifyRootChange {
-            onRootFoldersChanged?()
+            publishRootShellProjectionsChanged()
         }
         return RootShellAttachment(folder: rootFolderVM, didAppend: true)
     }
@@ -2765,7 +2829,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
         invalidateStaticSnapshot(forRootFullPath: stdRoot)
         removeHierarchyGenerationEntry(forRootFullPath: stdRoot)
-        onRootFoldersChanged?()
+        publishRootShellProjectionsChanged()
         if rootFolders.isEmpty {
             allFoldersUnloadedPublisher.send(())
         }
@@ -2781,7 +2845,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         fileHierarchyIndex.insertFolder(folder, rootKey: rootKey)
         registerExpansionTracking(for: folder)
         invalidateStaticSnapshot(forRootFullPath: folder.standardizedFullPath)
-        onRootFoldersChanged?()
+        publishRootShellProjectionsChanged()
     }
 
     /// When refreshRootFolderStateAfterLoad is false, the caller must perform a later
@@ -2878,11 +2942,20 @@ class WorkspaceFilesViewModel: ObservableObject {
                 #if DEBUG
                     let rootVMInitStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
                 #endif
-                let rootShellAttachment = try attachRootShellInternal(
-                    for: workspaceRootRecord,
-                    workspaceID: workspace.id,
-                    notifyRootChange: false
-                )
+                let rootShellAttachment: RootShellAttachment
+                do {
+                    beginRootShellProjectionChangeBatch()
+                    defer { endRootShellProjectionChangeBatch() }
+                    rootShellAttachment = try attachRootShellInternal(
+                        for: workspaceRootRecord,
+                        workspaceID: workspace.id,
+                        notifyRootChange: true
+                    )
+                    try validateRootLoadToken(loadToken)
+                    if rootKind == .user {
+                        reorderRootFolders(to: workspace.repoPaths)
+                    }
+                }
                 let rootFolderVM = rootShellAttachment.folder
                 attachedRootFolder = rootFolderVM
                 if rootShellAttachment.didAppend {
@@ -2903,11 +2976,6 @@ class WorkspaceFilesViewModel: ObservableObject {
                         await rootLoadDidAttachRootShellHandler(stdRootPath, workspaceRootRecord.id)
                     }
                 #endif
-                try validateRootLoadToken(loadToken)
-
-                if rootKind == .user {
-                    reorderRootFolders(to: workspace.repoPaths)
-                }
                 try validateRootLoadToken(loadToken)
                 rootShellLoadedPaths.insert(stdRootPath)
                 invalidateStaticSnapshot(forRootFullPath: rootFolderVM.standardizedFullPath)
@@ -3178,7 +3246,9 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
         // Remove only this captured partial VM. A newer same-path load can reuse the
         // stable store root ID, so ID-based removal can detach the new owner.
+        let rootCountBeforeRemoval = rootFolders.count
         rootFolders.removeAll { $0 === folder }
+        let removedRootFolder = rootFolders.count != rootCountBeforeRemoval
         if let currentFolderBeingAdded = folderBeingAdded, currentFolderBeingAdded === folder {
             folderBeingAdded = nil
         }
@@ -3210,6 +3280,9 @@ class WorkspaceFilesViewModel: ObservableObject {
             removeHierarchyGenerationEntry(forRootFullPath: stdPath)
         }
         invalidateStaticSnapshot(forRootFullPath: nil)
+        if removedRootFolder {
+            publishRootShellProjectionsChanged()
+        }
     }
 
     private func unloadRootFolder(for url: URL) async {
@@ -3309,7 +3382,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         // If this refresh genuinely unloaded/reloaded roots, emit one final broad
         // invalidation after the in-place work settles. Pure soft refreshes and
         if didStructurallyRefreshRoots && !didReorderRoots {
-            onRootFoldersChanged?()
+            publishRootShellProjectionsChanged()
         }
         return didStructurallyRefreshRoots || didReorderRoots
     }
@@ -4262,7 +4335,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         #if DEBUG
             let onRootsChangedStartMS = debugPerfTimestampMS()
         #endif
-        onRootFoldersChanged?()
+        publishRootFoldersChanged()
         #if DEBUG
             onRootFoldersChangedDurationMS = debugPerfElapsedMS(since: onRootsChangedStartMS)
         #endif
@@ -4783,7 +4856,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
         invalidateStaticSnapshot(forRootFullPath: rootKey)
         await clearPathResolutionCaches()
-        onRootFoldersChanged?()
+        publishRootFoldersChanged()
         return outcome.file
     }
 
@@ -5549,7 +5622,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             await workspaceFileContextStore.unloadRoot(id: workspaceRoot.id)
         }
 
-        onRootFoldersChanged?()
+        publishRootShellProjectionsChanged()
 
         if currentSlicesByRoot.removeValue(forKey: stdRoot) != nil {
             requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
@@ -6207,7 +6280,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         if hadRoots {
             allFoldersUnloadedPublisher.send(())
         }
-        onRootFoldersChanged?()
+        publishRootShellProjectionsChanged()
     }
 
     @MainActor
@@ -7893,7 +7966,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         let reorderedRoots = userRoots + systemRoots
         guard rootFolders.map(\.id) != reorderedRoots.map(\.id) else { return false }
         rootFolders = reorderedRoots
-        onRootFoldersChanged?()
+        publishRootShellProjectionsChanged()
         return true
     }
 
@@ -8827,6 +8900,11 @@ class WorkspaceFilesViewModel: ObservableObject {
         @MainActor
         func injectIndexedFileForTesting(_ file: FileViewModel) {
             fileHierarchyIndex.insertFile(file, rootKey: file.standardizedRootFolderPath)
+        }
+
+        @MainActor
+        func injectIndexedFolderForTesting(_ folder: FolderViewModel) {
+            fileHierarchyIndex.insertFolder(folder, rootKey: StandardizedPath.absolute(folder.rootPath))
         }
 
         /// Attach the selection callback and toggle a file into `selectedFiles`
