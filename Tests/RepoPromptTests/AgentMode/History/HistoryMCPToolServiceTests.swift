@@ -1126,6 +1126,50 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertFalse(renderedText.contains("progress noise"))
     }
 
+    func testGetSession_budgetExhaustionKeepsReturnedRangeContiguous() async throws {
+        // When the char budget exhausts mid-window, rendered turns must form a contiguous
+        // block around the target so returned_turn_start/end never bracket an unrendered
+        // hole. Regression for F8: the prior target-first-then-ascending order could
+        // render {target, target-2} and report a range spanning a missing turn.
+        let record = makeRecord(name: "S1")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        let base = Date(timeIntervalSince1970: 1000)
+        let turns = (0 ..< 5).map { index in
+            // Target turn (2) is short so it renders cheaply; siblings are long so each
+            // consumes the whole remaining budget, forcing exhaustion after one sibling.
+            let text = index == 2 ? String(repeating: "x", count: 100) : String(repeating: "y", count: 2000)
+            return AgentTranscriptTurn(
+                request: AgentTranscriptRequestAnchor(
+                    from: AgentChatItem(
+                        id: UUID(),
+                        timestamp: base.addingTimeInterval(TimeInterval(index)),
+                        kind: .user,
+                        text: text,
+                        sequenceIndex: index
+                    )
+                ),
+                startedAt: base.addingTimeInterval(TimeInterval(index))
+            )
+        }
+        mockScanner.transcriptProvider = { _ in AgentTranscript(turns: turns) }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: [
+                "op": "get_session",
+                "session_id": .string(record.id.uuidString),
+                "around_turn": .int(2),
+                "context_turns": .int(2),
+                "max_chars": .int(1500)
+            ],
+            scanner: mockScanner
+        )
+        let dto = try getSessionReply(result)
+        // The reported range must equal the rendered payload — no gap.
+        let span = dto.returnedTurnEnd - dto.returnedTurnStart + 1
+        XCTAssertEqual(span, dto.turns.count, "Returned turn range must be contiguous (no holes)")
+        XCTAssertTrue(dto.turns.contains { $0.turnIndex == 2 }, "Target turn must render")
+    }
+
     // MARK: - role mapping
 
     func testSearch_roleMapping_toolExecution() async throws {
@@ -1549,6 +1593,21 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(try errorReply(result), "idle_threshold_minutes must be an integer")
     }
 
+    func testIdleThreshold_settingsDefaultClampedToValidRange() throws {
+        // An out-of-range stored default (e.g. via `defaults write`) must be clamped to
+        // 0...1440, not trusted raw — the explicit-arg path validates that range, so the
+        // default must too. Regression for F4.
+        let key = HistoryMCPToolService.idleThresholdSettingsKey
+        let prior = UserDefaults.standard.object(forKey: key)
+        UserDefaults.standard.set(100_000, forKey: key)
+        defer {
+            if let prior { UserDefaults.standard.set(prior, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+
+        XCTAssertEqual(try HistoryMCPToolService.resolveIdleThreshold(nil), 1440)
+    }
+
     // MARK: - Snippet Extraction
 
     func testExtractSnippet_shortText() {
@@ -1843,6 +1902,38 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(groupsByDuration[0].activeDurationSeconds, 60, "Day 1: 60s")
         XCTAssertEqual(groupsByDuration[1].activeDurationSeconds, 120, "Day 2: 120s")
         XCTAssertEqual(reply.totalActiveDurationSeconds, 180, "Total: 60+120=180, no overnight gap counted")
+    }
+
+    func testTime_groupByDay_mergesOverlappingAndNestedTurnIntervals() async throws {
+        // Same-day nested + overlapping turns must merge (no double counting), and the
+        // gap after a nested turn must be measured against the merged interval end —
+        // not the nested turn's earlier end. Regression for F1: the calendar path's
+        // prior raw per-turn sum + prevEnd tracking double-counted overlaps and let
+        // prevEnd regress on nested turns.
+        let day = Self.utcMidnight("2026-06-12T10:00:00Z")
+        // T1 10:00–11:00 (3600s), T2 10:30–10:45 nested inside T1, T3 11:05–11:20 (900s).
+        let t1 = AgentTranscriptTurn(responseSpans: [], startedAt: day, completedAt: day.addingTimeInterval(3600))
+        let t2 = AgentTranscriptTurn(responseSpans: [], startedAt: day.addingTimeInterval(1800), completedAt: day.addingTimeInterval(2700))
+        let t3 = AgentTranscriptTurn(responseSpans: [], startedAt: day.addingTimeInterval(3900), completedAt: day.addingTimeInterval(4800))
+        let record = makeRecord(name: "Overlap")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        mockScanner.transcriptProvider = { _ in AgentTranscript(turns: [t1, t2, t3]) }
+
+        // 5-min gap between merged [10:00–11:00] and [11:05–11:20] is ≤ 30-min threshold → active.
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "day", "idle_threshold_minutes": 30],
+            scanner: mockScanner
+        )
+        guard case let .time(reply) = result else {
+            return XCTFail("Expected .time reply, got \(result)")
+        }
+        XCTAssertEqual(reply.groups.count, 1, "All turns share one calendar day")
+        XCTAssertEqual(reply.groups.first?.turnCount, 3)
+        // Merged covered: 3600 (T1 absorbs nested T2) + 900 (T3) = 4500; active gap
+        // 11:00–11:05 = 300s ≤ threshold → +300. Total = 4800. The old raw-sum +
+        // prevEnd code returned 6600 (double-counted T2 and measured T3's gap from
+        // T2's regressed end).
+        XCTAssertEqual(reply.totalActiveDurationSeconds, 4800)
     }
 
     func testTime_groupByDayHonorsLimit() async throws {

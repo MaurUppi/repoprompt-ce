@@ -117,6 +117,9 @@ enum HistoryMCPToolService {
                 firstActivityAt: iso8601DateTime.string(from: r.firstActivityAt ?? r.activityDate),
                 lastActivityAt: iso8601DateTime.string(from: r.lastActivityAt ?? r.savedAt),
                 activeDurationSeconds: r.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes),
+                // `turn_count` here is the projected visible item/row count (itemCount), not raw
+                // transcript turns; `time` calendar groups and `get_session.total_turns` count
+                // real turns. Kept as-is for `list_sessions` API stability (see spec).
                 turnCount: r.itemCount,
                 toolCallCount: r.toolCallCount,
                 filesTouched: cappedFilesTouched,
@@ -198,9 +201,14 @@ enum HistoryMCPToolService {
         var replyTruncated = requestedRange.count < totalTurns
         var renderedTurnsByIndex: [Int: HistoryGetSessionReply.TurnDTO] = [:]
 
+        // Render outward from the target by distance (ties → lower index first) so a
+        // budget-exhausted partial render is always contiguous around the target.
+        // The prior target-first-then-ascending order could leave a gapped set like
+        // {target, target-2}, making returned_turn_start/end bracket an unrendered hole.
         let budgetOrder = window.sorted { lhs, rhs in
-            if lhs.offset == targetTurnIndex { return true }
-            if rhs.offset == targetTurnIndex { return false }
+            let lhsDist = abs(lhs.offset - targetTurnIndex)
+            let rhsDist = abs(rhs.offset - targetTurnIndex)
+            if lhsDist != rhsDist { return lhsDist < rhsDist }
             return lhs.offset < rhs.offset
         }
 
@@ -308,27 +316,29 @@ enum HistoryMCPToolService {
             for (turnIndex, turn) in transcript.turns.enumerated() {
                 var turnMatches: [HistorySearchMatch] = []
 
-                // Search activity text (only if turn is not structurally compacted, or source=all/activities).
+                // Search activity text. `source:"activities"` is the activity subset of
+                // `source:"all"`, so both treat compacted turns identically (per spec a
+                // compacted turn discards its activities, but any retained activity is
+                // searchable under both filters — no carve-out that would make
+                // `source:"activities"` narrower than the activity matches in `source:"all"`).
                 if sourceFilter != "summaries" {
-                    if !turn.isStructurallyCompacted || sourceFilter == "all" {
-                        for activity in turn.allActivities {
-                            if activity.text.lowercased().contains(queryLower) {
-                                let snippet = extractSnippet(text: activity.text, query: queryLower)
-                                let roleString = mapActivityRole(activity.role)
-                                let match = HistorySearchMatch(
-                                    sessionID: session.record.id,
-                                    sessionName: session.record.name,
-                                    workspaceName: session.workspaceName,
-                                    turnIndex: turnIndex,
-                                    role: roleString,
-                                    timestamp: activity.timestamp,
-                                    snippet: snippet,
-                                    source: "activity",
-                                    turnRequestText: turn.request?.text
-                                )
-                                turnMatches.append(match)
-                                break // One match per activity is sufficient for dedup base.
-                            }
+                    for activity in turn.allActivities {
+                        if activity.text.lowercased().contains(queryLower) {
+                            let snippet = extractSnippet(text: activity.text, query: queryLower)
+                            let roleString = mapActivityRole(activity.role)
+                            let match = HistorySearchMatch(
+                                sessionID: session.record.id,
+                                sessionName: session.record.name,
+                                workspaceName: session.workspaceName,
+                                turnIndex: turnIndex,
+                                role: roleString,
+                                timestamp: activity.timestamp,
+                                snippet: snippet,
+                                source: "activity",
+                                turnRequestText: turn.request?.text
+                            )
+                            turnMatches.append(match)
+                            break // One match per activity is sufficient for dedup base.
                         }
                     }
                 }
@@ -586,7 +596,6 @@ enum HistoryMCPToolService {
         scanner: HistorySessionScanning
     ) async throws -> HistoryToolReply {
         let calendar = Calendar.current
-        let thresholdSeconds = idleThresholdMinutes * 60
         var sessionsScanned = 0
         var scanTruncated = false
 
@@ -617,14 +626,22 @@ enum HistoryMCPToolService {
 
             let sid = session.record.id
             sessionNames[sid] = session.record.name
-            var prevEnd: Date?
-            var prevGroupKey: String?
+            // Bucket this session's turn intervals by group key, then compute the merged
+            // active duration per group — same sort+merge+`<=threshold` math as
+            // `AgentSessionMetadataRecord.activeDurationSeconds(thresholdMinutes:)`, so
+            // overlapping/nested/out-of-order turns aren't double-counted and gaps are
+            // measured between merged intervals (the raw `prevEnd` approach regressed on
+            // nested turns and double-counted overlaps).
+            var intervalsByKey: [String: [(start: Date, end: Date)]] = [:]
+            var turnsByKey: [String: Int] = [:]
+            var toolCallsByKey: [String: Int] = [:]
 
             for turn in transcript.turns {
                 let start = turn.startedAt
                 if let dateFrom, start < dateFrom { continue }
                 if let dateTo, start > dateTo { continue }
                 let end = turn.completedAt ?? turn.lastActivityAt ?? start
+                guard end >= start else { continue }
                 let dayStart = calendar.startOfDay(for: start)
 
                 let key: String
@@ -640,38 +657,26 @@ enum HistoryMCPToolService {
                 default: continue
                 }
 
-                let duration = max(0, Int(end.timeIntervalSince(start)))
+                intervalsByKey[key, default: []].append((start, end))
+                turnsByKey[key, default: 0] += 1
+                if let tc = turn.summary?.toolCount, tc > 0 {
+                    toolCallsByKey[key, default: 0] += tc
+                } else {
+                    toolCallsByKey[key, default: 0] += turn.responseSpans.reduce(0) { $0 + $1.activities.count(where: { $0.toolExecution != nil }) }
+                }
+            }
+
+            for (key, intervals) in intervalsByKey {
+                let activeSeconds = AgentSessionMetadataRecord.activeDurationSeconds(intervals: intervals, thresholdMinutes: idleThresholdMinutes)
                 groupKeys.insert(key)
                 groupSessionIDs[key, default: []].insert(sid)
-                groupDuration[key, default: 0] += duration
-                groupTurns[key, default: 0] += 1
-                if let tc = turn.summary?.toolCount, tc > 0 {
-                    groupToolCalls[key, default: 0] += tc
-                } else {
-                    groupToolCalls[key, default: 0] += turn.responseSpans.reduce(0) { $0 + $1.activities.count(where: { $0.toolExecution != nil }) }
-                }
-
-                // Intra-group gap (same group as previous turn → may count as active)
-                if let pk = prevGroupKey, pk == key, let pe = prevEnd {
-                    let gap = Int(start.timeIntervalSince(pe))
-                    if gap > 0, gap <= thresholdSeconds {
-                        groupDuration[key, default: 0] += gap
-                    }
-                }
-
+                groupDuration[key, default: 0] += activeSeconds
+                groupTurns[key, default: 0] += turnsByKey[key] ?? 0
+                groupToolCalls[key, default: 0] += toolCallsByKey[key] ?? 0
                 if includeDetails {
-                    detailDuration[key, default: [:]][sid, default: 0] += duration
-                    detailTurns[key, default: [:]][sid, default: 0] += 1
-                    if let pk = prevGroupKey, pk == key, let pe = prevEnd {
-                        let gap = Int(start.timeIntervalSince(pe))
-                        if gap > 0, gap <= thresholdSeconds {
-                            detailDuration[key, default: [:]][sid, default: 0] += gap
-                        }
-                    }
+                    detailDuration[key, default: [:]][sid, default: 0] += activeSeconds
+                    detailTurns[key, default: [:]][sid, default: 0] += turnsByKey[key] ?? 0
                 }
-
-                prevEnd = end
-                prevGroupKey = key
             }
         }
 
@@ -851,7 +856,8 @@ enum HistoryMCPToolService {
         // the formatter can stay near the caller's requested token budget. The same
         // fraction is used at every budget, so the curve is continuous (no cliff
         // between small and large budgets) and large budgets keep their ~72% share.
-        max(1, maxChars - max(1, Int(Double(maxChars) * 0.28)))
+        let reserve = max(1, Int(Double(maxChars) * 0.28))
+        return max(1, maxChars - reserve)
     }
 
     private static func resolveGetSessionTurnRange(
@@ -1177,7 +1183,10 @@ enum HistoryMCPToolService {
     /// non-integer values throw a validation error (no clamping). Callers map the thrown
     /// error to an error reply.
     static func resolveIdleThreshold(_ value: Value?) throws -> Int {
-        let defaultThreshold = (UserDefaults.standard.object(forKey: Self.idleThresholdSettingsKey) as? Int) ?? AgentSessionMetadataRecord.defaultIdleThresholdMinutes
+        let rawDefault = (UserDefaults.standard.object(forKey: Self.idleThresholdSettingsKey) as? Int) ?? AgentSessionMetadataRecord.defaultIdleThresholdMinutes
+        // Clamp the stored default: explicit args are validated to 0...1440, but a raw
+        // `defaults write` (or any future writer) could store an out-of-range value.
+        let defaultThreshold = min(max(0, rawDefault), 1440)
         guard let value else { return defaultThreshold }
         guard let intValue = value.intValue else {
             throw HistoryValidationError(message: "idle_threshold_minutes must be an integer")

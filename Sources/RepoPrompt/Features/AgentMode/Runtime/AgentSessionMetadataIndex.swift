@@ -430,6 +430,45 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         }
     }
 
+    /// Sorts and merges overlapping/contiguous intervals (sorted by start, then end) so nested
+    /// or overlapping turns are never double-counted. Zero-duration (point) intervals are retained.
+    /// Shared between persisted duration-primitive computation and per-group history attribution.
+    static func mergedIntervals(_ intervals: [(start: Date, end: Date)]) -> [(start: Date, end: Date)] {
+        guard !intervals.isEmpty else { return [] }
+        let sorted = intervals.sorted { lhs, rhs in
+            lhs.start < rhs.start || (lhs.start == rhs.start && lhs.end < rhs.end)
+        }
+        var merged: [(start: Date, end: Date)] = [sorted[0]]
+        for interval in sorted.dropFirst() {
+            let lastIndex = merged.count - 1
+            if interval.start > merged[lastIndex].end {
+                merged.append(interval)
+            } else {
+                merged[lastIndex].end = max(merged[lastIndex].end, interval.end)
+            }
+        }
+        return merged
+    }
+
+    /// Active duration for an arbitrary interval set: merged covered time plus inter-interval gaps
+    /// `<= thresholdMinutes`. Mirrors per-record ``activeDurationSeconds(thresholdMinutes:)`` so
+    /// calendar `history.time` attribution agrees with session/workspace grouping.
+    static func activeDurationSeconds(intervals: [(start: Date, end: Date)], thresholdMinutes: Int) -> Int {
+        let merged = mergedIntervals(intervals)
+        guard !merged.isEmpty else { return 0 }
+        let thresholdSeconds = thresholdMinutes * 60
+        var covered = 0
+        var activeGaps = 0
+        for (index, interval) in merged.enumerated() {
+            covered += Int(interval.end.timeIntervalSince(interval.start))
+            if index > 0 {
+                let gap = Int(interval.start.timeIntervalSince(merged[index - 1].end))
+                if gap > 0, gap <= thresholdSeconds { activeGaps += gap }
+            }
+        }
+        return max(0, covered + activeGaps)
+    }
+
     /// Compute threshold-independent duration primitives from transcript turns:
     /// the union of merged per-turn active intervals (`coveredSeconds`) and the positive gaps
     /// between those merged intervals (`gapSeconds`). Each interval is
@@ -445,21 +484,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             let end = turn.completedAt ?? turn.lastActivityAt ?? start
             if end >= start { intervals.append((start, end)) }
         }
-        guard !intervals.isEmpty else { return (0, []) }
-
-        intervals.sort { lhs, rhs in
-            lhs.start < rhs.start || (lhs.start == rhs.start && lhs.end < rhs.end)
-        }
-
-        var merged: [(start: Date, end: Date)] = [intervals[0]]
-        for interval in intervals.dropFirst() {
-            let lastIndex = merged.count - 1
-            if interval.start > merged[lastIndex].end {
-                merged.append(interval)
-            } else {
-                merged[lastIndex].end = max(merged[lastIndex].end, interval.end)
-            }
-        }
+        let merged = mergedIntervals(intervals)
+        guard !merged.isEmpty else { return (0, []) }
 
         var coveredSeconds = 0
         var gapSeconds: [Int] = []
