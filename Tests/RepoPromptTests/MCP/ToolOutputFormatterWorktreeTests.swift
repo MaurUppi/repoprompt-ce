@@ -734,7 +734,6 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
             let turn_count = 3
             let files_touched = ["A.swift", "B.swift", "C.swift"]
             let files_touched_count = 5
-            let files_touched_truncated = true
         }
 
         struct HistoryList: Encodable {
@@ -750,7 +749,10 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
             args: ["op": .string("list_sessions")],
             value: Self.value(HistoryList())
         ))
+        XCTAssertTrue(text.contains("## History Sessions"))
+        XCTAssertTrue(text.contains("Big Session"))
         XCTAssertTrue(text.contains("files: A.swift, B.swift, C.swift (+2 more)"))
+        XCTAssertFalse(text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{"))
     }
 
     func testHistoryFormatterSummarizesSkippedWorkspaces() throws {
@@ -770,37 +772,99 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
             args: ["op": .string("list_sessions")],
             value: Self.value(HistoryList())
         ))
-        XCTAssertTrue(text.contains("- **Skipped workspaces**: 3"))
-        XCTAssertTrue(text.contains("stale index schema v2: 2"))
-        XCTAssertTrue(text.contains("unreadable index: 1"))
+        XCTAssertTrue(text.contains("- **Skipped workspaces**: stale index schema v2: 2; unreadable index: 1"))
         XCTAssertFalse(text.contains("Workspace A: stale index schema v2; Workspace B"))
     }
 
-    func testHistoryFormatterUsesCompactMarkdownInsteadOfGenericJSON() throws {
-        struct HistorySession: Encodable {
-            let session_id = "ABC"
-            let session_name = "History Session"
-            let workspace_name = "Workspace"
-            let active_duration_seconds = 42
-            let turn_count = 2
-            let files_touched = ["Sources/App.swift"]
+    func testHistoryFormatterShowsSearchFollowUpIdentifiersAndRequest() throws {
+        struct HistoryMatch: Encodable {
+            let session_id = "66A50D12-0000-0000-0000-000000000000"
+            let session_name = "History polish"
+            let workspace_name = "RepoPrompt"
+            let turn_index = 4
+            let role = "assistant"
+            let timestamp = "2026-07-05T06:00:00Z"
+            let snippet = "cache warmed and search returned quickly"
+            let source = "activity"
+            let turn_request_text = "what is the speed improvement?"
         }
+
+        struct HistorySearch: Encodable {
+            let total_matches = 1
+            let truncated = false
+            let sessions_scanned = 1
+            let scan_truncated = false
+            let skipped_workspaces: [String] = []
+            let results = [HistoryMatch()]
+        }
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
+            args: ["op": .string("search")],
+            value: Self.value(HistorySearch())
+        ))
+        XCTAssertTrue(text.contains("`66A50D12-0000-0000-0000-000000000000` **History polish** turn 4 [activity] assistant @ 2026-07-05T06:00:00Z"))
+        XCTAssertTrue(text.contains("request: what is the speed improvement?"))
+    }
+
+    func testHistoryFormatterLabelsStaleIndexSkipsPrecisely() throws {
         struct HistoryList: Encodable {
             let total_sessions = 1
             let truncated = false
             let sessions_scanned = 1
             let scan_truncated = false
-            let skipped_workspaces: [String] = []
-            let sessions = [HistorySession()]
+            let skipped_workspaces = [
+                "stale index schema v2: 9693",
+                "stale index schema v1: 37"
+            ]
+            let sessions: [String] = []
         }
 
         let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
             args: ["op": .string("list_sessions")],
             value: Self.value(HistoryList())
         ))
-        XCTAssertTrue(text.contains("## History Sessions"))
-        XCTAssertTrue(text.contains("History Session"))
-        XCTAssertFalse(text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{"))
+        XCTAssertTrue(text.contains("- **Skipped stale session indexes**: v2: 9693; v1: 37"))
+        XCTAssertFalse(text.contains("Skipped workspaces"))
+    }
+
+    func testHistoryFormatterShowsGetSessionWindow() throws {
+        struct Entry: Encodable {
+            let role = "assistant"
+            let timestamp = "2026-07-05T06:00:00Z"
+            let text = "Candidate issue: missing smoke coverage"
+            let truncated = false
+        }
+
+        struct Turn: Encodable {
+            let turn_index = 4
+            let started_at = "2026-07-05T06:00:00Z"
+            let request_text = "Find unfiled issues"
+            let tool_call_summary = "file_search success ×2"
+            let entries = [Entry()]
+            let truncated = false
+        }
+
+        struct HistoryGetSession: Encodable {
+            let session_id = "66A50D12-0000-0000-0000-000000000000"
+            let session_name = "History polish"
+            let workspace_name = "RepoPrompt"
+            let total_turns = 12
+            let returned_turn_start = 3
+            let returned_turn_end = 5
+            let truncated = true
+            let turns = [Turn()]
+        }
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatHistory(
+            args: ["op": .string("get_session")],
+            value: Self.value(HistoryGetSession())
+        ))
+        XCTAssertTrue(text.contains("## History Session ✅"))
+        XCTAssertTrue(text.contains("`66A50D12-0000-0000-0000-000000000000` **History polish**"))
+        XCTAssertTrue(text.contains("**Turns**: 3–5 of 12"))
+        XCTAssertTrue(text.contains("**Request**: Find unfiled issues"))
+        XCTAssertTrue(text.contains("**Tools**: file_search success ×2"))
+        XCTAssertTrue(text.contains("**assistant** @ 2026-07-05T06:00:00Z: Candidate issue: missing smoke coverage"))
     }
 
     private static func value(_ value: some Encodable) throws -> Value {

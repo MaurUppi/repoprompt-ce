@@ -9,7 +9,7 @@ import Foundation
 // encodes via `Value(dto)` like every other window-tool provider.
 //
 // `list_sessions.files_touched` is capped to keep raw MCP payloads predictable;
-// use `files_touched_count` and `files_touched_truncated` to detect omitted paths.
+// use `files_touched_count` to detect omitted paths.
 // Optional response fields (`agent_kind`, `agent_model`, `last_run_state` on list;
 // `turn_request_text` on search; `details` on time groups) are plain `Optional`
 // properties, so they are omitted from the encoded JSON when absent — no per-field
@@ -20,6 +20,7 @@ enum HistoryToolReply {
     case listSessions(HistoryListSessionsReply)
     case search(HistorySearchReply)
     case time(HistoryTimeReply)
+    case getSession(HistoryGetSessionReply)
     case error(HistoryErrorReply)
 }
 
@@ -37,7 +38,6 @@ struct HistoryListSessionsReply: Codable, Equatable {
         let toolCallCount: Int
         let filesTouched: [String]
         let filesTouchedCount: Int
-        let filesTouchedTruncated: Bool
         let hadErrors: Bool
         let agentKind: String?
         let agentModel: String?
@@ -54,7 +54,6 @@ struct HistoryListSessionsReply: Codable, Equatable {
             case toolCallCount = "tool_call_count"
             case filesTouched = "files_touched"
             case filesTouchedCount = "files_touched_count"
-            case filesTouchedTruncated = "files_touched_truncated"
             case hadErrors = "had_errors"
             case agentKind = "agent_kind"
             case agentModel = "agent_model"
@@ -72,7 +71,6 @@ struct HistoryListSessionsReply: Codable, Equatable {
             toolCallCount: Int,
             filesTouched: [String],
             filesTouchedCount: Int? = nil,
-            filesTouchedTruncated: Bool? = nil,
             hadErrors: Bool,
             agentKind: String? = nil,
             agentModel: String? = nil,
@@ -88,7 +86,6 @@ struct HistoryListSessionsReply: Codable, Equatable {
             self.toolCallCount = toolCallCount
             self.filesTouched = filesTouched
             self.filesTouchedCount = filesTouchedCount ?? filesTouched.count
-            self.filesTouchedTruncated = filesTouchedTruncated ?? false
             self.hadErrors = hadErrors
             self.agentKind = agentKind
             self.agentModel = agentModel
@@ -100,7 +97,7 @@ struct HistoryListSessionsReply: Codable, Equatable {
     let truncated: Bool
     let sessionsScanned: Int
     let scanTruncated: Bool
-    let skippedWorkspaces: [String]
+    let skippedWorkspaces: [String]?
     let sessions: [SessionDTO]
 
     private enum CodingKeys: String, CodingKey {
@@ -170,7 +167,7 @@ struct HistorySearchReply: Codable, Equatable {
     /// bounded.
     let scanTruncated: Bool
     let sessionsScanned: Int
-    let skippedWorkspaces: [String]
+    let skippedWorkspaces: [String]?
     let results: [MatchDTO]
 
     private enum CodingKeys: String, CodingKey {
@@ -239,7 +236,7 @@ struct HistoryTimeReply: Codable, Equatable {
     let truncated: Bool
     let sessionsScanned: Int
     let scanTruncated: Bool
-    let skippedWorkspaces: [String]
+    let skippedWorkspaces: [String]?
     let groups: [GroupDTO]
 
     private enum CodingKeys: String, CodingKey {
@@ -250,6 +247,82 @@ struct HistoryTimeReply: Codable, Equatable {
         case scanTruncated = "scan_truncated"
         case skippedWorkspaces = "skipped_workspaces"
         case groups
+    }
+}
+
+// MARK: - get_session
+
+struct HistoryGetSessionReply: Codable, Equatable {
+    struct EntryDTO: Codable, Equatable {
+        let role: String
+        let timestamp: String?
+        let text: String
+        let truncated: Bool?
+
+        init(role: String, timestamp: String? = nil, text: String, truncated: Bool = false) {
+            self.role = role
+            self.timestamp = timestamp
+            self.text = text
+            self.truncated = truncated ? true : nil
+        }
+    }
+
+    struct TurnDTO: Codable, Equatable {
+        let turnIndex: Int
+        let startedAt: String
+        let requestText: String?
+        let toolCallSummary: String?
+        let entries: [EntryDTO]
+        let truncated: Bool
+        let entriesOmitted: Int?
+
+        private enum CodingKeys: String, CodingKey {
+            case turnIndex = "turn_index"
+            case startedAt = "started_at"
+            case requestText = "request_text"
+            case toolCallSummary = "tool_call_summary"
+            case entries
+            case truncated
+            case entriesOmitted = "entries_omitted"
+        }
+
+        init(
+            turnIndex: Int,
+            startedAt: String,
+            requestText: String?,
+            toolCallSummary: String?,
+            entries: [EntryDTO],
+            truncated: Bool,
+            entriesOmitted: Int? = nil
+        ) {
+            self.turnIndex = turnIndex
+            self.startedAt = startedAt
+            self.requestText = requestText
+            self.toolCallSummary = toolCallSummary
+            self.entries = entries
+            self.truncated = truncated
+            self.entriesOmitted = entriesOmitted
+        }
+    }
+
+    let sessionID: String
+    let sessionName: String
+    let workspaceName: String
+    let totalTurns: Int
+    let returnedTurnStart: Int
+    let returnedTurnEnd: Int
+    let truncated: Bool
+    let turns: [TurnDTO]
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case sessionName = "session_name"
+        case workspaceName = "workspace_name"
+        case totalTurns = "total_turns"
+        case returnedTurnStart = "returned_turn_start"
+        case returnedTurnEnd = "returned_turn_end"
+        case truncated
+        case turns
     }
 }
 

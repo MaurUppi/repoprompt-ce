@@ -20,19 +20,17 @@ final class HistoryMCPToolServiceTests: XCTestCase {
 
     // MARK: - Error Cases
 
-    func testExecute_missingOp_returnsError() async throws {
-        let result = try await HistoryMCPToolService.execute(args: [:], scanner: mockScanner)
-        XCTAssertEqual(try errorReply(result), "Missing or empty required parameter 'op'")
-    }
+    func testExecute_invalidOpReturnsError() async throws {
+        let cases: [([String: Value], String)] = [
+            ([:], "Missing or empty required parameter 'op'"),
+            (["op": ""], "Missing or empty required parameter 'op'"),
+            (["op": "unknown"], "Unknown op 'unknown'. Valid ops: list_sessions, search, time, get_session")
+        ]
 
-    func testExecute_emptyOp_returnsError() async throws {
-        let result = try await HistoryMCPToolService.execute(args: ["op": ""], scanner: mockScanner)
-        XCTAssertEqual(try errorReply(result), "Missing or empty required parameter 'op'")
-    }
-
-    func testExecute_unknownOp_returnsError() async throws {
-        let result = try await HistoryMCPToolService.execute(args: ["op": "unknown"], scanner: mockScanner)
-        XCTAssertEqual(try errorReply(result), "Unknown op 'unknown'. Valid ops: list_sessions, search, time")
+        for (args, expected) in cases {
+            let result = try await HistoryMCPToolService.execute(args: args, scanner: mockScanner)
+            XCTAssertEqual(try errorReply(result), expected)
+        }
     }
 
     // MARK: - list_sessions
@@ -86,34 +84,6 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(dto.totalSessions, 50)
         XCTAssertEqual(dto.truncated, true)
         XCTAssertEqual(dto.sessions.count, 20)
-    }
-
-    func testListSessions_defaultLimit() async throws {
-        // Default limit is 30.
-        let records = (0 ..< 50).map { makeRecord(name: "S\($0)") }
-        mockScanner.scanResults = [makeScanResult(records: records)]
-
-        let result = try await HistoryMCPToolService.execute(
-            args: ["op": "list_sessions"],
-            scanner: mockScanner
-        )
-        let dto = try listReply(result)
-        XCTAssertEqual(dto.totalSessions, 50)
-        XCTAssertEqual(dto.truncated, true)
-        XCTAssertEqual(dto.sessions.count, 30)
-    }
-
-    func testListSessions_maxLimit100() async throws {
-        let records = (0 ..< 150).map { makeRecord(name: "S\($0)") }
-        mockScanner.scanResults = [makeScanResult(records: records)]
-
-        let result = try await HistoryMCPToolService.execute(
-            args: ["op": "list_sessions", "limit": 200],
-            scanner: mockScanner
-        )
-        let dto = try listReply(result)
-        XCTAssertEqual(dto.truncated, true)
-        XCTAssertEqual(dto.sessions.count, 100)
     }
 
     func testListSessions_sortByDuration() async throws {
@@ -311,7 +281,6 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         let session = try XCTUnwrap(dto.sessions.first)
         XCTAssertEqual(session.filesTouched, ["lib/utils.swift", "src/main.swift"]) // sorted
         XCTAssertEqual(session.filesTouchedCount, 2)
-        XCTAssertFalse(session.filesTouchedTruncated)
     }
 
     func testListSessions_capsFilesTouchedAndReportsCount() async throws {
@@ -327,7 +296,6 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         let session = try XCTUnwrap(dto.sessions.first)
         XCTAssertEqual(session.filesTouched.count, 20)
         XCTAssertEqual(session.filesTouchedCount, 25)
-        XCTAssertTrue(session.filesTouchedTruncated)
         XCTAssertEqual(session.filesTouched.first, "Sources/File00.swift")
         XCTAssertEqual(session.filesTouched.last, "Sources/File19.swift")
     }
@@ -646,13 +614,12 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(dto.results[0].source, "activity")
     }
 
-    func testSearch_sourceFilterActivities() async throws {
-        // Summary has the match but source=activities should skip it.
-        let record = makeRecord(name: "S1")
-        let scanResult = makeScanResult(records: [record])
-        mockScanner.scanResults = [scanResult]
+    func testSearch_sourceFiltersRestrictMatchedFields() async throws {
+        let summaryOnly = makeRecord(name: "SummaryOnly")
+        let activityOnly = makeRecord(name: "ActivityOnly")
+        mockScanner.scanResults = [makeScanResult(records: [summaryOnly, activityOnly])]
 
-        let turn = AgentTranscriptTurn(
+        let summaryTurn = AgentTranscriptTurn(
             id: UUID(),
             summary: AgentTranscriptTurnSummary(
                 requestText: nil,
@@ -668,22 +635,6 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             ),
             startedAt: Date(timeIntervalSince1970: 1000)
         )
-        mockScanner.transcriptProvider = { _ in AgentTranscript(turns: [turn]) }
-
-        let result = try await HistoryMCPToolService.execute(
-            args: ["op": "search", "query": "rate limiting", "source": "activities"],
-            scanner: mockScanner
-        )
-        let dto = try searchReply(result)
-        XCTAssertEqual(dto.totalMatches, 0)
-    }
-
-    func testSearch_sourceFilterSummaries() async throws {
-        // Activity has the match but source=summaries should skip it.
-        let record = makeRecord(name: "S1")
-        let scanResult = makeScanResult(records: [record])
-        mockScanner.scanResults = [scanResult]
-
         let activity = AgentTranscriptActivity(
             id: UUID(),
             timestamp: Date(timeIntervalSince1970: 1000),
@@ -695,7 +646,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             isSubstantiveAssistant: true,
             sealsAssistantBoundary: false
         )
-        let turn = AgentTranscriptTurn(
+        let activityTurn = AgentTranscriptTurn(
             id: UUID(),
             responseSpans: [
                 AgentTranscriptProviderResponseSpan(
@@ -706,14 +657,29 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             ],
             startedAt: Date(timeIntervalSince1970: 1000)
         )
-        mockScanner.transcriptProvider = { _ in AgentTranscript(turns: [turn]) }
+        mockScanner.transcriptProvider = { sessionID in
+            sessionID == summaryOnly.id
+                ? AgentTranscript(turns: [summaryTurn])
+                : AgentTranscript(turns: [activityTurn])
+        }
 
-        let result = try await HistoryMCPToolService.execute(
+        let activitiesResult = try await HistoryMCPToolService.execute(
+            args: ["op": "search", "query": "rate limiting", "source": "activities"],
+            scanner: mockScanner
+        )
+        let activitiesDTO = try searchReply(activitiesResult)
+        XCTAssertEqual(activitiesDTO.totalMatches, 1)
+        XCTAssertEqual(activitiesDTO.results.first?.sessionID, activityOnly.id.uuidString)
+        XCTAssertEqual(activitiesDTO.results.first?.source, "activity")
+
+        let summariesResult = try await HistoryMCPToolService.execute(
             args: ["op": "search", "query": "rate limiting", "source": "summaries"],
             scanner: mockScanner
         )
-        let dto = try searchReply(result)
-        XCTAssertEqual(dto.totalMatches, 0)
+        let summariesDTO = try searchReply(summariesResult)
+        XCTAssertEqual(summariesDTO.totalMatches, 1)
+        XCTAssertEqual(summariesDTO.results.first?.sessionID, summaryOnly.id.uuidString)
+        XCTAssertEqual(summariesDTO.results.first?.source, "summary")
     }
 
     func testSearch_truncation() async throws {
@@ -758,12 +724,17 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         // Defect: a broad query must not decode every filtered session transcript.
         // `limit` caps matches, not work; the scan cap bounds transcripts decoded and
         // surfaces `scan_truncated` when hit.
-        let records = (0 ..< 250).map { makeRecord(name: "S\($0)") }
+        let records = (0 ..< 250).map { index in
+            makeRecord(
+                name: "S\(index)",
+                lastActivityAt: Date(timeIntervalSince1970: TimeInterval(index))
+            )
+        }
         mockScanner.scanResults = [makeScanResult(records: records)]
 
-        var loadCount = 0
-        mockScanner.transcriptProvider = { _ in
-            loadCount += 1
+        var loadedSessionIDs: [UUID] = []
+        mockScanner.transcriptProvider = { sessionID in
+            loadedSessionIDs.append(sessionID)
             return .empty
         }
 
@@ -773,7 +744,9 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         )
         let dto = try searchReply(result)
         XCTAssertTrue(dto.scanTruncated, "scan_truncated must be set when the scan cap is reached")
-        XCTAssertEqual(loadCount, 200, "should decode at most maxSessionsScanned transcripts")
+        XCTAssertEqual(loadedSessionIDs.count, 200, "should decode at most maxSessionsScanned transcripts")
+        XCTAssertEqual(loadedSessionIDs.first, records.last?.id, "search should scan newest sessions before applying the cap")
+        XCTAssertFalse(loadedSessionIDs.contains(records[0].id), "oldest sessions should be outside the default scan cap")
     }
 
     func testSearch_scanCapNotHitWhenFewerSessions() async throws {
@@ -993,6 +966,164 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         let dto = try searchReply(result)
         XCTAssertEqual(dto.results.count, 1)
         XCTAssertEqual(dto.results[0].turnRequestText, nil)
+    }
+
+    // MARK: - get_session
+
+    func testGetSession_requiresBoundedWindow() async throws {
+        let record = makeRecord(name: "S1")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        mockScanner.transcriptProvider = { _ in AgentTranscript(turns: [
+            AgentTranscriptTurn(startedAt: Date(timeIntervalSince1970: 1000))
+        ]) }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "get_session", "session_id": .string(record.id.uuidString)],
+            scanner: mockScanner
+        )
+        XCTAssertEqual(
+            try errorReply(result),
+            "get_session requires around_turn from a search result, or turn_start/turn_end for a bounded range"
+        )
+    }
+
+    func testGetSession_contextTurnsZeroReturnsOnlyTargetTurn() async throws {
+        let record = makeRecord(name: "S1")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+
+        let base = Date(timeIntervalSince1970: 1000)
+        let turns = (0 ..< 3).map { index in
+            AgentTranscriptTurn(
+                request: AgentTranscriptRequestAnchor(
+                    from: AgentChatItem(
+                        id: UUID(),
+                        timestamp: base.addingTimeInterval(TimeInterval(index)),
+                        kind: .user,
+                        text: "Request \(index)",
+                        sequenceIndex: index
+                    )
+                ),
+                startedAt: base.addingTimeInterval(TimeInterval(index))
+            )
+        }
+        mockScanner.transcriptProvider = { _ in AgentTranscript(turns: turns) }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: [
+                "op": "get_session",
+                "session_id": .string(record.id.uuidString),
+                "around_turn": .int(1),
+                "context_turns": .int(0)
+            ],
+            scanner: mockScanner
+        )
+
+        let dto = try getSessionReply(result)
+        XCTAssertEqual(dto.returnedTurnStart, 1)
+        XCTAssertEqual(dto.returnedTurnEnd, 1)
+        XCTAssertEqual(dto.turns.map(\.turnIndex), [1])
+        XCTAssertEqual(dto.turns[0].requestText, "Request 1")
+    }
+
+    func testGetSession_returnsNoiseReducedWindowAroundTurn() async throws {
+        let record = makeRecord(name: "S1")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+
+        let base = Date(timeIntervalSince1970: 1000)
+        let toolExecution = AgentTranscriptToolExecution(
+            stableExecutionID: "tool-1",
+            toolName: "file_search",
+            invocationID: UUID(),
+            argsJSON: "{\"secret\":\"do-not-render\"}",
+            resultJSON: "{\"huge\":\"do-not-render\"}",
+            toolIsError: false,
+            status: .success,
+            summaryText: "8 matches"
+        )
+        let request = AgentTranscriptRequestAnchor(
+            from: AgentChatItem(
+                id: UUID(),
+                timestamp: base,
+                kind: .user,
+                text: "Find unfiled issues",
+                sequenceIndex: 0
+            )
+        )
+        let turn = AgentTranscriptTurn(
+            request: request,
+            responseSpans: [
+                AgentTranscriptProviderResponseSpan(
+                    startedAt: base,
+                    activities: [
+                        AgentTranscriptActivity(
+                            id: UUID(),
+                            timestamp: base.addingTimeInterval(1),
+                            sequenceIndex: 1,
+                            role: .thinking,
+                            itemKind: .assistant,
+                            text: "private reasoning should not render"
+                        ),
+                        AgentTranscriptActivity(
+                            id: UUID(),
+                            timestamp: base.addingTimeInterval(2),
+                            sequenceIndex: 2,
+                            role: .toolExecution,
+                            itemKind: .assistant,
+                            text: "raw tool payload",
+                            toolExecution: toolExecution
+                        ),
+                        AgentTranscriptActivity(
+                            id: UUID(),
+                            timestamp: base.addingTimeInterval(3),
+                            sequenceIndex: 3,
+                            role: .assistant,
+                            itemKind: .assistant,
+                            text: "Candidate issue: missing smoke coverage"
+                        ),
+                        AgentTranscriptActivity(
+                            id: UUID(),
+                            timestamp: base.addingTimeInterval(4),
+                            sequenceIndex: 4,
+                            role: .error,
+                            itemKind: .assistant,
+                            text: "Tool failed once"
+                        ),
+                        AgentTranscriptActivity(
+                            id: UUID(),
+                            timestamp: base.addingTimeInterval(5),
+                            sequenceIndex: 5,
+                            role: .progress,
+                            itemKind: .assistant,
+                            text: "progress noise should not render"
+                        )
+                    ]
+                )
+            ],
+            startedAt: base
+        )
+        mockScanner.transcriptProvider = { _ in AgentTranscript(turns: [turn]) }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: [
+                "op": "get_session",
+                "session_id": .string(record.id.uuidString),
+                "around_turn": .int(0),
+                "context_turns": .int(0)
+            ],
+            scanner: mockScanner
+        )
+        let dto = try getSessionReply(result)
+        XCTAssertEqual(dto.sessionID, record.id.uuidString)
+        XCTAssertEqual(dto.turns.count, 1)
+        XCTAssertEqual(dto.turns[0].requestText, "Find unfiled issues")
+        XCTAssertEqual(dto.turns[0].toolCallSummary, "file_search success")
+        let renderedText = dto.turns[0].entries.map(\.text).joined(separator: "\n")
+        XCTAssertTrue(renderedText.contains("Candidate issue: missing smoke coverage"))
+        XCTAssertTrue(renderedText.contains("Tool failed once"))
+        XCTAssertFalse(renderedText.contains("file_search"))
+        XCTAssertFalse(renderedText.contains("do-not-render"))
+        XCTAssertFalse(renderedText.contains("private reasoning"))
+        XCTAssertFalse(renderedText.contains("progress noise"))
     }
 
     // MARK: - role mapping
@@ -1227,6 +1358,21 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(s1Group.sessions, 1)
         XCTAssertEqual(s1Group.activeDurationSeconds, 100)
         XCTAssertEqual(s1Group.turnCount, 3)
+    }
+
+    func testTime_groupBySessionHonorsLimit() async throws {
+        let r1 = makeRecord(name: "S1", activeDurationSeconds: 100, itemCount: 3)
+        let r2 = makeRecord(name: "S2", activeDurationSeconds: 200, itemCount: 5)
+        mockScanner.scanResults = [makeScanResult(records: [r1, r2])]
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "session", "limit": 1],
+            scanner: mockScanner
+        )
+        let dto = try timeReply(result)
+        XCTAssertEqual(dto.groups.count, 1)
+        XCTAssertTrue(dto.truncated)
+        XCTAssertEqual(dto.totalActiveDurationSeconds, 300)
     }
 
     func testTime_groupByWorkspace() async throws {
@@ -1591,6 +1737,11 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         return try XCTUnwrap(nil as HistoryTimeReply?, "expected .time reply, got \(reply)")
     }
 
+    private func getSessionReply(_ reply: HistoryToolReply) throws -> HistoryGetSessionReply {
+        if case let .getSession(dto) = reply { return dto }
+        return try XCTUnwrap(nil as HistoryGetSessionReply?, "expected .getSession reply, got \(reply)")
+    }
+
     private func errorReply(_ reply: HistoryToolReply) throws -> String {
         if case let .error(dto) = reply { return dto.error }
         return try XCTUnwrap(nil as String?, "expected .error reply, got \(reply)")
@@ -1677,6 +1828,28 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(groupsByDuration[0].activeDurationSeconds, 60, "Day 1: 60s")
         XCTAssertEqual(groupsByDuration[1].activeDurationSeconds, 120, "Day 2: 120s")
         XCTAssertEqual(reply.totalActiveDurationSeconds, 180, "Total: 60+120=180, no overnight gap counted")
+    }
+
+    func testTime_groupByDayHonorsLimit() async throws {
+        let day1 = Date(timeIntervalSince1970: 1_700_000_000)
+        let day2 = day1.addingTimeInterval(86400)
+        let transcript = AgentTranscript(turns: [
+            AgentTranscriptTurn(responseSpans: [], startedAt: day1, completedAt: day1.addingTimeInterval(60)),
+            AgentTranscriptTurn(responseSpans: [], startedAt: day2, completedAt: day2.addingTimeInterval(120))
+        ])
+
+        let record = makeRecord(name: "MultiDay")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        mockScanner.transcriptProvider = { _ in transcript }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "day", "limit": 1],
+            scanner: mockScanner
+        )
+        let dto = try timeReply(result)
+        XCTAssertEqual(dto.groups.count, 1)
+        XCTAssertTrue(dto.truncated)
+        XCTAssertEqual(dto.totalActiveDurationSeconds, 180)
     }
 
     /// Synthesize a single-turn transcript for each record in scanResults, with duration

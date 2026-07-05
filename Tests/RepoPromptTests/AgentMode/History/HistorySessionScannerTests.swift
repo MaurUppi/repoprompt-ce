@@ -470,21 +470,6 @@ final class HistorySessionScannerTests: XCTestCase {
         XCTAssertTrue(loaded.turns.isEmpty)
     }
 
-    // MARK: - Error Types
-
-    func testErrorDescriptions_areNonEmpty() {
-        let errors: [HistorySessionScannerError] = [
-            .workspaceDirectoryNotFound(URL(fileURLWithPath: "/tmp/test")),
-            .indexDecodingFailed(workspaceDir: URL(fileURLWithPath: "/tmp/ws"), underlying: "bad json"),
-            .sessionFileNotFound(sessionID: UUID(), workspaceDir: URL(fileURLWithPath: "/tmp/ws")),
-            .transcriptDecodingFailed(sessionID: UUID(), underlying: "decode error")
-        ]
-        for error in errors {
-            XCTAssertFalse(error.localizedDescription.isEmpty)
-            XCTAssertNotNil(error.errorDescription)
-        }
-    }
-
     // MARK: - Cross-Workspace Unification
 
     func testScanAllWorkspaces_recordsIncludeWorkspaceContext() async throws {

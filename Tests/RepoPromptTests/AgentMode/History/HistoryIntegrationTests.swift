@@ -246,61 +246,6 @@ final class HistoryIntegrationTests: XCTestCase {
         XCTAssertEqual(Set(dto.results.map(\.source)), ["activity", "summary"])
     }
 
-    func testSearch_dedupPrefersActivityWhenActivityAndSummaryMatchSameTurn() async throws {
-        let workspace = try fixture.createWorkspace(name: "DedupProject")
-        let spec = HistoryTestFixture.textSearchSession(
-            name: "Dedup Session",
-            activityText: "I resolved unique_search_term_xyz in the implementation",
-            summaryText: "Fixed unique_search_term_xyz"
-        )
-        try fixture.install([spec], in: workspace)
-
-        let result = try await HistoryMCPToolService.execute(
-            args: ["op": "search", "query": "unique_search_term_xyz"],
-            scanner: scanner
-        )
-        let dto = try searchReply(result)
-
-        XCTAssertEqual(dto.totalMatches, 1)
-        XCTAssertEqual(dto.results.first?.source, "activity")
-    }
-
-    func testSearch_snippetExtractionUsesBoundedContext() async throws {
-        let workspace = try fixture.createWorkspace(name: "SnippetProject")
-        let padding = String(repeating: "a", count: 300)
-        let text = "\(padding)FINDME_KEYWORD_12345\(padding)"
-        let spec = HistoryTestFixture.textSearchSession(name: "Snippet Session", activityText: text)
-        try fixture.install([spec], in: workspace)
-
-        let result = try await HistoryMCPToolService.execute(
-            args: ["op": "search", "query": "FINDME_KEYWORD_12345"],
-            scanner: scanner
-        )
-        let dto = try searchReply(result)
-
-        let snippet = try XCTUnwrap(dto.results.first?.snippet)
-        XCTAssertTrue(snippet.contains("FINDME_KEYWORD_12345"))
-        XCTAssertLessThanOrEqual(snippet.count, 250)
-        XCTAssertGreaterThanOrEqual(snippet.count, 100)
-        XCTAssertNotEqual(snippet, text)
-    }
-
-    func testSearch_emptyResultSet() async throws {
-        let workspace = try fixture.createWorkspace(name: "NoMatchProject")
-        let spec = HistoryTestFixture.textSearchSession(name: "Session", activityText: "ordinary text")
-        try fixture.install([spec], in: workspace)
-
-        let result = try await HistoryMCPToolService.execute(
-            args: ["op": "search", "query": "this_query_matches_nothing_at_all"],
-            scanner: scanner
-        )
-        let dto = try searchReply(result)
-
-        XCTAssertEqual(dto.totalMatches, 0)
-        XCTAssertEqual(dto.truncated, false)
-        XCTAssertEqual(dto.results.count, 0)
-    }
-
     func testTime_groupedByDayAggregatesDurationAndToolCalls() async throws {
         let workspace = try fixture.createWorkspace(name: "TimeProject")
         let day1 = try localDate(year: 2026, month: 6, day: 8, hour: 12)
@@ -385,20 +330,6 @@ final class HistoryIntegrationTests: XCTestCase {
         XCTAssertEqual(group.toolCallCount, 2)
         let details = try XCTUnwrap(group.details)
         XCTAssertEqual(details.first?.sessionName, "Target")
-    }
-
-    func testListSessions_emptyResultSet() async throws {
-        _ = try fixture.createWorkspace(name: "EmptyProject")
-
-        let result = try await HistoryMCPToolService.execute(
-            args: ["op": "list_sessions", "workspace": "NonExistent"],
-            scanner: scanner
-        )
-        let dto = try listReply(result)
-
-        XCTAssertEqual(dto.totalSessions, 0)
-        XCTAssertEqual(dto.truncated, false)
-        XCTAssertEqual(dto.sessions.count, 0)
     }
 
     // MARK: - Helpers

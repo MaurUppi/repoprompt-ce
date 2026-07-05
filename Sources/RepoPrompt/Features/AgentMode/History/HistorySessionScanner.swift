@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import RepoPromptShared
 
@@ -63,17 +64,11 @@ struct HistoryFilteredSessionRecord: Equatable {
 // MARK: - Scanner Errors
 
 enum HistorySessionScannerError: Error, Equatable, LocalizedError {
-    case workspaceDirectoryNotFound(URL)
-    case indexDecodingFailed(workspaceDir: URL, underlying: String)
     case sessionFileNotFound(sessionID: UUID, workspaceDir: URL)
     case transcriptDecodingFailed(sessionID: UUID, underlying: String)
 
     var errorDescription: String? {
         switch self {
-        case let .workspaceDirectoryNotFound(url):
-            "Workspace directory not found: \(url.path)"
-        case let .indexDecodingFailed(workspaceDir, underlying):
-            "Failed to decode index in \(workspaceDir.lastPathComponent): \(underlying)"
         case let .sessionFileNotFound(sessionID, workspaceDir):
             "Session file not found for \(sessionID) in \(workspaceDir.lastPathComponent)"
         case let .transcriptDecodingFailed(sessionID, underlying):
@@ -92,7 +87,26 @@ enum HistorySessionScannerError: Error, Equatable, LocalizedError {
 /// workspaces under `Workspaces/*/`. Each workspace directory is expected to contain an
 /// `AgentSessions/AgentSessionIndex.json` file.
 actor HistorySessionScanner: HistorySessionScanning {
-    private static let defaultScanCacheTTL: TimeInterval = 10 * 60
+    private static let defaultScanCacheTTL: TimeInterval = 90
+
+    private struct FileSignature: Equatable {
+        let fileSize: Int64
+        let modificationTime: TimeInterval
+    }
+
+    private struct IndexScanCache: Equatable {
+        struct Entry: Equatable {
+            let indexSignature: FileSignature
+            let workspaceSignature: FileSignature?
+            let readerSchemaVersion: Int
+            let workspaceName: String
+            let workspaceID: UUID?
+            let indexSchemaVersion: Int?
+            let records: [AgentSessionMetadataRecord]
+        }
+
+        var entries: [String: Entry]
+    }
 
     private let fileManager: FileManager
     private let decoder: JSONDecoder
@@ -103,6 +117,7 @@ actor HistorySessionScanner: HistorySessionScanning {
     private let scanCacheTTL: TimeInterval
     private var cachedScanResults: [HistoryWorkspaceScanResult]?
     private var cachedScanResultsAt: Date?
+    private var indexScanCache: IndexScanCache?
 
     init(
         fileManager: FileManager = .default,
@@ -134,7 +149,7 @@ actor HistorySessionScanner: HistorySessionScanning {
 
         let workspacesRoot = applicationSupportRoot.appendingPathComponent("Workspaces", isDirectory: true)
 
-        guard fileManager.fileExists(atPath: workspacesRoot.path) else {
+        guard directoryExists(at: workspacesRoot) else {
             cachedScanResults = []
             cachedScanResultsAt = now
             return []
@@ -153,9 +168,11 @@ actor HistorySessionScanner: HistorySessionScanning {
             return []
         }
 
+        var seenIndexCacheKeys = Set<String>()
         let results = workspaceDirs.map { workspaceDir in
-            scanWorkspace(workspaceDir)
+            scanWorkspace(workspaceDir, seenIndexCacheKeys: &seenIndexCacheKeys)
         }
+        pruneIndexScanCache(keeping: seenIndexCacheKeys)
         cachedScanResults = results
         cachedScanResultsAt = Date()
         return results
@@ -255,22 +272,20 @@ actor HistorySessionScanner: HistorySessionScanning {
                 return .empty
             }
             return transcript
-        } catch let error as DecodingError {
-            throw HistorySessionScannerError.transcriptDecodingFailed(
-                sessionID: sessionID,
-                underlying: decodingErrorDescription(error)
-            )
         } catch {
             throw HistorySessionScannerError.transcriptDecodingFailed(
                 sessionID: sessionID,
-                underlying: error.localizedDescription
+                underlying: String(describing: error)
             )
         }
     }
 
     // MARK: - Private Helpers
 
-    private func scanWorkspace(_ workspaceDir: URL) -> HistoryWorkspaceScanResult {
+    private func scanWorkspace(
+        _ workspaceDir: URL,
+        seenIndexCacheKeys: inout Set<String>
+    ) -> HistoryWorkspaceScanResult {
         let dirName = workspaceDir.lastPathComponent
         let fallbackIdentity = WorkspaceDirectoryName.parse(dirName)
 
@@ -291,37 +306,152 @@ actor HistorySessionScanner: HistorySessionScanning {
         }
 
         let agentSessionsDir = workspaceDir.appendingPathComponent("AgentSessions", isDirectory: true)
-        guard fileManager.fileExists(atPath: agentSessionsDir.path) else {
+        guard directoryExists(at: agentSessionsDir) else {
             // No AgentSessions directory — this workspace has no sessions. Avoid reading
             // workspace.json on the cold scan path; the directory name is sufficient.
             return result()
         }
 
         let indexFile = agentSessionsDir.appendingPathComponent("AgentSessionIndex.json")
-        guard fileManager.fileExists(atPath: indexFile.path) else {
+        guard let indexSignature = fileSignature(for: indexFile) else {
             // No index file — return empty records (no failure flag; index may not exist yet).
             return result()
+        }
+
+        let cacheKey = indexScanCacheKey(for: indexFile)
+        seenIndexCacheKeys.insert(cacheKey)
+        let workspaceJSON = workspaceDir.appendingPathComponent("workspace.json")
+        let workspaceSignature = fileSignature(for: workspaceJSON)
+        if let cachedResult = cachedScanResult(
+            for: cacheKey,
+            indexSignature: indexSignature,
+            workspaceSignature: workspaceSignature,
+            workspaceDir: workspaceDir
+        ) {
+            return cachedResult
         }
 
         do {
             let data = try Data(contentsOf: indexFile, options: .mappedIfSafe)
             guard let schemaVersion = schemaVersionSniff(from: data) else {
+                removeCachedIndexScan(cacheKey)
                 return result(indexReadFailed: true)
             }
 
-            // Reject stale indexes before full metadata decode. Most user installs carry many
-            // tiny stale indexes; fully decoding them dominates cold history scans even though
-            // the records will be discarded immediately afterward.
+            let identity = resolveWorkspaceNameAndID(from: workspaceDir, dirName: dirName, fileManager: fileManager)
             guard schemaVersion == AgentSessionMetadataIndex.currentSchemaVersion else {
-                return result(indexSchemaVersion: schemaVersion)
+                rememberIndexScan(
+                    cacheKey,
+                    indexSignature: indexSignature,
+                    workspaceSignature: workspaceSignature,
+                    identity: identity,
+                    indexSchemaVersion: schemaVersion,
+                    records: []
+                )
+                return result(indexSchemaVersion: schemaVersion, identity: identity)
             }
 
             let index = try decoder.decode(AgentSessionMetadataIndex.self, from: data)
-            let identity = resolveWorkspaceNameAndID(from: workspaceDir, dirName: dirName, fileManager: fileManager)
+            rememberIndexScan(
+                cacheKey,
+                indexSignature: indexSignature,
+                workspaceSignature: workspaceSignature,
+                identity: identity,
+                indexSchemaVersion: nil,
+                records: index.entries
+            )
             return result(records: index.entries, identity: identity)
         } catch {
+            removeCachedIndexScan(cacheKey)
             return result(indexReadFailed: true)
         }
+    }
+
+    private func pruneIndexScanCache(keeping liveKeys: Set<String>) {
+        guard var cache = indexScanCache else { return }
+        let originalCount = cache.entries.count
+        cache.entries = cache.entries.filter { liveKeys.contains($0.key) }
+        if cache.entries.count != originalCount {
+            indexScanCache = cache
+        }
+    }
+
+    private func cachedScanResult(
+        for cacheKey: String,
+        indexSignature: FileSignature,
+        workspaceSignature: FileSignature?,
+        workspaceDir: URL
+    ) -> HistoryWorkspaceScanResult? {
+        guard let entry = indexScanCache?.entries[cacheKey],
+              entry.readerSchemaVersion == AgentSessionMetadataIndex.currentSchemaVersion,
+              entry.indexSignature == indexSignature,
+              entry.workspaceSignature == workspaceSignature
+        else { return nil }
+
+        return HistoryWorkspaceScanResult(
+            workspaceDir: workspaceDir,
+            workspaceName: entry.workspaceName,
+            workspaceID: entry.workspaceID,
+            records: entry.records,
+            indexReadFailed: false,
+            indexSchemaVersion: entry.indexSchemaVersion
+        )
+    }
+
+    private func rememberIndexScan(
+        _ cacheKey: String,
+        indexSignature: FileSignature,
+        workspaceSignature: FileSignature?,
+        identity: (name: String, id: UUID?),
+        indexSchemaVersion: Int?,
+        records: [AgentSessionMetadataRecord]
+    ) {
+        var cache = indexScanCache ?? IndexScanCache(entries: [:])
+        let entry = IndexScanCache.Entry(
+            indexSignature: indexSignature,
+            workspaceSignature: workspaceSignature,
+            readerSchemaVersion: AgentSessionMetadataIndex.currentSchemaVersion,
+            workspaceName: identity.name,
+            workspaceID: identity.id,
+            indexSchemaVersion: indexSchemaVersion,
+            records: records
+        )
+        if cache.entries[cacheKey] == entry {
+            return
+        }
+        cache.entries[cacheKey] = entry
+        indexScanCache = cache
+    }
+
+    private func removeCachedIndexScan(_ cacheKey: String) {
+        guard var cache = indexScanCache, cache.entries.removeValue(forKey: cacheKey) != nil else { return }
+        indexScanCache = cache
+    }
+
+    private func fileSignature(for fileURL: URL) -> FileSignature? {
+        var statResult = Darwin.stat()
+        return fileURL.withUnsafeFileSystemRepresentation { path in
+            guard let path, stat(path, &statResult) == 0 else { return nil }
+            return FileSignature(
+                fileSize: Int64(statResult.st_size),
+                modificationTime: Date(
+                    timeIntervalSince1970: TimeInterval(statResult.st_mtimespec.tv_sec)
+                        + (TimeInterval(statResult.st_mtimespec.tv_nsec) / 1_000_000_000)
+                ).timeIntervalSinceReferenceDate
+            )
+        }
+    }
+
+    private func directoryExists(at url: URL) -> Bool {
+        var statResult = Darwin.stat()
+        return url.withUnsafeFileSystemRepresentation { path in
+            guard let path, stat(path, &statResult) == 0 else { return false }
+            return (statResult.st_mode & S_IFMT) == S_IFDIR
+        }
+    }
+
+    private func indexScanCacheKey(for fileURL: URL) -> String {
+        fileURL.standardizedFileURL.path
     }
 
     private nonisolated func schemaVersionSniff(from data: Data) -> Int? {
@@ -363,21 +493,5 @@ actor HistorySessionScanner: HistorySessionScanning {
 
         // Parse directory name: "Workspace-{name}-{uuid}" or fall back to directory name.
         return WorkspaceDirectoryName.parse(dirName)
-    }
-
-    /// Produce a human-readable description from a DecodingError for error reporting.
-    private nonisolated func decodingErrorDescription(_ error: DecodingError) -> String {
-        switch error {
-        case let .typeMismatch(type, context):
-            "Type mismatch for \(type) at \(context.codingPath.map(\.stringValue).joined(separator: ".")): \(context.debugDescription)"
-        case let .valueNotFound(type, context):
-            "Value not found for \(type) at \(context.codingPath.map(\.stringValue).joined(separator: ".")): \(context.debugDescription)"
-        case let .keyNotFound(key, context):
-            "Key not found '\(key.stringValue)' at \(context.codingPath.map(\.stringValue).joined(separator: ".")): \(context.debugDescription)"
-        case let .dataCorrupted(context):
-            "Data corrupted at \(context.codingPath.map(\.stringValue).joined(separator: ".")): \(context.debugDescription)"
-        @unknown default:
-            error.localizedDescription
-        }
     }
 }

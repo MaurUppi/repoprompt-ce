@@ -1,7 +1,8 @@
 import Foundation
 import MCP
 
-/// Dispatches the `history` MCP tool operations (`list_sessions`, `search`, `time`)
+/// Dispatches the `history` MCP tool operations (`list_sessions`, `search`, `time`,
+/// `get_session`)
 /// against the cross-workspace session scanner.
 ///
 /// Each operation returns a typed ``HistoryToolReply`` (a `Codable & Sendable` reply
@@ -12,6 +13,7 @@ enum HistoryMCPToolService {
     /// UserDefaults key shared with GlobalSettingsStore.setHistoryIdleThresholdMinutes.
     static let idleThresholdSettingsKey = "history.idle_threshold_minutes"
     private static let maxFilesTouchedPerListedSession = 20
+    private static let maxGetSessionEntriesPerTurn = 20
 
     // MARK: - Public Entry Point
 
@@ -30,15 +32,21 @@ enum HistoryMCPToolService {
             return .error(HistoryErrorReply(error: "Missing or empty required parameter 'op'"))
         }
 
-        switch op {
-        case "list_sessions":
-            return try await executeListSessions(args: args, scanner: scanner)
-        case "search":
-            return try await executeSearch(args: args, scanner: scanner)
-        case "time":
-            return try await executeTime(args: args, scanner: scanner)
-        default:
-            return .error(HistoryErrorReply(error: "Unknown op '\(op)'. Valid ops: list_sessions, search, time"))
+        do {
+            switch op {
+            case "list_sessions":
+                return try await executeListSessions(args: args, scanner: scanner)
+            case "search":
+                return try await executeSearch(args: args, scanner: scanner)
+            case "time":
+                return try await executeTime(args: args, scanner: scanner)
+            case "get_session":
+                return try await executeGetSession(args: args, scanner: scanner)
+            default:
+                return .error(HistoryErrorReply(error: "Unknown op '\(op)'. Valid ops: list_sessions, search, time, get_session"))
+            }
+        } catch let error as HistoryValidationError {
+            return .error(HistoryErrorReply(error: error.message))
         }
     }
 
@@ -52,93 +60,180 @@ enum HistoryMCPToolService {
         let agentKindFilter = args["agent_kind"]?.stringValue
         let modelFilter = args["model"]?.stringValue
         let filePathFilter = args["touched_file"]?.stringValue
-        let dateFrom: Date?
-        let dateTo: Date?
-        do {
-            dateFrom = try parseValidatedDateBound(args["date_from"]?.stringValue, parameterName: "date_from", isUpperBound: false)
-            dateTo = try parseValidatedDateBound(args["date_to"]?.stringValue, parameterName: "date_to", isUpperBound: true)
-        } catch let error as HistoryValidationError {
-            return .error(HistoryErrorReply(error: error.message))
-        }
+        let dateFrom = try parseValidatedDateBound(args["date_from"]?.stringValue, parameterName: "date_from", isUpperBound: false)
+        let dateTo = try parseValidatedDateBound(args["date_to"]?.stringValue, parameterName: "date_to", isUpperBound: true)
         let sortRaw = args["sort"]?.stringValue ?? "last_activity"
         guard ["last_activity", "duration", "turn_count"].contains(sortRaw) else {
             return .error(HistoryErrorReply(error: "Invalid 'sort' value '\(sortRaw)'. Valid values: last_activity, duration, turn_count"))
         }
         let limit = clampLimit(args["limit"]?.intValue, default: 30, max: 100)
 
-        do {
-            let idleThresholdMinutes = try resolveIdleThreshold(args["idle_threshold_minutes"])
-            let maxSessionsScanned = try resolveMaxSessionsScanned(args["max_sessions_scanned"])
-            let scanResults = try await scanner.scanAllWorkspaces()
-            let skippedWorkspaces = scanDiagnostics(from: scanResults)
-            let filtered = scanner.sessionsMatchingFilters(
-                scanResults,
-                workspace: workspaceFilter,
-                agentKind: agentKindFilter,
-                model: modelFilter,
-                filePath: nil,
-                from: dateFrom,
-                to: dateTo
+        let idleThresholdMinutes = try resolveIdleThreshold(args["idle_threshold_minutes"])
+        let maxSessionsScanned = try resolveMaxSessionsScanned(args["max_sessions_scanned"])
+        let scanResults = try await scanner.scanAllWorkspaces()
+        let skippedWorkspaces = scanDiagnostics(from: scanResults)
+        let filtered = scanner.sessionsMatchingFilters(
+            scanResults,
+            workspace: workspaceFilter,
+            agentKind: agentKindFilter,
+            model: modelFilter,
+            filePath: nil,
+            from: dateFrom,
+            to: dateTo
+        )
+
+        // Keep metadata filtering/sorting cheap, then hydrate only bounded candidates.
+        // When touched_file is present, stub-rebuilt records may have empty keyPaths, so
+        // the file filter is applied after bounded on-demand enrichment.
+        var sorted = sortFilteredSessions(filtered, by: sortRaw == "duration" ? "last_activity" : sortRaw, idleThresholdMinutes: idleThresholdMinutes)
+        let candidates = Array(sorted.prefix(maxSessionsScanned))
+        let sessionsScanned = candidates.count
+        let scanTruncated = sorted.count > candidates.count
+        var hydrated = await Self.enrichingStubBuiltSessions(candidates, scanner: scanner)
+        if sortRaw == "duration" {
+            hydrated = sortFilteredSessions(hydrated, by: sortRaw, idleThresholdMinutes: idleThresholdMinutes)
+        }
+        let totalSessions: Int
+        if let filePathFilter {
+            hydrated = hydrated.filter { session in
+                session.record.keyPaths.contains { historyPath($0, matches: filePathFilter) }
+            }
+            totalSessions = hydrated.count
+        } else {
+            totalSessions = filtered.count
+        }
+        sorted = hydrated
+        let truncated = sorted.count > limit
+        let sliced = Array(sorted.prefix(limit))
+
+        let sessions: [HistoryListSessionsReply.SessionDTO] = sliced.map { session in
+            let r = session.record
+            let filesTouched = Array(r.keyPaths).sorted()
+            let cappedFilesTouched = Array(filesTouched.prefix(maxFilesTouchedPerListedSession))
+            return HistoryListSessionsReply.SessionDTO(
+                sessionID: r.id.uuidString,
+                sessionName: r.name,
+                workspaceName: session.workspaceName,
+                firstActivityAt: iso8601DateTime.string(from: r.firstActivityAt ?? r.activityDate),
+                lastActivityAt: iso8601DateTime.string(from: r.lastActivityAt ?? r.savedAt),
+                activeDurationSeconds: r.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes),
+                turnCount: r.itemCount,
+                toolCallCount: r.toolCallCount,
+                filesTouched: cappedFilesTouched,
+                filesTouchedCount: filesTouched.count,
+                hadErrors: r.hasUnknownConversationContent,
+                agentKind: r.agentKindRaw,
+                agentModel: r.agentModelRaw,
+                lastRunState: r.lastRunStateRaw
             )
+        }
 
-            // Keep metadata filtering/sorting cheap, then hydrate only bounded candidates.
-            // When touched_file is present, stub-rebuilt records may have empty keyPaths, so
-            // the file filter is applied after bounded on-demand enrichment.
-            var sorted = sortFilteredSessions(filtered, by: sortRaw == "duration" ? "last_activity" : sortRaw, idleThresholdMinutes: idleThresholdMinutes)
-            let candidates = Array(sorted.prefix(maxSessionsScanned))
-            let sessionsScanned = candidates.count
-            let scanTruncated = sorted.count > candidates.count
-            var hydrated = await Self.enrichingStubBuiltSessions(candidates, scanner: scanner)
-            if sortRaw == "duration" {
-                hydrated = sortFilteredSessions(hydrated, by: sortRaw, idleThresholdMinutes: idleThresholdMinutes)
-            }
-            let totalSessions: Int
-            if let filePathFilter {
-                hydrated = hydrated.filter { session in
-                    session.record.keyPaths.contains { historyPath($0, matches: filePathFilter) }
-                }
-                totalSessions = hydrated.count
-            } else {
-                totalSessions = filtered.count
-            }
-            sorted = hydrated
-            let truncated = scanTruncated || sorted.count > limit
-            let sliced = Array(sorted.prefix(limit))
+        return .listSessions(HistoryListSessionsReply(
+            totalSessions: totalSessions,
+            truncated: truncated,
+            sessionsScanned: sessionsScanned,
+            scanTruncated: scanTruncated,
+            skippedWorkspaces: nonEmptyDiagnostics(skippedWorkspaces),
+            sessions: sessions
+        ))
+    }
 
-            let sessions: [HistoryListSessionsReply.SessionDTO] = sliced.map { session in
-                let r = session.record
-                let filesTouched = Array(r.keyPaths).sorted()
-                let cappedFilesTouched = Array(filesTouched.prefix(maxFilesTouchedPerListedSession))
-                return HistoryListSessionsReply.SessionDTO(
-                    sessionID: r.id.uuidString,
-                    sessionName: r.name,
-                    workspaceName: session.workspaceName,
-                    firstActivityAt: iso8601DateTime.string(from: r.firstActivityAt ?? r.activityDate),
-                    lastActivityAt: iso8601DateTime.string(from: r.lastActivityAt ?? r.savedAt),
-                    activeDurationSeconds: r.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes),
-                    turnCount: r.itemCount,
-                    toolCallCount: r.toolCallCount,
-                    filesTouched: cappedFilesTouched,
-                    filesTouchedCount: filesTouched.count,
-                    filesTouchedTruncated: filesTouched.count > cappedFilesTouched.count,
-                    hadErrors: r.hasUnknownConversationContent,
-                    agentKind: r.agentKindRaw,
-                    agentModel: r.agentModelRaw,
-                    lastRunState: r.lastRunStateRaw
+    // MARK: - get_session
+
+    private static func executeGetSession(
+        args: [String: Value],
+        scanner: HistorySessionScanning
+    ) async throws -> HistoryToolReply {
+        guard let sessionIDRaw = args["session_id"]?.stringValue, !sessionIDRaw.isEmpty else {
+            return .error(HistoryErrorReply(error: "Missing or empty required parameter 'session_id'"))
+        }
+        guard let sessionID = UUID(uuidString: sessionIDRaw) else {
+            return .error(HistoryErrorReply(error: "Invalid session_id: expected UUID format"))
+        }
+
+        let maxChars = clampLimit(args["max_chars"]?.intValue, default: 6000, max: 20000)
+        let contextTurns = clampGetSessionContextTurns(args["context_turns"]?.intValue)
+        let roles = normalizedGetSessionRoles(args["roles"]?.arrayValue?.compactMap(\.stringValue))
+
+        let scanResults = try await scanner.scanAllWorkspaces()
+        guard let session = scanResults.lazy.flatMap({ scan in
+            scan.records.map { record in
+                HistoryFilteredSessionRecord(
+                    record: record,
+                    workspaceName: scan.workspaceName,
+                    workspaceDir: scan.workspaceDir
                 )
             }
-
-            return .listSessions(HistoryListSessionsReply(
-                totalSessions: totalSessions,
-                truncated: truncated,
-                sessionsScanned: sessionsScanned,
-                scanTruncated: scanTruncated,
-                skippedWorkspaces: skippedWorkspaces,
-                sessions: sessions
-            ))
-        } catch let error as HistoryValidationError {
-            return .error(HistoryErrorReply(error: error.message))
+        }).first(where: { $0.record.id == sessionID }) else {
+            return .error(HistoryErrorReply(error: "No history session found for session_id '\(sessionIDRaw)'"))
         }
+
+        let transcript = try await scanner.loadTranscriptForSearch(
+            sessionID: session.record.id,
+            workspaceDir: session.workspaceDir
+        )
+        let totalTurns = transcript.turns.count
+        guard totalTurns > 0 else {
+            return .getSession(HistoryGetSessionReply(
+                sessionID: session.record.id.uuidString,
+                sessionName: session.record.name,
+                workspaceName: session.workspaceName,
+                totalTurns: 0,
+                returnedTurnStart: 0,
+                returnedTurnEnd: 0,
+                truncated: false,
+                turns: []
+            ))
+        }
+
+        let requestedRange = try resolveGetSessionTurnRange(
+            args: args,
+            totalTurns: totalTurns,
+            contextTurns: contextTurns
+        )
+        let targetTurnIndex = getSessionTargetTurnIndex(args: args, totalTurns: totalTurns)
+        let indexedTurns = Array(transcript.turns.enumerated())
+        let window = Array(indexedTurns[requestedRange])
+        var remainingChars = getSessionContentBudget(maxChars: maxChars)
+        var replyTruncated = requestedRange.count < totalTurns
+        var renderedTurnsByIndex: [Int: HistoryGetSessionReply.TurnDTO] = [:]
+
+        let budgetOrder = window.sorted { lhs, rhs in
+            if lhs.offset == targetTurnIndex { return true }
+            if rhs.offset == targetTurnIndex { return false }
+            return lhs.offset < rhs.offset
+        }
+
+        for (turnIndex, turn) in budgetOrder {
+            if remainingChars <= 0 {
+                replyTruncated = true
+                break
+            }
+            let rendered = renderGetSessionTurn(
+                turn,
+                turnIndex: turnIndex,
+                roles: roles,
+                remainingChars: &remainingChars
+            )
+            if rendered.truncated { replyTruncated = true }
+            renderedTurnsByIndex[turnIndex] = rendered.dto
+        }
+
+        let turnDTOs = window.compactMap { renderedTurnsByIndex[$0.offset] }
+        if turnDTOs.count < window.count { replyTruncated = true }
+        let returnedTurnStart = turnDTOs.map(\.turnIndex).min() ?? requestedRange.lowerBound
+        let returnedTurnEnd = turnDTOs.map(\.turnIndex).max() ?? requestedRange.lowerBound
+
+        return .getSession(HistoryGetSessionReply(
+            sessionID: session.record.id.uuidString,
+            sessionName: session.record.name,
+            workspaceName: session.workspaceName,
+            totalTurns: totalTurns,
+            returnedTurnStart: returnedTurnStart,
+            returnedTurnEnd: returnedTurnEnd,
+            truncated: replyTruncated,
+            turns: turnDTOs
+        ))
     }
 
     // MARK: - search
@@ -167,39 +262,23 @@ enum HistoryMCPToolService {
         guard ["activities", "summaries", "all"].contains(sourceFilter) else {
             return .error(HistoryErrorReply(error: "Invalid 'source' value '\(sourceFilter)'. Valid values: activities, summaries, all"))
         }
-        let dateFrom: Date?
-        let dateTo: Date?
-        do {
-            dateFrom = try parseValidatedDateBound(args["date_from"]?.stringValue, parameterName: "date_from", isUpperBound: false)
-            dateTo = try parseValidatedDateBound(args["date_to"]?.stringValue, parameterName: "date_to", isUpperBound: true)
-        } catch let error as HistoryValidationError {
-            return .error(HistoryErrorReply(error: error.message))
-        }
+        let dateFrom = try parseValidatedDateBound(args["date_from"]?.stringValue, parameterName: "date_from", isUpperBound: false)
+        let dateTo = try parseValidatedDateBound(args["date_to"]?.stringValue, parameterName: "date_to", isUpperBound: true)
         let limit = clampLimit(args["limit"]?.intValue, default: 20, max: 100)
         let includeTurnRequestText = args["include_turn_request_text"]?.boolValue ?? false
-        let maxSessionsScanned: Int
-        do {
-            maxSessionsScanned = try resolveMaxSessionsScanned(args["max_sessions_scanned"])
-        } catch let error as HistoryValidationError {
-            return .error(HistoryErrorReply(error: error.message))
-        }
+        let maxSessionsScanned = try resolveMaxSessionsScanned(args["max_sessions_scanned"])
 
         let scanResults = try await scanner.scanAllWorkspaces()
         let skippedWorkspaces = scanDiagnostics(from: scanResults)
 
-        let filtered: [HistoryFilteredSessionRecord]
-        do {
-            filtered = try resolveScopedSessions(
-                scanResults: scanResults,
-                scanner: scanner,
-                workspace: workspaceFilter,
-                sessionID: sessionIDFilter,
-                from: dateFrom,
-                to: dateTo
-            )
-        } catch let error as HistoryValidationError {
-            return .error(HistoryErrorReply(error: error.message))
-        }
+        let filtered = try resolveScopedSessions(
+            scanResults: scanResults,
+            scanner: scanner,
+            workspace: workspaceFilter,
+            sessionID: sessionIDFilter,
+            from: dateFrom,
+            to: dateTo
+        )
 
         let queryLower = query.lowercased()
         var retainedMatches: [HistorySearchMatch] = []
@@ -207,7 +286,8 @@ enum HistoryMCPToolService {
         var sessionsScanned = 0
         var scanTruncated = false
 
-        for session in filtered {
+        let orderedSessions = sortFilteredSessions(filtered, by: "last_activity", idleThresholdMinutes: AgentSessionMetadataRecord.defaultIdleThresholdMinutes)
+        for session in orderedSessions {
             if sessionsScanned >= maxSessionsScanned {
                 scanTruncated = true
                 break
@@ -291,21 +371,20 @@ enum HistoryMCPToolService {
                 if turnMatches.count > 1 {
                     let activityMatch = turnMatches.first { $0.source == "activity" }
                     if let activityMatch {
-                        appendSearchMatch(activityMatch, totalMatches: &totalMatches, retainedMatches: &retainedMatches, limit: limit)
+                        retainedMatches.append(activityMatch)
                     } else {
-                        appendSearchMatch(turnMatches[0], totalMatches: &totalMatches, retainedMatches: &retainedMatches, limit: limit)
+                        retainedMatches.append(turnMatches[0])
                     }
                 } else if let only = turnMatches.first {
-                    appendSearchMatch(only, totalMatches: &totalMatches, retainedMatches: &retainedMatches, limit: limit)
+                    retainedMatches.append(only)
                 }
             }
         }
 
-        // Sort retained matches by timestamp descending. We intentionally retain only a
-        // bounded result window while still counting every match in scanned sessions.
+        totalMatches = retainedMatches.count
         retainedMatches.sort { $0.timestamp > $1.timestamp }
 
-        let truncated = totalMatches > retainedMatches.count || scanTruncated
+        let truncated = totalMatches > limit
         let sliced = Array(retainedMatches.prefix(limit))
 
         let results: [HistorySearchReply.MatchDTO] = sliced.map { match in
@@ -327,7 +406,7 @@ enum HistoryMCPToolService {
             truncated: truncated,
             scanTruncated: scanTruncated,
             sessionsScanned: sessionsScanned,
-            skippedWorkspaces: skippedWorkspaces,
+            skippedWorkspaces: nonEmptyDiagnostics(skippedWorkspaces),
             results: results
         ))
     }
@@ -349,76 +428,64 @@ enum HistoryMCPToolService {
 
         let workspaceFilter = args["workspace"]?.stringValue
         let sessionIDFilter = args["session_id"]?.stringValue
-        let dateFrom: Date?
-        let dateTo: Date?
-        do {
-            dateFrom = try parseValidatedDateBound(args["date_from"]?.stringValue, parameterName: "date_from", isUpperBound: false)
-            dateTo = try parseValidatedDateBound(args["date_to"]?.stringValue, parameterName: "date_to", isUpperBound: true)
-        } catch let error as HistoryValidationError {
-            return .error(HistoryErrorReply(error: error.message))
-        }
+        let dateFrom = try parseValidatedDateBound(args["date_from"]?.stringValue, parameterName: "date_from", isUpperBound: false)
+        let dateTo = try parseValidatedDateBound(args["date_to"]?.stringValue, parameterName: "date_to", isUpperBound: true)
         let includeDetails = args["include_details"]?.boolValue ?? false
-        let maxSessionsScanned: Int
-        do {
-            maxSessionsScanned = try resolveMaxSessionsScanned(args["max_sessions_scanned"])
-        } catch let error as HistoryValidationError {
-            return .error(HistoryErrorReply(error: error.message))
-        }
+        let limit = clampLimit(args["limit"]?.intValue, default: 30, max: 100)
+        let maxSessionsScanned = try resolveMaxSessionsScanned(args["max_sessions_scanned"])
 
         let scanResults = try await scanner.scanAllWorkspaces()
         let skippedWorkspaces = scanDiagnostics(from: scanResults)
 
-        do {
-            let filtered = try resolveScopedSessions(
-                scanResults: scanResults,
-                scanner: scanner,
-                workspace: workspaceFilter,
-                sessionID: sessionIDFilter,
-                from: dateFrom,
-                to: dateTo
-            )
-            let idleThresholdMinutes = try resolveIdleThreshold(args["idle_threshold_minutes"])
+        let filtered = try resolveScopedSessions(
+            scanResults: scanResults,
+            scanner: scanner,
+            workspace: workspaceFilter,
+            sessionID: sessionIDFilter,
+            from: dateFrom,
+            to: dateTo
+        )
+        let idleThresholdMinutes = try resolveIdleThreshold(args["idle_threshold_minutes"])
 
-            // Calendar grouping (day/week/month) uses per-day attribution via transcript
-            // loading — each turn's duration is attributed to the day it occurred, preventing
-            // double counting across day-scoped queries. Session/workspace grouping stays
-            // metadata-only (no per-day splitting needed).
-            if ["day", "week", "month"].contains(groupBy) {
-                return try await executeTimeCalendarGrouped(
-                    filtered,
-                    groupBy: groupBy,
-                    idleThresholdMinutes: idleThresholdMinutes,
-                    includeDetails: includeDetails,
-                    dateFrom: dateFrom,
-                    dateTo: dateTo,
-                    maxSessionsScanned: maxSessionsScanned,
-                    skippedWorkspaces: skippedWorkspaces,
-                    scanner: scanner
-                )
-            }
-
-            // Non-calendar grouping reads stored duration; hydrate only a bounded candidate set.
-            let candidates = Array(sortFilteredSessions(filtered, by: "last_activity", idleThresholdMinutes: idleThresholdMinutes).prefix(maxSessionsScanned))
-            let sessionsScanned = candidates.count
-            let scanTruncated = filtered.count > candidates.count
-            let enriched = await Self.enrichingStubBuiltSessions(candidates, scanner: scanner)
-            let totalSessions = enriched.count
-            let totalDuration = enriched.reduce(0) { $0 + $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
-
-            let groups = groupSessions(enriched, by: groupBy, includeDetails: includeDetails, idleThresholdMinutes: idleThresholdMinutes)
-
-            return .time(HistoryTimeReply(
-                totalSessions: totalSessions,
-                totalActiveDurationSeconds: totalDuration,
-                truncated: scanTruncated,
-                sessionsScanned: sessionsScanned,
-                scanTruncated: scanTruncated,
+        // Calendar grouping (day/week/month) uses per-day attribution via transcript
+        // loading — each turn's duration is attributed to the day it occurred, preventing
+        // double counting across day-scoped queries. Session/workspace grouping stays
+        // metadata-only (no per-day splitting needed).
+        if ["day", "week", "month"].contains(groupBy) {
+            return try await executeTimeCalendarGrouped(
+                filtered,
+                groupBy: groupBy,
+                idleThresholdMinutes: idleThresholdMinutes,
+                includeDetails: includeDetails,
+                dateFrom: dateFrom,
+                dateTo: dateTo,
+                maxSessionsScanned: maxSessionsScanned,
+                limit: limit,
                 skippedWorkspaces: skippedWorkspaces,
-                groups: groups
-            ))
-        } catch let error as HistoryValidationError {
-            return .error(HistoryErrorReply(error: error.message))
+                scanner: scanner
+            )
         }
+
+        // Non-calendar grouping reads stored duration; hydrate only a bounded candidate set.
+        let candidates = Array(sortFilteredSessions(filtered, by: "last_activity", idleThresholdMinutes: idleThresholdMinutes).prefix(maxSessionsScanned))
+        let sessionsScanned = candidates.count
+        let scanTruncated = filtered.count > candidates.count
+        let enriched = await Self.enrichingStubBuiltSessions(candidates, scanner: scanner)
+        let totalSessions = enriched.count
+        let totalDuration = enriched.reduce(0) { $0 + $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
+
+        let allGroups = groupSessions(enriched, by: groupBy, includeDetails: includeDetails, idleThresholdMinutes: idleThresholdMinutes)
+        let groups = Array(allGroups.prefix(limit))
+
+        return .time(HistoryTimeReply(
+            totalSessions: totalSessions,
+            totalActiveDurationSeconds: totalDuration,
+            truncated: allGroups.count > groups.count,
+            sessionsScanned: sessionsScanned,
+            scanTruncated: scanTruncated,
+            skippedWorkspaces: nonEmptyDiagnostics(skippedWorkspaces),
+            groups: groups
+        ))
     }
 
     // MARK: - On-Demand Transcript Enrichment
@@ -512,6 +579,7 @@ enum HistoryMCPToolService {
         dateFrom: Date?,
         dateTo: Date?,
         maxSessionsScanned: Int,
+        limit: Int,
         skippedWorkspaces: [String],
         scanner: HistorySessionScanning
     ) async throws -> HistoryToolReply {
@@ -606,7 +674,7 @@ enum HistoryMCPToolService {
         }
 
         let sortedKeys = groupKeys.sorted().reversed()
-        let groupDTOs: [HistoryTimeReply.GroupDTO] = sortedKeys.map { key in
+        let allGroupDTOs: [HistoryTimeReply.GroupDTO] = sortedKeys.map { key in
             let details: [HistoryTimeReply.GroupDTO.DetailDTO]?
             if includeDetails {
                 let dd = detailDuration[key] ?? [:]
@@ -630,14 +698,15 @@ enum HistoryMCPToolService {
             )
         }
 
-        let totalDuration = groupDTOs.reduce(0) { $0 + $1.activeDurationSeconds }
+        let groupDTOs = Array(allGroupDTOs.prefix(limit))
+        let totalDuration = allGroupDTOs.reduce(0) { $0 + $1.activeDurationSeconds }
         return .time(HistoryTimeReply(
             totalSessions: sessions.count,
             totalActiveDurationSeconds: totalDuration,
-            truncated: scanTruncated,
+            truncated: allGroupDTOs.count > groupDTOs.count,
             sessionsScanned: sessionsScanned,
             scanTruncated: scanTruncated,
-            skippedWorkspaces: skippedWorkspaces,
+            skippedWorkspaces: nonEmptyDiagnostics(skippedWorkspaces),
             groups: groupDTOs
         ))
     }
@@ -757,6 +826,233 @@ enum HistoryMCPToolService {
         }
     }
 
+    // MARK: - get_session Rendering
+
+    private static func clampGetSessionContextTurns(_ value: Int?) -> Int {
+        guard let value else { return 1 }
+        return max(0, min(value, 5))
+    }
+
+    private static func getSessionTargetTurnIndex(args: [String: Value], totalTurns: Int) -> Int {
+        if let aroundTurn = args["around_turn"]?.intValue, (0 ..< totalTurns).contains(aroundTurn) {
+            return aroundTurn
+        }
+        if let turnStart = args["turn_start"]?.intValue, (0 ..< totalTurns).contains(turnStart) {
+            return turnStart
+        }
+        return 0
+    }
+
+    private static func getSessionContentBudget(maxChars: Int) -> Int {
+        // `max_chars` applies to the user-visible formatted tool output, not just
+        // raw transcript text. Leave room for headings, bullets, and retry hints so
+        // the formatter can stay near the caller's requested token budget.
+        if maxChars <= 1200 {
+            return max(1, maxChars / 2)
+        }
+        return max(1, min(maxChars - 1200, Int(Double(maxChars) * 0.72)))
+    }
+
+    private static func resolveGetSessionTurnRange(
+        args: [String: Value],
+        totalTurns: Int,
+        contextTurns: Int
+    ) throws -> Range<Int> {
+        if let aroundTurn = args["around_turn"]?.intValue {
+            guard (0 ..< totalTurns).contains(aroundTurn) else {
+                throw HistoryValidationError(message: "around_turn must be between 0 and \(max(0, totalTurns - 1))")
+            }
+            let start = max(0, aroundTurn - contextTurns)
+            let end = min(totalTurns, aroundTurn + contextTurns + 1)
+            return start ..< end
+        }
+
+        guard let start = args["turn_start"]?.intValue else {
+            throw HistoryValidationError(message: "get_session requires around_turn from a search result, or turn_start/turn_end for a bounded range")
+        }
+        let requestedEnd = args["turn_end"]?.intValue ?? start
+        guard start >= 0, start < totalTurns else {
+            throw HistoryValidationError(message: "turn_start must be between 0 and \(max(0, totalTurns - 1))")
+        }
+        guard requestedEnd >= start else {
+            throw HistoryValidationError(message: "turn_end must be greater than or equal to turn_start")
+        }
+        let cappedEndInclusive = min(totalTurns - 1, min(requestedEnd, start + 19))
+        return start ..< (cappedEndInclusive + 1)
+    }
+
+    private static func normalizedGetSessionRoles(_ rawRoles: [String]?) -> Set<String> {
+        let roles = rawRoles?.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }.filter { !$0.isEmpty }
+        guard let roles, !roles.isEmpty else {
+            return ["user", "assistant", "error", "summary"]
+        }
+        return Set(roles)
+    }
+
+    private static func renderGetSessionTurn(
+        _ turn: AgentTranscriptTurn,
+        turnIndex: Int,
+        roles: Set<String>,
+        remainingChars: inout Int
+    ) -> (dto: HistoryGetSessionReply.TurnDTO, truncated: Bool) {
+        var entries: [HistoryGetSessionReply.EntryDTO] = []
+        var turnTruncated = false
+        var entriesOmitted = 0
+        let requestText: String?
+        if roles.contains("user"), let request = nonEmptyText(turn.request?.text), remainingChars > 0 {
+            let clipped = clipHistoryText(request, maxChars: min(2000, remainingChars))
+            requestText = clipped.text
+            remainingChars -= clipped.text.count
+            turnTruncated = turnTruncated || clipped.truncated
+        } else {
+            requestText = nil
+        }
+
+        if turn.isStructurallyCompacted, roles.contains("summary"), let summaryText = historySummaryText(turn.summary), remainingChars > 0 {
+            appendGetSessionEntry(
+                role: "summary",
+                text: summaryText,
+                perEntryMaxChars: 2000,
+                entries: &entries,
+                remainingChars: &remainingChars,
+                turnTruncated: &turnTruncated
+            )
+        }
+
+        let toolCallSummary = getSessionToolCallSummary(turn.allActivities)
+
+        for activity in turn.allActivities {
+            guard remainingChars > 0 else {
+                turnTruncated = true
+                break
+            }
+            guard let role = getSessionRole(for: activity.role), roles.contains(role) else {
+                continue
+            }
+            if entries.count >= maxGetSessionEntriesPerTurn {
+                entriesOmitted += 1
+                turnTruncated = true
+                continue
+            }
+            let text: String?
+            let perEntryMaxChars: Int
+            if role == "tool" {
+                text = getSessionToolSummary(activity)
+                perEntryMaxChars = 500
+            } else {
+                text = nonEmptyText(activity.text)
+                perEntryMaxChars = role == "error" ? 500 : 4000
+            }
+            guard let text else { continue }
+            appendGetSessionEntry(
+                role: role,
+                text: text,
+                perEntryMaxChars: perEntryMaxChars,
+                entries: &entries,
+                remainingChars: &remainingChars,
+                turnTruncated: &turnTruncated
+            )
+        }
+
+        return (
+            HistoryGetSessionReply.TurnDTO(
+                turnIndex: turnIndex,
+                startedAt: iso8601DateTime.string(from: turn.startedAt),
+                requestText: requestText,
+                toolCallSummary: roles.contains("tool") ? nil : toolCallSummary,
+                entries: entries,
+                truncated: turnTruncated,
+                entriesOmitted: entriesOmitted > 0 ? entriesOmitted : nil
+            ),
+            turnTruncated
+        )
+    }
+
+    private static func appendGetSessionEntry(
+        role: String,
+        text: String,
+        perEntryMaxChars: Int,
+        entries: inout [HistoryGetSessionReply.EntryDTO],
+        remainingChars: inout Int,
+        turnTruncated: inout Bool
+    ) {
+        let clipped = clipHistoryText(text, maxChars: min(perEntryMaxChars, remainingChars))
+        entries.append(HistoryGetSessionReply.EntryDTO(
+            role: role,
+            text: clipped.text,
+            truncated: clipped.truncated
+        ))
+        remainingChars -= clipped.text.count
+        turnTruncated = turnTruncated || clipped.truncated
+    }
+
+    private static func getSessionRole(for role: AgentTranscriptActivityRole) -> String? {
+        switch role {
+        case .assistant:
+            "assistant"
+        case .toolExecution:
+            "tool"
+        case .error:
+            "error"
+        case .progress, .note, .system:
+            "system"
+        case .thinking:
+            "thinking"
+        }
+    }
+
+    private static func getSessionToolSummary(_ activity: AgentTranscriptActivity) -> String? {
+        guard let tool = activity.toolExecution else {
+            return nonEmptyText(activity.text)
+        }
+        var parts = ["[tool:", tool.toolName ?? "unknown", tool.status.rawValue + "]"]
+        if let summary = nonEmptyText(tool.summaryText) {
+            parts.append(summary.replacingOccurrences(of: "\n", with: " "))
+        }
+        return parts.joined(separator: " ")
+    }
+
+    private static func getSessionToolCallSummary(_ activities: [AgentTranscriptActivity]) -> String? {
+        var counts: [String: Int] = [:]
+        var order: [String] = []
+        for activity in activities {
+            guard let tool = activity.toolExecution else { continue }
+            let key = "\(tool.toolName ?? "unknown") \(tool.status.rawValue)"
+            if counts[key] == nil { order.append(key) }
+            counts[key, default: 0] += 1
+        }
+        guard !order.isEmpty else { return nil }
+        let shown = order.prefix(5).map { key in
+            let count = counts[key] ?? 0
+            return count == 1 ? key : "\(key) ×\(count)"
+        }.joined(separator: ", ")
+        let omittedKinds = max(0, order.count - 5)
+        return omittedKinds > 0 ? "\(shown), +\(omittedKinds) more" : shown
+    }
+
+    private static func historySummaryText(_ summary: AgentTranscriptTurnSummary?) -> String? {
+        guard let summary else { return nil }
+        return nonEmptyText(summary.compactConclusionText)
+            ?? nonEmptyText(summary.conclusionText)
+            ?? nonEmptyText(summary.middleSummaryText)
+            ?? nonEmptyText(summary.requestText)
+    }
+
+    private static func nonEmptyText(_ text: String?) -> String? {
+        guard let text else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func clipHistoryText(_ text: String, maxChars: Int) -> (text: String, truncated: Bool) {
+        guard maxChars > 0 else { return ("", true) }
+        guard text.count > maxChars else { return (text, false) }
+        if maxChars == 1 { return ("…", true) }
+        return (String(text.prefix(maxChars - 1)) + "…", true)
+    }
+
     // MARK: - Snippet Extraction
 
     /// Extract a ~200-char snippet centered on the first occurrence of the query in text.
@@ -822,20 +1118,6 @@ enum HistoryMCPToolService {
         return parsed
     }
 
-    private static func appendSearchMatch(
-        _ match: HistorySearchMatch,
-        totalMatches: inout Int,
-        retainedMatches: inout [HistorySearchMatch],
-        limit: Int
-    ) {
-        totalMatches += 1
-        retainedMatches.append(match)
-        retainedMatches.sort { $0.timestamp > $1.timestamp }
-        if retainedMatches.count > limit {
-            retainedMatches.removeLast(retainedMatches.count - limit)
-        }
-    }
-
     private static func clippedTurnRequestText(_ text: String?) -> String? {
         guard let text else { return nil }
         let maxLength = 240
@@ -848,12 +1130,8 @@ enum HistoryMCPToolService {
         let normalizedQuery = normalizedHistoryPath(query)
         guard !normalizedKey.isEmpty, !normalizedQuery.isEmpty else { return false }
 
-        if normalizedKey == normalizedQuery { return true }
-        if normalizedKey.hasSuffix("/\(normalizedQuery)") { return true }
-        if normalizedQuery.hasSuffix("/\(normalizedKey)") { return true }
-        if URL(fileURLWithPath: normalizedKey).lastPathComponent == normalizedQuery { return true }
-        if URL(fileURLWithPath: normalizedQuery).lastPathComponent == normalizedKey { return true }
         return normalizedKey.localizedCaseInsensitiveContains(normalizedQuery)
+            || normalizedQuery.hasSuffix("/\(normalizedKey)")
     }
 
     private static func normalizedHistoryPath(_ path: String) -> String {
@@ -882,6 +1160,10 @@ enum HistoryMCPToolService {
         return order.prefix(10).map { reason in
             "\(reason): \(counts[reason] ?? 0)"
         }
+    }
+
+    private static func nonEmptyDiagnostics(_ diagnostics: [String]) -> [String]? {
+        diagnostics.isEmpty ? nil : diagnostics
     }
 
     static func clampLimit(_ value: Int?, default defaultValue: Int, max maxValue: Int) -> Int {

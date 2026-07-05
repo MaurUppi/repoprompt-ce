@@ -298,7 +298,6 @@ allowed_tracked_docs=(
   "docs/releasing.md"
   "docs/testing.md"
   "docs/spec/history-query-tools.md"
-  "docs/spec/history-query-tools-extensions.md"
   "docs/worktrees.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"

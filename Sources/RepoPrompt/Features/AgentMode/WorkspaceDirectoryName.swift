@@ -36,12 +36,6 @@ enum WorkspaceDirectoryName {
             }
         }
 
-        // Try the last component alone as a simple UUID (no hyphens in name).
-        if let last = components.last, let uuid = UUID(uuidString: last) {
-            let namePart = components.dropLast().joined(separator: "-")
-            return (name: namePart.isEmpty ? dirName : namePart, id: uuid)
-        }
-
         return (name: withoutPrefix, id: nil)
     }
 }

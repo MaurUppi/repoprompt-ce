@@ -25,13 +25,6 @@ struct AdvancedSettingsView: View {
     @ObservedObject private var globalSettings = GlobalSettingsStore.shared
     let windowState: WindowState
 
-    private var historyIdleThresholdBinding: Binding<Int> {
-        Binding(
-            get: { globalSettings.historyIdleThresholdMinutes() },
-            set: { globalSettings.setHistoryIdleThresholdMinutes($0) }
-        )
-    }
-
     private var historyIdleThresholdDoubleBinding: Binding<Double> {
         Binding(
             get: { Double(globalSettings.historyIdleThresholdMinutes()) },
@@ -285,7 +278,7 @@ struct AdvancedSettingsView: View {
                             .frame(width: 25)
                         Slider(value: historyIdleThresholdDoubleBinding, in: 0 ... 60, step: 1)
                             .accentColor(.blue)
-                        Text("\(historyIdleThresholdBinding.wrappedValue) min")
+                        Text("\(Int(historyIdleThresholdDoubleBinding.wrappedValue)) min")
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .frame(width: 45, alignment: .trailing)

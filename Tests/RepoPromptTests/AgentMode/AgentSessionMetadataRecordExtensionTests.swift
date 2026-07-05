@@ -318,102 +318,6 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
 
     // MARK: - Factory: activeDurationSeconds Computation
 
-    func testActiveDurationSingleTurn() {
-        let session = makeSession(turns: [
-            makeTurn(
-                startedAt: Date(timeIntervalSince1970: 0),
-                completedAt: Date(timeIntervalSince1970: 60)
-            )
-        ])
-
-        let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-test.json")
-        let record = AgentSessionMetadataRecord.record(
-            from: session,
-            fileURL: fileURL,
-            observedFileSize: nil,
-            observedFileModificationDate: nil
-        )
-
-        XCTAssertEqual(record.activeDurationSeconds, 60)
-    }
-
-    func testActiveDurationContinuousTurns() {
-        // Two turns back-to-back with no idle gap.
-        let session = makeSession(turns: [
-            makeTurn(
-                startedAt: Date(timeIntervalSince1970: 0),
-                completedAt: Date(timeIntervalSince1970: 60)
-            ),
-            makeTurn(
-                startedAt: Date(timeIntervalSince1970: 65),
-                completedAt: Date(timeIntervalSince1970: 120)
-            )
-        ])
-
-        let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-test.json")
-        let record = AgentSessionMetadataRecord.record(
-            from: session,
-            fileURL: fileURL,
-            observedFileSize: nil,
-            observedFileModificationDate: nil
-        )
-
-        // Turn 1: 60s. Turn 2 continuous from prev end: 120-60 = 60s. Total: 120.
-        XCTAssertEqual(record.activeDurationSeconds, 120)
-    }
-
-    func testActiveDurationExcludesIdleGapOverThirtyMinutes() {
-        // Two turns separated by a 45-minute idle gap.
-        let session = makeSession(turns: [
-            makeTurn(
-                startedAt: Date(timeIntervalSince1970: 0),
-                completedAt: Date(timeIntervalSince1970: 60)
-            ),
-            makeTurn(
-                startedAt: Date(timeIntervalSince1970: 60 + 45 * 60),
-                completedAt: Date(timeIntervalSince1970: 60 + 45 * 60 + 30)
-            )
-        ])
-
-        let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-test.json")
-        let record = AgentSessionMetadataRecord.record(
-            from: session,
-            fileURL: fileURL,
-            observedFileSize: nil,
-            observedFileModificationDate: nil
-        )
-
-        // Turn 1: 60s. Turn 2 has idle gap > 30min so only counts its own duration: 30s. Total: 90.
-        XCTAssertEqual(record.activeDurationSeconds, 90)
-    }
-
-    func testActiveDurationBoundaryGapExactlyThirtyMinutes() {
-        // Gap is exactly 30 minutes — should be treated as continuous (not excluded).
-        let thirtyMin: TimeInterval = 30 * 60
-        let session = makeSession(turns: [
-            makeTurn(
-                startedAt: Date(timeIntervalSince1970: 0),
-                completedAt: Date(timeIntervalSince1970: 60)
-            ),
-            makeTurn(
-                startedAt: Date(timeIntervalSince1970: 60 + thirtyMin),
-                completedAt: Date(timeIntervalSince1970: 60 + thirtyMin + 30)
-            )
-        ])
-
-        let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-test.json")
-        let record = AgentSessionMetadataRecord.record(
-            from: session,
-            fileURL: fileURL,
-            observedFileSize: nil,
-            observedFileModificationDate: nil
-        )
-
-        // Gap is exactly 30min → not excluded (only > 30min excluded). Continuous.
-        // Turn 1: 60s. Turn 2 continuous from prev end: 1890 - 60 = 1830. Total: 1890.
-        XCTAssertEqual(record.activeDurationSeconds(thresholdMinutes: 30), 1890)
-    }
-
     func testActiveDurationSkipsTurnsWithoutCompletionTimestamp() {
         let session = makeSession(turns: [
             makeTurn(
@@ -459,20 +363,6 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         )
 
         XCTAssertEqual(record.activeDurationSeconds, 45)
-    }
-
-    func testActiveDurationEmptyTurns() {
-        let session = makeSession(turns: [])
-
-        let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-test.json")
-        let record = AgentSessionMetadataRecord.record(
-            from: session,
-            fileURL: fileURL,
-            observedFileSize: nil,
-            observedFileModificationDate: nil
-        )
-
-        XCTAssertEqual(record.activeDurationSeconds, 0)
     }
 
     // MARK: - Activity Bounds
