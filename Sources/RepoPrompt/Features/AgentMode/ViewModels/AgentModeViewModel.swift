@@ -7233,6 +7233,7 @@ final class AgentModeViewModel: ObservableObject {
             anchorBlockIndex: visibleProjection.anchorBlockIndex,
             archivedHistoryState: archivedHistoryState,
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
+            isTranscriptWindowExpanded: session.isTranscriptWindowExpanded,
             isWindowCappedWhileActive: isCapped,
             bindingsHydrated: session.authoritativeHydratedBindingTransitionGeneration != nil,
             hydratedPersistentBinding: session.authoritativeHydratedBinding,
@@ -7473,6 +7474,7 @@ final class AgentModeViewModel: ObservableObject {
             anchorBlockIndex: snapshot.anchorBlockIndex,
             archivedHistoryState: snapshot.archivedHistoryState,
             isCompressedHistoryRevealed: snapshot.isCompressedHistoryRevealed,
+            isTranscriptWindowExpanded: snapshot.isTranscriptWindowExpanded,
             isWindowCappedWhileActive: snapshot.isWindowCappedWhileActive,
             bindingsHydrated: value,
             hydratedPersistentBinding: hydratedBinding,
@@ -7484,13 +7486,27 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func materializedTranscriptProjection(for session: TabSession) -> AgentTranscriptProjection {
-        session.isCompressedHistoryRevealed ? session.fullTranscriptProjection : session.workingTranscriptProjection
+        let projection = session.isCompressedHistoryRevealed ? session.fullTranscriptProjection : session.workingTranscriptProjection
+        return AgentTranscriptProjectionBuilder.tailWindowedProjection(
+            from: projection,
+            transcript: session.transcript,
+            isExpanded: session.isTranscriptWindowExpanded
+        )
     }
 
     func setCompressedHistoryVisibility(tabID: UUID, isRevealed: Bool) {
         guard let session = session(for: tabID, createIfNeeded: false) else { return }
         guard session.isCompressedHistoryRevealed != isRevealed else { return }
         session.isCompressedHistoryRevealed = isRevealed
+        session.transcriptProjection = materializedTranscriptProjection(for: session)
+        guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return }
+        _ = publishTranscriptPresentation(from: session)
+    }
+
+    func setTranscriptWindowExpanded(tabID: UUID, isExpanded: Bool) {
+        guard let session = session(for: tabID, createIfNeeded: false) else { return }
+        guard session.isTranscriptWindowExpanded != isExpanded else { return }
+        session.isTranscriptWindowExpanded = isExpanded
         session.transcriptProjection = materializedTranscriptProjection(for: session)
         guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return }
         _ = publishTranscriptPresentation(from: session)
