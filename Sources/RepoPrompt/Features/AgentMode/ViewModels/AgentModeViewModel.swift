@@ -5249,16 +5249,12 @@ final class AgentModeViewModel: ObservableObject {
             )
         }
         let expectedBindings = sourceSession.worktreeBindings
-        if !expectedBindings.isEmpty {
-            if let controlContext = sourceSession.mcpControlContext {
-                guard controlContext.sessionID == expectedParentSessionID else {
-                    throw MCPError.invalidParams(
-                        "agent_run.start routed source MCP control context changed before worktree inheritance."
-                    )
-                }
-            } else if sourceSession.isMCPOriginated {
+        if !expectedBindings.isEmpty,
+           let controlContext = sourceSession.mcpControlContext
+        {
+            guard controlContext.sessionID == expectedParentSessionID else {
                 throw MCPError.invalidParams(
-                    "agent_run.start routed source MCP control context is unavailable for worktree inheritance."
+                    "agent_run.start routed source MCP control context changed before worktree inheritance."
                 )
             }
         }
