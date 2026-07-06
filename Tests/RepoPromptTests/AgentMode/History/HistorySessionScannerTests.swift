@@ -543,6 +543,32 @@ final class HistorySessionScannerTests: XCTestCase {
         XCTAssertEqual(decodedAfterRefresh, 2)
     }
 
+    func testScanAllWorkspacesRefreshing_bypassesTTLCacheAndRepopulates() async throws {
+        // F6 mechanism: `scanAllWorkspacesRefreshing()` forces a fresh scan, ignoring the
+        // TTL cache, while the cached scan still hides a freshly-saved session; and the
+        // refresh repopulates the cache so later cached scans see it too.
+        let wsDir = try createWorkspaceDir(name: "Project", uuid: UUID())
+        let sessionA = UUID()
+        try createAgentSessionsIndex(in: wsDir, records: [makeMinimalRecord(id: sessionA, name: "A")])
+
+        let cachedScanner = HistorySessionScanner(applicationSupportRoot: tempDir, scanCacheTTL: 3600)
+        _ = try await cachedScanner.scanAllWorkspaces() // warm the cache with [A]
+
+        // App saves B: writes its file + updates the index.
+        let sessionB = UUID()
+        try writeSessionFile(AgentSession(id: sessionB, name: "B", transcript: nil, itemCount: 0), in: wsDir)
+        try createAgentSessionsIndex(in: wsDir, records: [makeMinimalRecord(id: sessionA, name: "A"), makeMinimalRecord(id: sessionB, name: "B")])
+
+        let cachedIDs = try await Set(cachedScanner.scanAllWorkspaces().flatMap(\.records).map(\.id))
+        XCTAssertFalse(cachedIDs.contains(sessionB), "Cached scan within TTL hides the freshly-saved session")
+
+        let refreshedIDs = try await Set(cachedScanner.scanAllWorkspacesRefreshing().flatMap(\.records).map(\.id))
+        XCTAssertTrue(refreshedIDs.contains(sessionB), "Refreshing scan bypasses the TTL and sees the freshly-saved session")
+
+        let postRefreshCachedIDs = try await Set(cachedScanner.scanAllWorkspaces().flatMap(\.records).map(\.id))
+        XCTAssertTrue(postRefreshCachedIDs.contains(sessionB), "Refreshing repopulates the cache so later cached scans see B")
+    }
+
     // MARK: - Cross-Workspace Unification
 
     func testScanAllWorkspaces_recordsIncludeWorkspaceContext() async throws {

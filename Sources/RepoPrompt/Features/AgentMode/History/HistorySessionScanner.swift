@@ -11,6 +11,13 @@ protocol HistorySessionScanning: Sendable {
     /// Returns one result per workspace that has an AgentSessions directory.
     func scanAllWorkspaces() async throws -> [HistoryWorkspaceScanResult]
 
+    /// Same as ``scanAllWorkspaces()`` but force a fresh scan, bypassing the
+    /// cross-workspace inventory TTL cache. Used to resolve a session id that was
+    /// saved after the cache was populated (e.g. a `get_session` lookup that missed).
+    /// The per-workspace index signature cache still applies, so unchanged indexes
+    /// are not re-decoded, and the result repopulates the TTL cache.
+    func scanAllWorkspacesRefreshing() async throws -> [HistoryWorkspaceScanResult]
+
     /// Filter metadata records across all workspaces.
     /// Calls ``scanAllWorkspaces()`` internally, then applies the given filters.
     func sessionsMatchingFilters(
@@ -159,7 +166,18 @@ actor HistorySessionScanner: HistorySessionScanning {
         {
             return cachedScanResults
         }
+        return try await performInventoryScan(now: now)
+    }
 
+    func scanAllWorkspacesRefreshing() async throws -> [HistoryWorkspaceScanResult] {
+        // Bypass the TTL cache and force a fresh scan. The per-workspace index
+        // signature cache still applies, so unchanged indexes are not re-decoded, and
+        // the result repopulates the TTL cache so subsequent cached calls see it. Used
+        // to resolve a session id saved since the cache was populated.
+        try await performInventoryScan(now: Date())
+    }
+
+    private func performInventoryScan(now: Date) async throws -> [HistoryWorkspaceScanResult] {
         let workspacesRoot = applicationSupportRoot.appendingPathComponent("Workspaces", isDirectory: true)
 
         guard directoryExists(at: workspacesRoot) else {
@@ -187,7 +205,7 @@ actor HistorySessionScanner: HistorySessionScanning {
         }
         pruneIndexScanCache(keeping: seenIndexCacheKeys)
         cachedScanResults = results
-        cachedScanResultsAt = Date()
+        cachedScanResultsAt = now
         return results
     }
 

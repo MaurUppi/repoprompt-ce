@@ -1170,6 +1170,24 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertTrue(dto.turns.contains { $0.turnIndex == 2 }, "Target turn must render")
     }
 
+    func testGetSession_resolvesFreshlySavedSessionViaRefreshOnCacheMiss() async throws {
+        // F6: when a session id isn't in the (cached) inventory, get_session retries
+        // with a fresh scan and resolves it. Models a session saved since the TTL
+        // cache was populated. Without the retry this returns "No session found".
+        let existing = makeRecord(name: "Existing")
+        let fresh = makeRecord(name: "Fresh")
+        mockScanner.scanResults = [makeScanResult(records: [existing])] // stale inventory
+        mockScanner.refreshingScanResults = [makeScanResult(records: [existing, fresh])] // fresh inventory
+        mockScanner.transcriptProvider = { _ in AgentTranscript(turns: [AgentTranscriptTurn(startedAt: Date(timeIntervalSince1970: 1000))]) }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "get_session", "session_id": .string(fresh.id.uuidString), "around_turn": .int(0)],
+            scanner: mockScanner
+        )
+        let dto = try getSessionReply(result)
+        XCTAssertEqual(dto.sessionID, fresh.id.uuidString)
+    }
+
     // MARK: - role mapping
 
     func testSearch_roleMapping_toolExecution() async throws {
@@ -2054,11 +2072,18 @@ private struct FilterRequest: Equatable {
 
 private final class MockHistoryScanner: HistorySessionScanning {
     var scanResults: [HistoryWorkspaceScanResult] = []
+    /// Optional fresh-scan results for `scanAllWorkspacesRefreshing()`; defaults to
+    /// `scanResults` so tests that don't exercise the cache-bypass path are unaffected.
+    var refreshingScanResults: [HistoryWorkspaceScanResult]?
     var filterRequests: [FilterRequest] = []
     var transcriptProvider: ((UUID) throws -> AgentTranscript)?
 
     func scanAllWorkspaces() async throws -> [HistoryWorkspaceScanResult] {
         scanResults
+    }
+
+    func scanAllWorkspacesRefreshing() async throws -> [HistoryWorkspaceScanResult] {
+        refreshingScanResults ?? scanResults
     }
 
     func sessionsMatchingFilters(

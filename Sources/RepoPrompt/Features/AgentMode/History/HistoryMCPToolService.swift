@@ -159,15 +159,24 @@ enum HistoryMCPToolService {
         let roles = normalizedGetSessionRoles(args["roles"]?.arrayValue?.compactMap(\.stringValue))
 
         let scanResults = try await scanner.scanAllWorkspaces()
-        guard let session = scanResults.lazy.flatMap({ scan in
-            scan.records.map { record in
-                HistoryFilteredSessionRecord(
-                    record: record,
-                    workspaceName: scan.workspaceName,
-                    workspaceDir: scan.workspaceDir
-                )
-            }
-        }).first(where: { $0.record.id == sessionID }) else {
+        func resolveSession(in results: [HistoryWorkspaceScanResult]) -> HistoryFilteredSessionRecord? {
+            results.lazy.flatMap { scan in
+                scan.records.map { record in
+                    HistoryFilteredSessionRecord(
+                        record: record,
+                        workspaceName: scan.workspaceName,
+                        workspaceDir: scan.workspaceDir
+                    )
+                }
+            }.first(where: { $0.record.id == sessionID })
+        }
+        // F6: if the id isn't in the (possibly cached) inventory, force a fresh scan —
+        // the session may have been saved since the TTL cache was populated.
+        var session = resolveSession(in: scanResults)
+        if session == nil {
+            session = try await resolveSession(in: scanner.scanAllWorkspacesRefreshing())
+        }
+        guard let session else {
             return .error(HistoryErrorReply(error: "No history session found for session_id '\(sessionIDRaw)'"))
         }
 
