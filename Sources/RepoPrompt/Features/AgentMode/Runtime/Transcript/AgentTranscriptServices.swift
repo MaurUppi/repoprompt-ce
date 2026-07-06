@@ -4202,7 +4202,7 @@ enum AgentTranscriptIO {
                         isToolBoundary: false
                     ))
                 }
-            case .request, .activityCluster, .groupedHistory, .middleSummary, .conclusion:
+            case .request, .activityCluster, .groupedHistory, .collapsedHistoryRange, .middleSummary, .conclusion:
                 break
             }
         }
@@ -5768,6 +5768,81 @@ enum AgentTranscriptProjectionBuilder {
         )
     }
 
+    static func tailWindowedProjection(
+        from projection: AgentTranscriptProjection,
+        transcript: AgentTranscript,
+        isExpanded: Bool,
+        tailTurnLimit: Int = 40
+    ) -> AgentTranscriptProjection {
+        guard !isExpanded, tailTurnLimit > 0 else { return projection }
+        let nonArchivedTurns = transcript.turns.filter { $0.retentionTier != .archived }
+        guard nonArchivedTurns.count > tailTurnLimit else { return projection }
+
+        let tailTurnIDs = Set(nonArchivedTurns.suffix(tailTurnLimit).map(\.id))
+        let incompleteTurnIDs = Set(nonArchivedTurns.filter { !$0.isCompleted }.map(\.id))
+        let hiddenTurnIDs = Set(nonArchivedTurns.compactMap { turn -> UUID? in
+            guard turn.isCompleted, !tailTurnIDs.contains(turn.id) else { return nil }
+            return turn.id
+        })
+        guard !hiddenTurnIDs.isEmpty else { return projection }
+
+        let hiddenBlocks = projection.workingBlocks.filter { hiddenTurnIDs.contains($0.turnID) }
+        guard let firstHiddenBlock = hiddenBlocks.first else { return projection }
+        let hiddenBlockIDs = Set(hiddenBlocks.map(\.id))
+        let hiddenRows = hiddenBlocks.flatMap(projectionRows(for:))
+        let collapsedBlockID = "collapsed-range:\(firstHiddenBlock.turnID.uuidString)"
+        let collapsedBlock = AgentTranscriptRenderBlock(
+            id: collapsedBlockID,
+            kind: .collapsedHistoryRange,
+            turnID: firstHiddenBlock.turnID,
+            retentionTier: firstHiddenBlock.retentionTier,
+            rows: [],
+            isArchived: false,
+            primaryAnchor: firstHiddenBlock.primaryAnchor ?? .request(turnID: firstHiddenBlock.turnID),
+            collapsedHistoryRange: .init(
+                hiddenTurnCount: hiddenTurnIDs.count,
+                hiddenBlockCount: hiddenBlocks.count,
+                hiddenRowCount: hiddenRows.count
+            ),
+            defaultPresentation: .collapsed
+        )
+
+        var didInsertCollapsedBlock = false
+        var windowedBlocks: [AgentTranscriptRenderBlock] = []
+        windowedBlocks.reserveCapacity(projection.workingBlocks.count - hiddenBlocks.count + 1)
+        for block in projection.workingBlocks {
+            if hiddenBlockIDs.contains(block.id) {
+                if !didInsertCollapsedBlock {
+                    windowedBlocks.append(collapsedBlock)
+                    didInsertCollapsedBlock = true
+                }
+                continue
+            }
+            if tailTurnIDs.contains(block.turnID) || incompleteTurnIDs.contains(block.turnID) || block.isArchived {
+                windowedBlocks.append(block)
+            }
+        }
+        guard didInsertCollapsedBlock else { return projection }
+
+        let visibleRowIDs = Set(windowedBlocks.flatMap(projectionRows(for:)).map(\.id))
+        var anchorBlockIndex = projection.anchorBlockIndex
+        for (anchor, blockID) in projection.anchorBlockIndex where hiddenBlockIDs.contains(blockID) {
+            anchorBlockIndex[anchor] = collapsedBlockID
+        }
+        let visibleBlockIDs = Set(windowedBlocks.map(\.id)).union(projection.archivedBlocks.map(\.id))
+        anchorBlockIndex = anchorBlockIndex.filter { visibleBlockIDs.contains($0.value) }
+
+        return .init(
+            workingBlocks: windowedBlocks,
+            archivedBlocks: projection.archivedBlocks,
+            workingRows: projection.workingRows.filter { visibleRowIDs.contains($0.id) },
+            archivedRows: projection.archivedRows,
+            rowAnchorIndex: projection.rowAnchorIndex,
+            anchorBlockIndex: anchorBlockIndex,
+            workingUnitCount: windowedBlocks.count
+        )
+    }
+
     static func archivedSnapshot(from fullProjection: AgentTranscriptProjection) -> AgentArchivedTranscriptSnapshot {
         let archivedRowIDs = Set(fullProjection.archivedRows.map(\.id))
         let archivedBlockIDs = Set(fullProjection.archivedBlocks.map(\.id))
@@ -5829,6 +5904,8 @@ enum AgentTranscriptProjectionBuilder {
             []
         case .request, .activityCluster, .standaloneAssistant, .standaloneTool, .standaloneNote, .middleSummary, .conclusion:
             block.rows
+        case .collapsedHistoryRange:
+            []
         }
     }
 
@@ -6648,7 +6725,7 @@ enum AgentTranscriptProjectionBuilder {
 
     private static func presentedItemCount(for block: AgentTranscriptRenderBlock) -> Int {
         switch block.kind {
-        case .activityCluster, .groupedHistory:
+        case .activityCluster, .groupedHistory, .collapsedHistoryRange:
             1
         case .request, .standaloneAssistant, .standaloneTool, .standaloneNote, .middleSummary, .conclusion:
             block.rows.count
@@ -7454,7 +7531,7 @@ enum AgentTranscriptProjectionBuilder {
             .activity
         case .standaloneNote:
             block.rows.contains(where: { $0.kind == .thinking }) ? .activity : .notes
-        case .request, .activityCluster, .groupedHistory, .middleSummary, .conclusion:
+        case .request, .activityCluster, .groupedHistory, .collapsedHistoryRange, .middleSummary, .conclusion:
             .mixed
         }
     }
@@ -7478,7 +7555,7 @@ enum AgentTranscriptProjectionBuilder {
                 } else {
                     containsNotes = true
                 }
-            case .request, .activityCluster, .groupedHistory, .middleSummary, .conclusion:
+            case .request, .activityCluster, .groupedHistory, .collapsedHistoryRange, .middleSummary, .conclusion:
                 containsMixed = true
             }
         }
