@@ -205,10 +205,11 @@ final class AgentNavigationHUDViewModel: ObservableObject {
         if searching {
             return snapshot.items
         }
+        let visible = snapshot.items.filter { !$0.isArchived }
         if showSubagents {
-            return snapshot.items.filter { $0.depth <= AgentNavigationHUDSnapshotBuilder.maxVisibleDepth }
+            return visible.filter { $0.depth <= AgentNavigationHUDSnapshotBuilder.maxVisibleDepth }
         }
-        return snapshot.items.filter { !$0.isSubagent }
+        return visible.filter { !$0.isSubagent }
     }
 
     func selectItem(atDisplayIndex index: Int, currentWindow: WindowState) async {

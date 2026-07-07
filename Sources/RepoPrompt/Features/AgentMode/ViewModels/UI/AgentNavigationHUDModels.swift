@@ -183,6 +183,7 @@ enum AgentNavigationHUDSnapshotBuilder {
             .filter { !$0.isClosing }
             .flatMap { currentWindowItems(windowState: $0) }
         let archivedRows = currentWindow.map(currentWorkspaceArchivedItems(windowState:)) ?? []
+        // Archived rows deliberately bypass the live 24h inclusion filter; they are search-only.
         return AgentNavigationHUDSnapshot(
             mode: .allAgents,
             title: AgentNavigationHUDMode.allAgents.title,
