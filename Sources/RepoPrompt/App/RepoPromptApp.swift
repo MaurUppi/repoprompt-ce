@@ -70,9 +70,6 @@ struct RepoPromptApp: App {
         signal(SIGPIPE, SIG_IGN)
 
         SentryTelemetryBootstrap.start()
-        SentryTelemetryBootstrap.trace(.appLaunch) {
-            SentryTelemetryBootstrap.addBreadcrumb(.appLifecycle, action: .appInitialized)
-        }
 
         ProcessDebugLogging.log(
             prefix: "MCPStartup",
@@ -80,19 +77,18 @@ struct RepoPromptApp: App {
             flushStdout: true
         )
         Task.detached {
-            ProcessDebugLogging.log(
-                prefix: "MCPStartup",
-                "RepoPromptApp.init start task running",
-                flushStdout: true
-            )
-            #if REPOPROMPT_SENTRY_ENABLED
+            await SentryTelemetryBootstrap.traceAsync(.appLaunch) {
+                SentryTelemetryBootstrap.addBreadcrumb(.appLifecycle, action: .appInitialized)
+                ProcessDebugLogging.log(
+                    prefix: "MCPStartup",
+                    "RepoPromptApp.init start task running",
+                    flushStdout: true
+                )
                 await SentryTelemetryBootstrap.traceAsync(.mcpServerStart) {
                     await ServerController.shared.startServer()
                     SentryTelemetryBootstrap.addBreadcrumb(.mcpBootstrap, action: .mcpServerStarted)
                 }
-            #else
-                await ServerController.shared.startServer()
-            #endif
+            }
         }
 
         if !AppLaunchConfiguration.current.suppressesWindowRestore {
