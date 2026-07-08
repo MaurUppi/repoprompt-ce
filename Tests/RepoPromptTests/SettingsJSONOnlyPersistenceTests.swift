@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import XCTest
 @_spi(TestSupport) @testable import RepoPrompt
@@ -333,6 +334,105 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(try fileStore.load().scalarPreferences?.ui?.showDatesInMessageTimestamps, true)
         let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
         XCTAssertTrue(reloaded.showDatesInMessageTimestamps())
+    }
+
+    // MARK: - Cross-window observability & persistence-block recovery
+
+    private func makeStore(at fileURL: URL) throws -> GlobalSettingsStore {
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
+        return GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fileURL))
+    }
+
+    /// A `globalDefaults` change must publish `objectWillChange` so other windows observing
+    /// `GlobalSettingsStore` re-sync. Defect: changing the Context Builder agent or MCP role
+    /// defaults in one window left every other window stale.
+    func testGlobalDefaultsSettersPublishObjectWillChange() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let store = try makeStore(at: fileURL)
+
+        var emissions = 0
+        let cancellable = store.objectWillChange.sink { _ in emissions += 1 }
+        defer { cancellable.cancel() }
+
+        store.updateGlobalMCPAgentRoleOverrides(["explore": "claudeCode:haiku"])
+        store.setGlobalContextBuilderAgentSelection(agentRaw: "claudeCode", modelRaw: "haiku", markUserDefined: true)
+        store.setGlobalRecommendationProviderFilter([.codex])
+
+        XCTAssertGreaterThanOrEqual(
+            emissions, 3,
+            "globalDefaults setters must publish objectWillChange so other windows update"
+        )
+    }
+
+    /// A newer-than-supported schema must be surfaced (not silently treated as defaults) so the
+    /// user understands why settings will not save. Defect: every restart silently reset all
+    /// global settings because the v3 file was indistinguishable from \"no settings\".
+    func testNewerSchemaFileExposesBlockReason() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(#"{"schemaVersion":999,"updatedAt":"2026-05-20T00:00:00Z"}"#.utf8).write(to: fileURL)
+
+        let store = try makeStore(at: fileURL)
+
+        XCTAssertEqual(
+            store.persistenceBlockReason,
+            .unsupportedFutureSchema(onDiskVersion: 999, supportedVersion: GlobalSettingsDocument.currentSchemaVersion)
+        )
+    }
+
+    /// A newer-schema file must be preserved and keep saves blocked until the user explicitly
+    /// recovers. Defect: the app must never overwrite an unknown schema automatically.
+    func testNewerSchemaFileIsPreservedAndSaveStaysBlocked() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let futureJSON = #"{"schemaVersion":999,"updatedAt":"2026-05-20T00:00:00Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"globalDefaults":{"discoverAgentRaw":"claudeCode"},"scalarPreferences":{}}"#
+        try Data(futureJSON.utf8).write(to: fileURL)
+
+        let store = try makeStore(at: fileURL)
+        // A change attempt must not touch the preserved newer-schema file.
+        store.setGlobalContextBuilderAgentSelection(agentRaw: "codexExec", modelRaw: "default", markUserDefined: true)
+        let onDiskDuringBlock = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertTrue(onDiskDuringBlock.contains("\"schemaVersion\":999"))
+        XCTAssertNotNil(store.persistenceBlockReason, "save must stay blocked until the user recovers")
+    }
+
+    /// User-initiated recovery backs up the offending file, writes fresh current-schema defaults,
+    /// clears the block, and re-enables saves. Defect: there was no way out of the blocked state
+    /// without manually editing files under Application Support.
+    func testUserInitiatedRecoveryBacksUpResetsAndUnblocks() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let futureJSON = #"{"schemaVersion":999,"updatedAt":"2026-05-20T00:00:00Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"globalDefaults":{"discoverAgentRaw":"claudeCode"},"scalarPreferences":{}}"#
+        try Data(futureJSON.utf8).write(to: fileURL)
+
+        let store = try makeStore(at: fileURL)
+        XCTAssertNotNil(store.persistenceBlockReason)
+
+        XCTAssertTrue(store.recoverBlockedPersistenceAfterBackup(), "recovery should back up the offending file")
+        XCTAssertNil(store.persistenceBlockReason, "recovery must clear the block")
+
+        // Original offending file moved into Backups/.
+        let backupDir = fileURL.deletingLastPathComponent().appendingPathComponent("Backups", isDirectory: true)
+        let backups = try FileManager.default.contentsOfDirectory(atPath: backupDir.path)
+        XCTAssertTrue(backups.contains { $0.hasPrefix("globalSettings.superseded-") })
+
+        // On-disk file is now current-schema defaults and saves work again.
+        let reloaded = try makeStore(at: fileURL)
+        XCTAssertNil(reloaded.persistenceBlockReason, "file must load healthy after recovery")
+        reloaded.setGlobalContextBuilderAgentSelection(agentRaw: "codexExec", modelRaw: "default", markUserDefined: true)
+        let post = try makeStore(at: fileURL)
+        XCTAssertNil(post.persistenceBlockReason, "file must decode at current schema after recovery")
+        XCTAssertEqual(post.globalContextBuilderAgentSelection().agentRaw, "codexExec", "saves must persist again after recovery")
     }
 
     private func makeTempDirectory() throws -> URL {

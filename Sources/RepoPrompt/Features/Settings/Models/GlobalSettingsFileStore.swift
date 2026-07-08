@@ -2,10 +2,25 @@ import Foundation
 
 protocol GlobalSettingsFileStoring {
     var fileURL: URL { get }
+    /// Non-nil when the on-disk file is blocked (unreadable or a newer schema); surfaced to the user.
+    var blockReason: GlobalSettingsPersistenceBlockReason? { get }
 
     func load() throws -> GlobalSettingsDocument
     func loadOrCreateDefault() -> GlobalSettingsDocument
     func save(_ document: GlobalSettingsDocument) throws
+    /// User-initiated recovery: backs up the offending file, writes fresh defaults, clears the block.
+    @discardableResult
+    func performUserInitiatedRecovery() -> Bool
+}
+
+/// Why global-settings persistence is currently blocked: the store loads in-memory defaults
+/// and refuses to overwrite the on-disk file. Surfaced to the user so they can take a recovery
+/// action; RepoPrompt never auto-recovers from a schema it did not write.
+enum GlobalSettingsPersistenceBlockReason: Equatable {
+    /// On-disk schema is newer than this build supports (`onDiskVersion` > `supportedVersion`).
+    case unsupportedFutureSchema(onDiskVersion: Int, supportedVersion: Int)
+    /// The on-disk file is unreadable and could not be moved to the Backups folder.
+    case corruptUnrecoverable
 }
 
 /// File-backed store for the versioned global settings document.
@@ -22,6 +37,11 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
     private let now: () -> Date
     private var preservingUnsupportedFutureDocument = false
     private var preservingUnbackedCorruptDocument = false
+
+    /// Non-nil when the on-disk file cannot be safely read or overwritten, so the store falls
+    /// back to in-memory defaults and refuses saves. Surfaced to the user (never auto-recovered).
+    /// Cleared by `performUserInitiatedRecovery()`.
+    private(set) var blockReason: GlobalSettingsPersistenceBlockReason?
 
     init(
         fileURL: URL = GlobalSettingsFileStore.defaultFileURL(),
@@ -51,16 +71,22 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         let header = try Self.decoder.decode(GlobalSettingsDocumentHeader.self, from: data)
         guard header.schemaVersion <= GlobalSettingsDocument.currentSchemaVersion else {
             preservingUnsupportedFutureDocument = true
+            blockReason = .unsupportedFutureSchema(
+                onDiskVersion: header.schemaVersion,
+                supportedVersion: GlobalSettingsDocument.currentSchemaVersion
+            )
             throw GlobalSettingsFileStoreError.unsupportedFutureSchema(header.schemaVersion)
         }
         preservingUnsupportedFutureDocument = false
         preservingUnbackedCorruptDocument = false
+        blockReason = nil
         return try Self.decoder.decode(GlobalSettingsDocument.self, from: data)
     }
 
     func loadOrCreateDefault() -> GlobalSettingsDocument {
         preservingUnsupportedFutureDocument = false
         preservingUnbackedCorruptDocument = false
+        blockReason = nil
         if fileManager.fileExists(atPath: fileURL.path) {
             do {
                 var document = try load()
@@ -79,6 +105,7 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
                     writeFallbackDocument(fallback)
                 } else {
                     preservingUnbackedCorruptDocument = true
+                    blockReason = .corruptUnrecoverable
                 }
                 return fallback
             }
@@ -87,6 +114,26 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         let document = defaultDocument()
         writeFallbackDocument(document)
         return document
+    }
+
+    /// User-initiated recovery from a blocked state (`blockReason != nil`): backs up the
+    /// offending on-disk file into `Backups/`, writes fresh current-schema defaults, and
+    /// clears the block so saves resume. Never runs automatically — the app surfaces the
+    /// block and the user chooses to recover. Returns whether the existing file was backed
+    /// up (false only if the backup itself failed; the reset still happens).
+    @discardableResult
+    func performUserInitiatedRecovery() -> Bool {
+        let didBackUp = fileManager.fileExists(atPath: fileURL.path)
+            ? supersedeExistingFileToBackup(label: "superseded") != nil
+            : true
+        // Clear preservation flags so `save()` no longer refuses, then write fresh defaults.
+        // `unsupportedFutureSchemaVersionOnDisk()` will now return nil because the offending
+        // file was moved aside by `supersedeExistingFileToBackup`.
+        preservingUnsupportedFutureDocument = false
+        preservingUnbackedCorruptDocument = false
+        writeFallbackDocument(defaultDocument())
+        blockReason = nil
+        return didBackUp
     }
 
     func save(_ document: GlobalSettingsDocument) throws {
@@ -132,18 +179,25 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         )
     }
 
-    private func backupCorruptFile(error: Error) -> Bool {
+    /// Moves (or copies + removes) the current on-disk file into `Backups/` with the given
+    /// label. Returns the backup URL on success, or nil if there was no file to back up or the
+    /// move failed. The original path is left empty so a following `save()` cannot re-trip the
+    /// newer-schema guard.
+    @discardableResult
+    private func supersedeExistingFileToBackup(label: String) -> URL? {
+        guard fileManager.fileExists(atPath: fileURL.path) else { return nil }
         do {
             let backupDirectory = fileURL
                 .deletingLastPathComponent()
                 .appendingPathComponent("Backups", isDirectory: true)
             try fileManager.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
 
+            let stamp = Self.backupTimestamp(for: now())
             var backupURL = backupDirectory
-                .appendingPathComponent("globalSettings.corrupt-\(Self.backupTimestamp(for: now())).json")
+                .appendingPathComponent("globalSettings.\(label)-\(stamp).json")
             if fileManager.fileExists(atPath: backupURL.path) {
                 backupURL = backupDirectory
-                    .appendingPathComponent("globalSettings.corrupt-\(Self.backupTimestamp(for: now()))-\(UUID().uuidString).json")
+                    .appendingPathComponent("globalSettings.\(label)-\(stamp)-\(UUID().uuidString).json")
             }
 
             do {
@@ -152,12 +206,17 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
                 try fileManager.copyItem(at: fileURL, to: backupURL)
                 try? fileManager.removeItem(at: fileURL)
             }
-            print("⚠️ Backed up corrupt global settings JSON to \(backupURL.path): \(error)")
-            return true
+            return backupURL
         } catch {
-            print("⚠️ Failed to back up corrupt global settings JSON at \(fileURL.path): \(error)")
-            return false
+            print("⚠️ Failed to back up global settings JSON at \(fileURL.path): \(error)")
+            return nil
         }
+    }
+
+    private func backupCorruptFile(error: Error) -> Bool {
+        guard let backupURL = supersedeExistingFileToBackup(label: "corrupt") else { return false }
+        print("⚠️ Backed up corrupt global settings JSON to \(backupURL.path): \(error)")
+        return true
     }
 
     private func unsupportedFutureSchemaVersionOnDisk() -> Int? {

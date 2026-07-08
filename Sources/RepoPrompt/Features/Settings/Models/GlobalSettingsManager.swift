@@ -223,7 +223,7 @@ struct ChatGlobalSettings: Codable {
 /// Stores the global Context Builder agent/model selection (single source of truth).
 /// This is NOT per-workspace - it's the same across all workspaces.
 /// Persisted field names still use the legacy discover-agent keys for compatibility.
-struct GlobalDefaults: Codable {
+struct GlobalDefaults: Codable, Equatable {
     /// Global Context Builder agent selection (shared across all workspaces).
     var discoverAgentRaw: String?
     /// Maps agent rawValue to last-used model rawValue for that agent (global)
@@ -293,6 +293,9 @@ class GlobalSettingsStore: ObservableObject {
     @Published private(set) var copySettings: [UUID: CopyGlobalSettings] = [:]
     @Published private(set) var chatSettings: [UUID: ChatGlobalSettings] = [:]
     @Published private(set) var codeMapsGloballyDisabled: Bool = false
+    /// Non-nil when the on-disk settings file is blocked (unreadable or a newer schema).
+    /// UI surfaces this so the user can recover; RepoPrompt never auto-recovers.
+    @Published private(set) var persistenceBlockReason: GlobalSettingsPersistenceBlockReason?
     private var globalDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
     private var scalarPreferences = GlobalScalarPreferences()
 
@@ -1356,6 +1359,19 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    /// Publishes `objectWillChange` when `globalDefaults` changed and persists if `commit`.
+    /// Centralizes the publish-on-mutate contract for the global-defaults surface (Context
+    /// Builder agent, MCP role overrides, recommendation provider filter) so any change
+    /// propagates to every observing window; route all `globalDefaults` mutations through here.
+    private func persistGlobalDefaultsChange(before: GlobalDefaults, commit: Bool) {
+        if before != globalDefaults {
+            objectWillChange.send()
+        }
+        if commit {
+            save()
+        }
+    }
+
     // MARK: - Global Context Builder Agent Selection (Single Source of Truth)
 
     /// Returns the raw persisted global Context Builder selection without synthesizing a fallback.
@@ -1416,6 +1432,7 @@ class GlobalSettingsStore: ObservableObject {
         function: StaticString = #function
     ) {
         let oldSelection = globalContextBuilderAgentSelection()
+        let globalDefaultsBeforeMutation = globalDefaults
         let normalized = AgentModelCatalog.normalizeSelection(agentRaw: agentRaw, modelRaw: modelRaw)
         globalDefaults.discoverAgentRaw = normalized.agent.rawValue
         if globalDefaults.discoverModelsByAgent == nil {
@@ -1438,7 +1455,7 @@ class GlobalSettingsStore: ObservableObject {
             line: line,
             function: function
         )
-        save()
+        persistGlobalDefaultsChange(before: globalDefaultsBeforeMutation, commit: true)
     }
 
     /// Sets the global Context Builder agent and optionally updates/clears that agent's
@@ -1455,6 +1472,7 @@ class GlobalSettingsStore: ObservableObject {
         function: StaticString = #function
     ) {
         let oldSelection = globalContextBuilderAgentSelection()
+        let globalDefaultsBeforeMutation = globalDefaults
         let trimmedAgentRaw = agentRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         let agent = AgentProviderKind(rawValue: trimmedAgentRaw)
             ?? AgentModelCatalog.normalizeSelection(agentRaw: trimmedAgentRaw, modelRaw: modelRaw).agent
@@ -1493,7 +1511,7 @@ class GlobalSettingsStore: ObservableObject {
             line: line,
             function: function
         )
-        save()
+        persistGlobalDefaultsChange(before: globalDefaultsBeforeMutation, commit: true)
     }
 
     /// Returns whether the user has explicitly set the global Context Builder agent defaults.
@@ -1541,10 +1559,9 @@ class GlobalSettingsStore: ObservableObject {
     /// Updates global MCP Agent Mode role-default overrides.
     /// Empty dictionaries are normalized to nil.
     func updateGlobalMCPAgentRoleOverrides(_ overrides: [String: String]?, commit: Bool = true) {
+        let globalDefaultsBeforeMutation = globalDefaults
         globalDefaults.mcpAgentRoleOverrides = Self.normalizedMCPAgentRoleOverrides(overrides)
-        if commit {
-            save()
-        }
+        persistGlobalDefaultsChange(before: globalDefaultsBeforeMutation, commit: commit)
     }
 
     // MARK: - Recommendation Provider Filter (Global)
@@ -1583,6 +1600,7 @@ class GlobalSettingsStore: ObservableObject {
 
     /// Updates the global provider filter. Passing all providers clears the override.
     func setGlobalRecommendationProviderFilter(_ providers: Set<RecommendationProviderKind>, commit: Bool = true) {
+        let globalDefaultsBeforeMutation = globalDefaults
         if providers == Set(RecommendationProviderKind.allCases) {
             globalDefaults.recommendationProviderFilterRaw = nil
         } else {
@@ -1590,9 +1608,7 @@ class GlobalSettingsStore: ObservableObject {
                 .filter { providers.contains($0) }
                 .map(\.rawValue)
         }
-        if commit {
-            save()
-        }
+        persistGlobalDefaultsChange(before: globalDefaultsBeforeMutation, commit: commit)
     }
 
     private func normalizedRoleOverrides(_ overrides: [String: String]?) -> [String: String]? {
@@ -1663,6 +1679,19 @@ class GlobalSettingsStore: ObservableObject {
         globalDefaults = document.globalDefaults
         scalarPreferences = document.scalarPreferences ?? GlobalScalarPreferences()
         codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
+        persistenceBlockReason = fileStore.blockReason
+    }
+
+    /// User-initiated recovery when `persistenceBlockReason` is non-nil. The file store backs
+    /// up the offending on-disk file, writes fresh current-schema defaults, and clears the
+    /// block; this method then re-reads those defaults so the store and observers refresh.
+    /// Returns whether the existing file was backed up (the reset always happens).
+    @discardableResult
+    func recoverBlockedPersistenceAfterBackup() -> Bool {
+        let backedUp = fileStore.performUserInitiatedRecovery()
+        objectWillChange.send()
+        load()
+        return backedUp
     }
 
     @discardableResult
