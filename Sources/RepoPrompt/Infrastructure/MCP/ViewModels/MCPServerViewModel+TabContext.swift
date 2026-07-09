@@ -4011,7 +4011,7 @@ extension MCPServerViewModel {
 
     @MainActor
     @discardableResult
-    func detachContextBuilderTabContextForPeerEOF(
+    func detachContextBuilderTabContextForDiscoveryTeardown(
         connectionID: UUID,
         runID: UUID
     ) -> Bool {
@@ -4036,7 +4036,7 @@ extension MCPServerViewModel {
         connectionIDByRunID.removeValue(forKey: runID)
         pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: runID)
         connectionIDToRunID.removeValue(forKey: connectionID)
-        tabContextLog("Detached Context Builder context after peer EOF connectionID=\(connectionID) runID=\(runID)")
+        tabContextLog("Detached Context Builder context for discovery teardown connectionID=\(connectionID) runID=\(runID)")
         return true
     }
 

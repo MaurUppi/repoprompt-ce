@@ -5895,7 +5895,7 @@ actor ServerNetworkManager {
         var didDetachContextBuilderContext = false
         if let detachContextBuilderRunID {
             for state in targets {
-                didDetachContextBuilderContext = state.mcpServer.detachContextBuilderTabContextForPeerEOF(
+                didDetachContextBuilderContext = state.mcpServer.detachContextBuilderTabContextForDiscoveryTeardown(
                     connectionID: connectionID,
                     runID: detachContextBuilderRunID
                 ) || didDetachContextBuilderContext
@@ -5985,17 +5985,14 @@ actor ServerNetworkManager {
         persistAcceptedSocketTerminalRecord(connectionID: id, context: context)
 
         // Capture run ownership before any suspension or connection-dictionary cleanup.
-        // Only orderly peer EOF from a discover-run child may transfer final context ownership.
+        // A discovery child can finish successfully and then disappear through several
+        // transport shapes (server terminate, write hangup/stall, read error, TTL, etc.).
+        // Preserve its final tab context for commit whenever the connection still has
+        // authoritative discover-run ownership; cancellation/staleness is enforced later
+        // by the commit path's isStillCurrent checks.
         let cleanupRunPurpose = runPurposeByConnection[id] ?? .unknown
         let cleanupRunID = runIDByConnectionID[id]
-        let detachContextBuilderRunID: UUID? = if context.reason == MCPTransportTerminalCause.peerEOF.rawValue,
-                                                  context.initiator == .peer,
-                                                  cleanupRunPurpose == .discoverRun
-        {
-            cleanupRunID
-        } else {
-            nil
-        }
+        let detachContextBuilderRunID: UUID? = cleanupRunPurpose == .discoverRun ? cleanupRunID : nil
 
         // Always drop any lingering bootstrap reservation (commit/rollback should handle it,
         // but this is a leak safety-net for edge cases)
