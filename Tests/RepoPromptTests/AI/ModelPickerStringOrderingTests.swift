@@ -103,6 +103,28 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         XCTAssertEqual(xhighSelection.effortLevel, .xhigh)
     }
 
+    func testCodexReasoningEffortParsesMaxWithoutChangingRecommendations() {
+        XCTAssertEqual(CodexReasoningEffort.parse("max"), .max)
+        XCTAssertEqual(CodexReasoningEffort.parse("maximum"), .max)
+        XCTAssertEqual(CodexModelSpecifier(raw: "gpt-5.6-sol-max").baseModel, "gpt-5.6-sol")
+        XCTAssertEqual(CodexModelSpecifier(raw: "gpt-5.6-sol-max").reasoningEffort, .max)
+        XCTAssertEqual(AgentModel.resolvedModel(forRaw: "gpt-5.6-sol-max", agentKind: .codexExec), .gpt56SolMax)
+        XCTAssertEqual(AIModel.fromModelName("codex_cli_gpt-5.6-sol-max"), .codexCliGpt56SolMax)
+        XCTAssertEqual(AIModel.codexCliGpt56SolMax.defaultReasoningEffort, "max")
+    }
+
+    func testCodexPickerExposesGpt56MaxAfterXHigh() {
+        let models = AgentModel.modelsForAgent(.codexExec)
+        guard let xhighIndex = models.firstIndex(of: .gpt56SolXHigh),
+              let maxIndex = models.firstIndex(of: .gpt56SolMax)
+        else {
+            XCTFail("Expected GPT-5.6 Sol XHigh and Max in Codex picker")
+            return
+        }
+        XCTAssertGreaterThan(maxIndex, xhighIndex)
+        XCTAssertTrue(AgentModel.gpt56SolMax.description.contains("choose intentionally"))
+    }
+
     func testAIModelCodexMenuGroupsUseStableSemanticOrdering() {
         let groups = AIModel.codexMenuGroups(for: [
             .codexCustom(name: "gpt-5.2-high"),

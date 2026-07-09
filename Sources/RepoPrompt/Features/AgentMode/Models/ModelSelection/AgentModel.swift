@@ -30,14 +30,17 @@ enum AgentModel: String, CaseIterable, Codable {
     case gpt56SolMedium = "gpt-5.6-sol-medium"
     case gpt56SolHigh = "gpt-5.6-sol-high"
     case gpt56SolXHigh = "gpt-5.6-sol-xhigh"
+    case gpt56SolMax = "gpt-5.6-sol-max"
     case gpt56TerraLow = "gpt-5.6-terra-low"
     case gpt56TerraMedium = "gpt-5.6-terra-medium"
     case gpt56TerraHigh = "gpt-5.6-terra-high"
     case gpt56TerraXHigh = "gpt-5.6-terra-xhigh"
+    case gpt56TerraMax = "gpt-5.6-terra-max"
     case gpt56LunaLow = "gpt-5.6-luna-low"
     case gpt56LunaMedium = "gpt-5.6-luna-medium"
     case gpt56LunaHigh = "gpt-5.6-luna-high"
     case gpt56LunaXHigh = "gpt-5.6-luna-xhigh"
+    case gpt56LunaMax = "gpt-5.6-luna-max"
 
     // Legacy GPT-5.5 models retained for decoding/resolution compatibility.
     case gpt55CodexLow = "gpt-5.5-low"
@@ -110,14 +113,17 @@ enum AgentModel: String, CaseIterable, Codable {
         case .gpt56SolMedium: "GPT-5.6 Sol Medium"
         case .gpt56SolHigh: "GPT-5.6 Sol High"
         case .gpt56SolXHigh: "GPT-5.6 Sol XHigh"
+        case .gpt56SolMax: "GPT-5.6 Sol Max"
         case .gpt56TerraLow: "GPT-5.6 Terra Low"
         case .gpt56TerraMedium: "GPT-5.6 Terra Medium"
         case .gpt56TerraHigh: "GPT-5.6 Terra High"
         case .gpt56TerraXHigh: "GPT-5.6 Terra XHigh"
+        case .gpt56TerraMax: "GPT-5.6 Terra Max"
         case .gpt56LunaLow: "GPT-5.6 Luna Low"
         case .gpt56LunaMedium: "GPT-5.6 Luna Medium"
         case .gpt56LunaHigh: "GPT-5.6 Luna High"
         case .gpt56LunaXHigh: "GPT-5.6 Luna XHigh"
+        case .gpt56LunaMax: "GPT-5.6 Luna Max"
         case .gpt55CodexLow: "GPT-5.5 Low"
         case .gpt55CodexMedium: "GPT-5.5 Medium"
         case .gpt55CodexHigh: "GPT-5.5 High"
@@ -169,15 +175,18 @@ enum AgentModel: String, CaseIterable, Codable {
         case .gpt56SolLow: "Fast GPT-5.6 Sol reasoning through Codex. Recommended for explore, discovery, and lightweight implementation."
         case .gpt56SolMedium: "Balanced GPT-5.6 Sol reasoning through Codex. Good for Engineer defaults when you want more reasoning than Low without jumping to High."
         case .gpt56SolHigh: "Deep GPT-5.6 Sol reasoning through Codex. Recommended for planning, review, and pair-agent work."
-        case .gpt56SolXHigh: "Maximum GPT-5.6 Sol reasoning through Codex. Use selectively for the hardest agentic tasks."
+        case .gpt56SolXHigh: "Extra-high GPT-5.6 Sol reasoning through Codex. Use selectively for hard agentic tasks."
+        case .gpt56SolMax: "Maximum GPT-5.6 Sol reasoning through Codex. Can use substantially more tokens; choose intentionally for exceptional tasks."
         case .gpt56TerraLow: "Fast GPT-5.6 Terra reasoning through Codex. Balances intelligence and cost for lighter agentic work."
         case .gpt56TerraMedium: "Balanced GPT-5.6 Terra reasoning through Codex. Strong default when cost matters."
         case .gpt56TerraHigh: "Deep GPT-5.6 Terra reasoning through Codex. Good for complex work with cost-conscious tradeoffs."
-        case .gpt56TerraXHigh: "Maximum GPT-5.6 Terra reasoning through Codex. Use selectively for hard cost-conscious tasks."
+        case .gpt56TerraXHigh: "Extra-high GPT-5.6 Terra reasoning through Codex. Use selectively for hard cost-conscious tasks."
+        case .gpt56TerraMax: "Maximum GPT-5.6 Terra reasoning through Codex. Can use substantially more tokens; choose intentionally."
         case .gpt56LunaLow: "Fast GPT-5.6 Luna reasoning through Codex. Cost-sensitive option for simple exploration."
         case .gpt56LunaMedium: "Balanced GPT-5.6 Luna reasoning through Codex. Cost-sensitive option for routine work."
         case .gpt56LunaHigh: "Deep GPT-5.6 Luna reasoning through Codex. Cost-sensitive option when more reasoning is needed."
-        case .gpt56LunaXHigh: "Maximum GPT-5.6 Luna reasoning through Codex. Cost-sensitive option for harder tasks."
+        case .gpt56LunaXHigh: "Extra-high GPT-5.6 Luna reasoning through Codex. Cost-sensitive option for harder tasks."
+        case .gpt56LunaMax: "Maximum GPT-5.6 Luna reasoning through Codex. Can use substantially more tokens; choose intentionally."
         case .gpt55CodexLow: "Fast GPT-5.5 reasoning through Codex. Recommended for explore, discovery, and lightweight implementation."
         case .gpt55CodexMedium: "Balanced GPT-5.5 reasoning through Codex. Good for Engineer defaults when you want more reasoning than Low without jumping to High."
         case .gpt55CodexHigh: "Deep GPT-5.5 reasoning through Codex. Recommended for planning, review, and pair-agent work."
@@ -233,14 +242,17 @@ enum AgentModel: String, CaseIterable, Codable {
                 .gpt56SolMedium,
                 .gpt56SolHigh,
                 .gpt56SolXHigh,
+                .gpt56SolMax,
                 .gpt56TerraLow,
                 .gpt56TerraMedium,
                 .gpt56TerraHigh,
                 .gpt56TerraXHigh,
+                .gpt56TerraMax,
                 .gpt56LunaLow,
                 .gpt56LunaMedium,
                 .gpt56LunaHigh,
                 .gpt56LunaXHigh,
+                .gpt56LunaMax,
                 .codexMini,
                 .codexLow,
                 .codexMedium,
@@ -375,6 +387,8 @@ enum AgentModel: String, CaseIterable, Codable {
                 .gpt56SolHigh
             case .some(.xhigh):
                 .gpt56SolXHigh
+            case .some(.max):
+                .gpt56SolMax
             case .some(.none), .some(.minimal), .some(.medium):
                 .gpt56SolMedium
             case nil, .some:
@@ -390,6 +404,8 @@ enum AgentModel: String, CaseIterable, Codable {
                 .gpt56TerraHigh
             case .some(.xhigh):
                 .gpt56TerraXHigh
+            case .some(.max):
+                .gpt56TerraMax
             case .some(.none), .some(.minimal), .some(.medium):
                 .gpt56TerraMedium
             case nil, .some:
@@ -405,6 +421,8 @@ enum AgentModel: String, CaseIterable, Codable {
                 .gpt56LunaHigh
             case .some(.xhigh):
                 .gpt56LunaXHigh
+            case .some(.max):
+                .gpt56LunaMax
             case .some(.none), .some(.minimal), .some(.medium):
                 .gpt56LunaMedium
             case nil, .some:

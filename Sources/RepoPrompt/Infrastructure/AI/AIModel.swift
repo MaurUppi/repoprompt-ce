@@ -83,14 +83,17 @@ public enum AIModel: Equatable, Hashable {
     case codexCliGpt56SolMedium
     case codexCliGpt56SolHigh
     case codexCliGpt56SolXHigh
+    case codexCliGpt56SolMax
     case codexCliGpt56TerraLow
     case codexCliGpt56TerraMedium
     case codexCliGpt56TerraHigh
     case codexCliGpt56TerraXHigh
+    case codexCliGpt56TerraMax
     case codexCliGpt56LunaLow
     case codexCliGpt56LunaMedium
     case codexCliGpt56LunaHigh
     case codexCliGpt56LunaXHigh
+    case codexCliGpt56LunaMax
     case codexCliGpt5Low
     case codexCliGpt5Medium
     case codexCliGpt5High
@@ -311,14 +314,17 @@ public enum AIModel: Equatable, Hashable {
         ModelInfo(model: .codexCliGpt56SolMedium, rawValue: "codex_cli_gpt-5.6-sol-medium", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol Medium", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt56SolHigh, rawValue: "codex_cli_gpt-5.6-sol-high", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol High", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt56SolXHigh, rawValue: "codex_cli_gpt-5.6-sol-xhigh", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol XHigh", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56SolMax, rawValue: "codex_cli_gpt-5.6-sol-max", actualName: "gpt-5.6-sol", displayName: "CLI·GPT-5.6 Sol Max", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt56TerraLow, rawValue: "codex_cli_gpt-5.6-terra-low", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra Low", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt56TerraMedium, rawValue: "codex_cli_gpt-5.6-terra-medium", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra Medium", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt56TerraHigh, rawValue: "codex_cli_gpt-5.6-terra-high", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra High", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt56TerraXHigh, rawValue: "codex_cli_gpt-5.6-terra-xhigh", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra XHigh", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56TerraMax, rawValue: "codex_cli_gpt-5.6-terra-max", actualName: "gpt-5.6-terra", displayName: "CLI·GPT-5.6 Terra Max", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt56LunaLow, rawValue: "codex_cli_gpt-5.6-luna-low", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna Low", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt56LunaMedium, rawValue: "codex_cli_gpt-5.6-luna-medium", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna Medium", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt56LunaHigh, rawValue: "codex_cli_gpt-5.6-luna-high", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna High", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt56LunaXHigh, rawValue: "codex_cli_gpt-5.6-luna-xhigh", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna XHigh", provider: ProviderIndex.codex),
+        ModelInfo(model: .codexCliGpt56LunaMax, rawValue: "codex_cli_gpt-5.6-luna-max", actualName: "gpt-5.6-luna", displayName: "CLI·GPT-5.6 Luna Max", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt5Low, rawValue: "codex_cli_gpt-5.2-low", actualName: "gpt-5.2", displayName: "CLI·GPT-5.2 Low", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt5Medium, rawValue: "codex_cli_gpt-5.2-medium", actualName: "gpt-5.2", displayName: "CLI·GPT-5.2 Medium", provider: ProviderIndex.codex),
         ModelInfo(model: .codexCliGpt5High, rawValue: "codex_cli_gpt-5.2-high", actualName: "gpt-5.2", displayName: "CLI·GPT-5.2 High", provider: ProviderIndex.codex),
@@ -1087,6 +1093,7 @@ public enum AIModel: Equatable, Hashable {
         case .gpt5, .gpt54, .gpt5CodexMed, .o3: return "medium"
         case .gpt5Low, .gpt54Low, .gpt5CodexLow, .o3Low: return "low"
         // Codex CLI models
+        case .codexCliGpt56SolMax, .codexCliGpt56TerraMax, .codexCliGpt56LunaMax: return "max"
         case .codexCliGpt56SolXHigh, .codexCliGpt56TerraXHigh, .codexCliGpt56LunaXHigh,
              .codexCliGpt5XHigh, .codexCliGpt54XHigh, .codexCliGpt5CodexXHigh: return "xhigh"
         case .codexCliGpt56SolHigh, .codexCliGpt56TerraHigh, .codexCliGpt56LunaHigh,
@@ -1622,6 +1629,7 @@ public enum AIModel: Equatable, Hashable {
 
         let suffixes = [
             "-xhigh", " xhigh", "-x-high", " x-high",
+            "-maximum", " maximum", "-max", " max",
             "-medium", " medium", "-med", " med",
             "-minimal", " minimal",
             "-high", " high",
@@ -1954,14 +1962,17 @@ public enum AIModel: Equatable, Hashable {
         case codexCliGpt56SolMedium
         case codexCliGpt56SolHigh
         case codexCliGpt56SolXHigh
+        case codexCliGpt56SolMax
         case codexCliGpt56TerraLow
         case codexCliGpt56TerraMedium
         case codexCliGpt56TerraHigh
         case codexCliGpt56TerraXHigh
+        case codexCliGpt56TerraMax
         case codexCliGpt56LunaLow
         case codexCliGpt56LunaMedium
         case codexCliGpt56LunaHigh
         case codexCliGpt56LunaXHigh
+        case codexCliGpt56LunaMax
         case codexCliGpt5Low
         case codexCliGpt5Medium
         case codexCliGpt5High
@@ -2124,6 +2135,8 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.codexCliGpt56SolHigh)
         case .codexCliGpt56SolXHigh:
             .staticCase(.codexCliGpt56SolXHigh)
+        case .codexCliGpt56SolMax:
+            .staticCase(.codexCliGpt56SolMax)
         case .codexCliGpt56TerraLow:
             .staticCase(.codexCliGpt56TerraLow)
         case .codexCliGpt56TerraMedium:
@@ -2132,6 +2145,8 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.codexCliGpt56TerraHigh)
         case .codexCliGpt56TerraXHigh:
             .staticCase(.codexCliGpt56TerraXHigh)
+        case .codexCliGpt56TerraMax:
+            .staticCase(.codexCliGpt56TerraMax)
         case .codexCliGpt56LunaLow:
             .staticCase(.codexCliGpt56LunaLow)
         case .codexCliGpt56LunaMedium:
@@ -2140,6 +2155,8 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.codexCliGpt56LunaHigh)
         case .codexCliGpt56LunaXHigh:
             .staticCase(.codexCliGpt56LunaXHigh)
+        case .codexCliGpt56LunaMax:
+            .staticCase(.codexCliGpt56LunaMax)
         case .codexCliGpt5Low:
             .staticCase(.codexCliGpt5Low)
         case .codexCliGpt5Medium:
