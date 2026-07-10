@@ -1,6 +1,6 @@
 import Combine
 import Foundation
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -48,28 +48,29 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
         XCTAssertEqual(windowB.planningModelName, "sonnet")
     }
 
-    func testSynchronizingContextBuilderPickerDoesNotOverwriteGlobalSelection() throws {
+    func testContextBuilderPickerExplicitCommitPersistsDisplayedRuntimeFallback() async throws {
+        let previousCodexConnected = UserDefaults.standard.object(forKey: "CodexCLIConnected")
+        defer {
+            if let previousCodexConnected {
+                UserDefaults.standard.set(previousCodexConnected, forKey: "CodexCLIConnected")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "CodexCLIConnected")
+            }
+        }
+        UserDefaults.standard.set(true, forKey: "CodexCLIConnected")
+
         let store = try makeIsolatedStore()
         let prompt = makePromptViewModel(windowID: 1, store: store)
-
-        // Reproduce the stale picker state behind “Use MCP for both”. The
-        // workspace/UI picker still says Claude while MCP/global says Codex.
-        prompt.contextBuilderAgent = .claudeCode
-        prompt.contextBuilderAgentModelRaw = AgentModel.claudeSonnet.rawValue
-        store.setGlobalContextBuilderAgentSelection(
-            agentRaw: AgentProviderKind.codexExec.rawValue,
-            modelRaw: AgentModel.gpt55CodexLow.rawValue,
-            markUserDefined: true
+        prompt.apiSettingsViewModel?.test_completeContextBuilderProviderValidation(
+            verifiedProviders: [.codexExec]
         )
+        await drainMainQueue()
 
-        prompt.synchronizeContextBuilderSelection(
-            agentRaw: AgentProviderKind.codexExec.rawValue,
-            modelRaw: AgentModel.gpt55CodexLow.rawValue
-        )
+        prompt.contextBuilderAgent = .codexExec
+        prompt.selectContextBuilderAgentModel(rawModel: AgentModel.gpt55CodexLow.rawValue)
+        prompt.commitContextBuilderSettings()
 
         let persisted = store.persistedGlobalContextBuilderAgentSelection()
-        XCTAssertEqual(prompt.contextBuilderAgent, .codexExec)
-        XCTAssertEqual(prompt.contextBuilderAgentModelRaw, AgentModel.gpt55CodexLow.rawValue)
         XCTAssertEqual(persisted.agentRaw, AgentProviderKind.codexExec.rawValue)
         XCTAssertEqual(persisted.modelRaw, AgentModel.gpt55CodexLow.rawValue)
     }
