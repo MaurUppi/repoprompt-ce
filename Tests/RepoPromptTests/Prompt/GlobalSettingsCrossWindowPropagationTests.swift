@@ -48,6 +48,32 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
         XCTAssertEqual(windowB.planningModelName, "sonnet")
     }
 
+    func testSynchronizingContextBuilderPickerDoesNotOverwriteGlobalSelection() throws {
+        let store = try makeIsolatedStore()
+        let prompt = makePromptViewModel(windowID: 1, store: store)
+
+        // Reproduce the stale picker state behind “Use MCP for both”. The
+        // workspace/UI picker still says Claude while MCP/global says Codex.
+        prompt.contextBuilderAgent = .claudeCode
+        prompt.contextBuilderAgentModelRaw = AgentModel.claudeSonnet.rawValue
+        store.setGlobalContextBuilderAgentSelection(
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            modelRaw: AgentModel.gpt55CodexLow.rawValue,
+            markUserDefined: true
+        )
+
+        prompt.synchronizeContextBuilderSelection(
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            modelRaw: AgentModel.gpt55CodexLow.rawValue
+        )
+
+        let persisted = store.persistedGlobalContextBuilderAgentSelection()
+        XCTAssertEqual(prompt.contextBuilderAgent, .codexExec)
+        XCTAssertEqual(prompt.contextBuilderAgentModelRaw, AgentModel.gpt55CodexLow.rawValue)
+        XCTAssertEqual(persisted.agentRaw, AgentProviderKind.codexExec.rawValue)
+        XCTAssertEqual(persisted.modelRaw, AgentModel.gpt55CodexLow.rawValue)
+    }
+
     // NOTE: Context Builder agent propagation is exercised compositionally — the store-side
     // publish is covered by SettingsJSONOnlyPersistenceTests.testGlobalDefaultsSettersPublishObjectWillChange
     // and the VM-side subscription + re-seed is covered by testOracleModelChangePropagatesAcrossWindows

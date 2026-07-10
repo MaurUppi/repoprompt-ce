@@ -304,13 +304,21 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     /// Context Builder selection. MCP already uses global; UI runs will, too.
     func resolveContextBuilderDriftUsingGlobal() {
         guard let drift = contextBuilderDrift,
+              let globalAgentRaw = drift.globalAgentRaw,
+              let globalModelRaw = drift.globalModelRaw,
               let workspaceID = promptVM.currentWorkspaceID else { return }
         var settings = settingsStore.chatSettings(for: workspaceID)
-        settings.contextBuilderAgentRaw = drift.globalAgentRaw
-        settings.contextBuilderAgentModelRaw = drift.globalModelRaw
+        settings.contextBuilderAgentRaw = globalAgentRaw
+        settings.contextBuilderAgentModelRaw = globalModelRaw
         settings.didUserSetContextBuilderDefaults = true
         settingsStore.updateChatSettings(settings, commit: true)
-        promptVM.commitContextBuilderSettings()
+        // The prompt view model can still hold the workspace's stale selection.
+        // Do not commit it: that would overwrite the authoritative global value
+        // we are deliberately copying into this workspace.
+        promptVM.synchronizeContextBuilderSelection(
+            agentRaw: globalAgentRaw,
+            modelRaw: globalModelRaw
+        )
         refresh()
     }
 

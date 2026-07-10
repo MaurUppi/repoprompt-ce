@@ -502,6 +502,20 @@ class PromptViewModel: ObservableObject {
         contextBuilderAgentModelRaw = rawModel
     }
 
+    /// Updates the picker from an already-persisted global Context Builder selection
+    /// without writing the picker’s previous value back into the global store.
+    func synchronizeContextBuilderSelection(agentRaw: String, modelRaw: String) {
+        guard let agent = AgentProviderKind(rawValue: agentRaw) else { return }
+        let trimmedModelRaw = modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveModelRaw = trimmedModelRaw.isEmpty ? defaultModelRaw(for: agent) : trimmedModelRaw
+
+        isSyncingSettings = true
+        contextBuilderAgent = agent
+        contextBuilderAgentModelRaw = effectiveModelRaw
+        isSyncingSettings = false
+        postRecommendationsShouldRefresh(reason: "contextBuilderSelectionSynchronized")
+    }
+
     private func isContextBuilderModelRawValidForAgent(_ rawModel: String, agent: AgentProviderKind) -> Bool {
         AgentModelCatalog.isValid(rawModel: rawModel, for: agent, availability: agentAvailabilityContext)
     }
