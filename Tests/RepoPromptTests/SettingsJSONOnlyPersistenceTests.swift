@@ -1702,7 +1702,6 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         )
     }
 
-
     private func makeTempDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("SettingsJSONOnlyPersistenceTests-\(UUID().uuidString)", isDirectory: true)
