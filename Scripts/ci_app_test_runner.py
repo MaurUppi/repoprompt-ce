@@ -1175,6 +1175,16 @@ def run_all_suites(
     if workers <= 0:
         print("::error::--workers must be greater than zero", flush=True, file=output)
         return 1
+    # Parallel canaries must not invent parallel_eligible defaults for suites
+    # absent from the ledger; force the strict classification contract.
+    if workers > 1 and not strict_ledger:
+        print(
+            "::warning::--workers > 1 enables --strict-ledger so missing ledger "
+            "suites cannot default to parallel_eligible",
+            flush=True,
+            file=output,
+        )
+        strict_ledger = True
     serial_plan = suite_plan or build_suite_plan(suite_list, ledger_suites={}, serial_policy={})
     if test_bundle is not None:
         print(
@@ -1273,6 +1283,10 @@ def run_all_suites(
             ] = group.label
             return True
 
+        # Pinned groups run on this coordinator thread while the pool runs up to
+        # `workers` parallel-eligible groups, so peak concurrency is workers + 1
+        # when a pinned suite overlaps in-flight eligible work. That is intentional:
+        # lane tags must fully partition shared-state conflicts before a canary.
         with ThreadPoolExecutor(max_workers=workers) as executor:
             for _ in range(workers):
                 if not submit_next(executor):
@@ -1372,7 +1386,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=1)
-    parser.add_argument("--strict-ledger", action="store_true", default=False)
+    parser.add_argument(
+        "--strict-ledger",
+        action="store_true",
+        default=False,
+        help=(
+            "Fail when discovered suites are missing from the ledger instead of "
+            "defaulting them to parallel_eligible. Implied when --workers > 1."
+        ),
+    )
     parser.add_argument("--slow-first", action="store_true", default=False)
     parser.add_argument("--batch-fast-suites", action="store_true", default=False)
     parser.add_argument("--batch-max-suites", type=int, default=4)
@@ -1400,7 +1422,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--workers",
         type=int,
         default=1,
-        help="Number of optional parallel workers for parallel-eligible suites. Default preserves serial execution.",
+        help=(
+            "Number of optional parallel workers for parallel-eligible suites. "
+            "Default 1 preserves serial execution. Values > 1 imply --strict-ledger."
+        ),
     )
     parser.add_argument(
         "--print-suite-plan-json",

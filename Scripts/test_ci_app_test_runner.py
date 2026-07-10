@@ -1345,6 +1345,29 @@ class CIAppTestRunnerTests(unittest.TestCase):
                     require_runtime_for_batching=True,
                 )
 
+    def test_workers_greater_than_one_enables_strict_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = self.write_ledger(Path(tmp), [
+                {"suite": "RepoPromptTests.Known", "method": "testOne", "runtime_seconds": "1.0"},
+            ])
+            output = io.StringIO()
+            exit_code = ci_app_test_runner.run_all_suites(
+                ["RepoPromptTests.Known", "RepoPromptTests.Unknown"],
+                timeout_seconds=1.0,
+                silent_timeout_retries=0,
+                swift_binary="swift",
+                cwd=None,
+                output=output,
+                workers=2,
+                ledger=ledger,
+                strict_ledger=False,
+            )
+
+        self.assertEqual(exit_code, 1)
+        text = output.getvalue()
+        self.assertIn("enables --strict-ledger", text)
+        self.assertIn("missing discovered suites", text)
+
     def test_non_strict_ledger_includes_missing_discovered_suite_with_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ledger = self.write_ledger(Path(tmp), [
