@@ -1018,6 +1018,76 @@ class CIAppTestRunnerTests(unittest.TestCase):
         self.assertIn("RepoPromptTests.AFail", calls)
         self.assertNotIn("RepoPromptTests.CAlsoNotSubmitted", calls)
 
+    def test_parallel_fail_fast_ignores_cancelled_peers_for_first_failure(self) -> None:
+        """Cancelled worker results must not steal first_failure / exit code.
+
+        When workers>1, peers observe the cancellation event and return
+        state=cancelled with exit 130. Those results can land in the same
+        futures batch as the real failure and sort first by group label.
+        Attribution must stay with the non-cancelled failure.
+        """
+        suites = [
+            ci_app_test_runner.PlannedSuite(
+                suite=name,
+                classification="parallel_eligible",
+                serial_lanes=(),
+                matched_serial_tags=(),
+                shared_state_tags=(),
+                resource_cost_tags=(),
+                execution_tiers=("routine",),
+                estimated_runtime_seconds=1.0,
+                method_count=1,
+                heavy_tier_present=False,
+            )
+            for name in ["RepoPromptTests.APeer", "RepoPromptTests.ZFail"]
+        ]
+
+        def fake_buffered(group, **kwargs):
+            if group.label == "RepoPromptTests.ZFail":
+                return (
+                    ci_app_test_runner.SuiteRunResult(
+                        suite=group.label,
+                        state="failed",
+                        exit_code=7,
+                        elapsed_seconds=0.1,
+                        output_seen=True,
+                        first_failure_line="XCTAssert failed: real failure",
+                        last_started_test=None,
+                        timed_out_after_seconds=None,
+                        attempts=1,
+                    ),
+                    f"{group.label} failed\n",
+                )
+            # Peer cancelled due to fail-fast; label sorts before ZFail.
+            return (
+                ci_app_test_runner.SuiteRunResult(
+                    suite=group.label,
+                    state="cancelled",
+                    exit_code=130,
+                    elapsed_seconds=0.05,
+                    output_seen=True,
+                    first_failure_line=None,
+                    last_started_test=None,
+                    timed_out_after_seconds=None,
+                    attempts=1,
+                ),
+                f"{group.label} cancelled\n",
+            )
+
+        with mock.patch.object(ci_app_test_runner, "run_suite_buffered", side_effect=fake_buffered):
+            exit_code = ci_app_test_runner.run_all_suites(
+                [suite.suite for suite in suites],
+                timeout_seconds=1.0,
+                silent_timeout_retries=0,
+                swift_binary="swift",
+                cwd=None,
+                output=io.StringIO(),
+                suite_plan=ci_app_test_runner.SuitePlan(tuple(suites)),
+                workers=2,
+            )
+
+        self.assertEqual(exit_code, 7)
+
     def test_create_suite_process_falls_back_to_swift_test_without_bundle(self) -> None:
         captured_args: list[list[str]] = []
 

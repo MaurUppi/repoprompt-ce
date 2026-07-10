@@ -1321,6 +1321,12 @@ def run_all_suites(
                         passed_results.append(result)
                         if first_failure is None:
                             submit_next(executor)
+                    elif result.state == "cancelled":
+                        # Cancelled peers are fail-fast side effects of a real failure
+                        # already observed (or about to be observed) on another future.
+                        # Mirror the pinned-serial branch so exit codes and first_failure
+                        # attribution stay tied to the actual failing suite.
+                        continue
                     elif first_failure is None:
                         first_failure = result
                         cancellation_event.set()
