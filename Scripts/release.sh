@@ -213,7 +213,8 @@ prepare_sentry_release() {
     if lookup_error="$(sentry-cli --org "$REPOPROMPT_SENTRY_ORG" releases info "$SENTRY_RELEASE_NAME" 2>&1 >/dev/null)"; then
         :
     else
-        local normalized_lookup_error="${lookup_error,,}"
+        local normalized_lookup_error
+        normalized_lookup_error="$(printf '%s' "$lookup_error" | tr '[:upper:]' '[:lower:]')"
         if [[ "$normalized_lookup_error" == *"release not found"* ||
             "$normalized_lookup_error" == *"release does not exist"* ||
             "$normalized_lookup_error" =~ (^|[^0-9])404([^0-9]|$) ]]; then
