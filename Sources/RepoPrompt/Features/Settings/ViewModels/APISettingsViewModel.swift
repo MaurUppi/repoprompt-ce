@@ -1518,55 +1518,14 @@ public class APISettingsViewModel: ObservableObject {
 
     func saveOpenAIShowServiceTierVariants() {
         let wasEnabled = UserDefaults.standard.bool(forKey: "openAIShowServiceTierVariants")
-        UserDefaults.standard.set(openAIShowServiceTierVariants, forKey: "openAIShowServiceTierVariants")
-
         // When turning variants OFF, normalize saved model preferences to strip tier wrappers
         if wasEnabled, !openAIShowServiceTierVariants {
-            normalizeTierVariantPreferences()
+            GlobalSettingsStore.shared.normalizeDisabledOpenAIServiceTierVariants()
         }
+        UserDefaults.standard.set(openAIShowServiceTierVariants, forKey: "openAIShowServiceTierVariants")
 
         Task {
             await updateAvailableModels()
-        }
-    }
-
-    /// Strips tier variant wrappers from saved model preferences when variants are disabled.
-    /// This prevents "hidden forced tier" behavior where a tier-variant selection silently
-    /// continues to override the global tier even after the user turns off variants.
-    private func normalizeTierVariantPreferences() {
-        let settingsStore = GlobalSettingsStore.shared
-        if let rawValue = settingsStore.planningModelRaw(), !rawValue.isEmpty,
-           case let .openAIServiceTierVariant(base, _) = AIModel.fromModelName(rawValue)
-        {
-            settingsStore.setPlanningModelRaw(
-                base.rawValue,
-                reason: "api_settings.normalize_tier_variant.planning",
-                honorSync: false
-            )
-        }
-
-        let normalizedPlanning = settingsStore.planningModelRaw()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if settingsStore.syncChatModelWithOracle(), !normalizedPlanning.isEmpty {
-            settingsStore.setPreferredComposeModelRaw(
-                normalizedPlanning,
-                reason: "api_settings.normalize_tier_variant.preferred_compose.sync_to_planning",
-                honorSync: false
-            )
-        } else if let rawValue = settingsStore.preferredComposeModelRaw(), !rawValue.isEmpty,
-                  case let .openAIServiceTierVariant(base, _) = AIModel.fromModelName(rawValue)
-        {
-            settingsStore.setPreferredComposeModelRaw(
-                base.rawValue,
-                reason: "api_settings.normalize_tier_variant.preferred_compose",
-                honorSync: false
-            )
-        }
-
-        let contextBuilderKey = "contextBuilderModel"
-        if let rawValue = UserDefaults.standard.string(forKey: contextBuilderKey), !rawValue.isEmpty,
-           case let .openAIServiceTierVariant(base, _) = AIModel.fromModelName(rawValue)
-        {
-            UserDefaults.standard.set(base.rawValue, forKey: contextBuilderKey)
         }
     }
 
