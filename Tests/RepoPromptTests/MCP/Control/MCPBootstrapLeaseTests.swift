@@ -634,11 +634,15 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             // releasing call's cleanup; a cancelAndCleanup races the suspended waiter. Both calls must
             // fail closed with the routing readiness error, and the pending policy must be cleared once.
             let suspendedCall = Task { () -> Error? in
-                do { try await lease.requireRouting(timeoutMs: 5000); return nil } catch { return error }
+                do { try await lease.requireRouting(timeoutMs: 5000)
+                    return nil
+                } catch { return error }
             }
             await waitForRoutingContinuations(runID: runID, atLeast: 1)
             let repeatedCall = Task { () -> Error? in
-                do { try await lease.requireRouting(timeoutMs: 5000); return nil } catch { return error }
+                do { try await lease.requireRouting(timeoutMs: 5000)
+                    return nil
+                } catch { return error }
             }
             await lease.cancelAndCleanup()
             let suspendedError = await suspendedCall.value

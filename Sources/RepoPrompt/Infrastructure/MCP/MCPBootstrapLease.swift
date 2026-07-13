@@ -37,7 +37,7 @@ struct MCPBootstrapLeaseSpec {
 /// connection (timeout or routing failure). ``provisioningUnavailable`` is reserved for
 /// provisioning validation (MCP server start / config bootstrap) and carries no behavioral
 /// guarantees on its own.
-enum MCPBootstrapReadinessError: Error, Equatable, Sendable {
+enum MCPBootstrapReadinessError: Error, Equatable {
     /// MCP provisioning validation (server start / config bootstrap) could not be completed for the
     /// run. Used by provisioning validation; no behavioral guarantees are attached here.
     case provisioningUnavailable
