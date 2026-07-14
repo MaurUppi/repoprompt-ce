@@ -13,20 +13,29 @@ final class AgentExecutionLocationPickerLayoutTests: XCTestCase {
     }
 
     func testPickerRegionKeepsStableOuterSizeAcrossLoadingPopulatedEmptyAndError() {
-        let expectedSize = CGSize(width: 284, height: 288)
+        XCTAssertEqual(AgentExecutionLocationPickerLayout.popoverWidth(for: .normal), 300, accuracy: 0.01)
+        XCTAssertEqual(AgentExecutionLocationPickerLayout.rowsHeight(for: .normal), 288, accuracy: 0.01)
+        XCTAssertEqual(AgentExecutionLocationPickerLayout.popoverWidth(for: .extraLarge), 360, accuracy: 0.01)
+        XCTAssertEqual(AgentExecutionLocationPickerLayout.rowsHeight(for: .extraLarge), 360, accuracy: 0.01)
 
-        for state in State.allCases {
-            let measuredSize = measuredSize(for: state)
-            XCTAssertEqual(measuredSize.width, expectedSize.width, accuracy: 0.5, "\(state) width changed")
-            XCTAssertEqual(measuredSize.height, expectedSize.height, accuracy: 0.5, "\(state) height changed")
+        for preset in FontScalePreset.allCases {
+            let expectedSize = CGSize(
+                width: AgentExecutionLocationPickerLayout.popoverWidth(for: preset) - 16,
+                height: AgentExecutionLocationPickerLayout.rowsHeight(for: preset)
+            )
+            for state in State.allCases {
+                let measuredSize = measuredSize(for: state, preset: preset)
+                XCTAssertEqual(measuredSize.width, expectedSize.width, accuracy: 0.5, "\(preset) \(state) width changed")
+                XCTAssertEqual(measuredSize.height, expectedSize.height, accuracy: 0.5, "\(preset) \(state) height changed")
+            }
         }
     }
 
-    private func measuredSize(for state: State) -> CGSize {
+    private func measuredSize(for state: State, preset: FontScalePreset) -> CGSize {
         let hostingView = NSHostingView(
             rootView: AgentExecutionLocationPickerRegion(
-                width: 284,
-                height: 288
+                width: AgentExecutionLocationPickerLayout.popoverWidth(for: preset) - 16,
+                height: AgentExecutionLocationPickerLayout.rowsHeight(for: preset)
             ) {
                 stateContent(for: state)
             }

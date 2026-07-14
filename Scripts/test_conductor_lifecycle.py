@@ -1957,13 +1957,22 @@ class SmokeOperationTests(unittest.TestCase):
         )
 
     def test_execution_location_ui_smoke_runs_after_worktree_readiness_stages(self) -> None:
-        calls: list[tuple[str, list[str]]] = []
+        calls: list[tuple[str, list[str], dict[str, object]]] = []
 
-        def record_command(name: str, argv: list[str], *_args: object, **_kwargs: object) -> tuple[int, str, str]:
-            calls.append((name, argv))
+        def record_command(name: str, argv: list[str], *_args: object, **kwargs: object) -> tuple[int, str, str]:
+            calls.append((name, argv, kwargs))
             return 0, "", ""
 
         with mock.patch.object(conductor, "require_debug_cli", return_value="/tmp/rpce-cli-debug"), mock.patch.object(
+            conductor, "find_debug_app_pids", return_value=["4242"]
+        ), mock.patch.dict(
+            os.environ,
+            {
+                "REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT": "2",
+                "REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_CYCLES": "2",
+            },
+            clear=False,
+        ), mock.patch.object(
             conductor, "run_operation_command", side_effect=record_command
         ):
             code = conductor.operation_smoke(
@@ -1973,7 +1982,7 @@ class SmokeOperationTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(
-            [name for name, _argv in calls],
+            [name for name, _argv, _kwargs in calls],
             [
                 "windows",
                 "workspace switch",
@@ -1985,8 +1994,24 @@ class SmokeOperationTests(unittest.TestCase):
         )
         self.assertEqual(
             calls[-1][1],
-            ["/tmp/repo/Scripts/smoke_agent_execution_location_popover.sh", "RepoPrompt"],
+            ["/tmp/repo/Scripts/smoke_agent_execution_location_popover.sh", "4242"],
         )
+        self.assertEqual(calls[-1][2]["timeout"], 184.0)
+
+    def test_execution_location_ui_smoke_requires_one_exact_debug_app(self) -> None:
+        with mock.patch.object(conductor, "require_debug_cli", return_value="/tmp/rpce-cli-debug"), mock.patch.object(
+            conductor, "find_debug_app_pids", return_value=[]
+        ), mock.patch.object(conductor, "run_operation_command", return_value=(0, "", "")) as run_command, contextlib.redirect_stdout(
+            io.StringIO()
+        ) as output:
+            code = conductor.operation_smoke(
+                Path("/tmp/repo"),
+                {"windowId": "7", "workspace": "test-workspace", "executionLocationUI": True},
+            )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(run_command.call_count, 5)
+        self.assertIn("requires exactly one running RepoPrompt debug app", output.getvalue())
 
     def test_structured_smoke_calls_route_to_requested_window_with_fake_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

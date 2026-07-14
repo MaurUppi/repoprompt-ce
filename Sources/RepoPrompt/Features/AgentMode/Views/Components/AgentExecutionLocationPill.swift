@@ -21,6 +21,22 @@ struct AgentExecutionLocationPickerRegion<Content: View>: View {
     }
 }
 
+enum AgentExecutionLocationPickerLayout {
+    static let popoverBaseWidth: CGFloat = 300
+    static let popoverMaxWidth: CGFloat = 360
+    static let rowsBaseHeight: CGFloat = 288
+    static let rowsMinHeight: CGFloat = 220
+    static let rowsMaxHeight: CGFloat = 360
+
+    static func popoverWidth(for fontPreset: FontScalePreset) -> CGFloat {
+        fontPreset.scaledClamped(popoverBaseWidth, max: popoverMaxWidth)
+    }
+
+    static func rowsHeight(for fontPreset: FontScalePreset) -> CGFloat {
+        fontPreset.scaledClamped(rowsBaseHeight, min: rowsMinHeight, max: rowsMaxHeight)
+    }
+}
+
 // MARK: - Execution Location Pill
 
 struct AgentExecutionLocationPill: View {
@@ -41,7 +57,7 @@ struct AgentExecutionLocationPill: View {
     }
 
     private var popoverWidth: CGFloat {
-        fontPreset.scaledClamped(300, max: 360)
+        AgentExecutionLocationPickerLayout.popoverWidth(for: fontPreset)
     }
 
     private var pillLabelMaxWidth: CGFloat {
@@ -49,7 +65,7 @@ struct AgentExecutionLocationPill: View {
     }
 
     private var existingWorktreeRowsMaxHeight: CGFloat {
-        fontPreset.scaledClamped(288, min: 220, max: 360)
+        AgentExecutionLocationPickerLayout.rowsHeight(for: fontPreset)
     }
 
     private var optionRowWidth: CGFloat {
@@ -216,18 +232,21 @@ struct AgentExecutionLocationPill: View {
         ) {
             if isLoadingExistingWorktrees {
                 ProgressView().controlSize(.small).padding(.horizontal, 8).padding(.vertical, 6)
+                    .accessibilityIdentifier("agent-execution-location-existing-loading")
             } else if let optionError {
                 Text(optionError)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 8)
+                    .accessibilityIdentifier("agent-execution-location-existing-error")
             } else if existingWorktrees.isEmpty {
                 Text("No other worktrees available")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
+                    .accessibilityIdentifier("agent-execution-location-existing-empty")
             } else {
                 ScrollView(.vertical) {
                     LazyVStack(alignment: .leading, spacing: 2) {
@@ -239,6 +258,7 @@ struct AgentExecutionLocationPill: View {
                 }
                 .frame(width: optionRowWidth, height: existingWorktreeRowsMaxHeight)
                 .scrollIndicators(.automatic)
+                .accessibilityIdentifier("agent-execution-location-existing-list")
             }
         }
     }
