@@ -206,14 +206,17 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 XCTAssertTrue(acquired, scenario.rawValue)
 
                 if scenario != .timeoutBeforeConnection {
-                    await MCPRoutingWaiter.notifyChildConnectionObserved(runID: runID)
+                    await MCPRoutingWaiter.notifyConnectionObserved(runID: runID)
                 }
                 if scenario == .success {
                     await MCPRoutingWaiter.notifyRouted(runID: runID)
                 }
 
-                let routed = await lease.releaseWhenRouted(
-                    timeoutMs: 10,
+                let outcome = await lease.releaseWhenRouted(
+                    waitPolicy: MCPRoutingWaitPolicy(
+                        noConnectionTimeout: .milliseconds(10),
+                        observedConnectionGrace: .milliseconds(10)
+                    ),
                     progressReporter: { progress in
                         await recorder.record(progress)
                     }
@@ -222,7 +225,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
 
                 switch scenario {
                 case .success:
-                    XCTAssertTrue(routed)
+                    XCTAssertEqual(outcome, .routed)
                     XCTAssertEqual(phases, [
                         .waitingForChildConnection,
                         .childConnectionObserved,
@@ -232,7 +235,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                     let clearCount = await policyRecorder.clearCount
                     XCTAssertEqual(clearCount, 0)
                 case .timeoutBeforeConnection:
-                    XCTAssertFalse(routed)
+                    XCTAssertEqual(outcome, .timedOutBeforeConnection)
                     XCTAssertEqual(phases, [
                         .waitingForChildConnection,
                         .routingTimeoutBeforeConnection
@@ -240,7 +243,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                     let clearCount = await policyRecorder.clearCount
                     XCTAssertEqual(clearCount, 1)
                 case .timeoutAfterConnection:
-                    XCTAssertFalse(routed)
+                    XCTAssertEqual(outcome, .timedOutAfterConnection)
                     XCTAssertEqual(phases, [
                         .waitingForChildConnection,
                         .childConnectionObserved,
@@ -305,8 +308,8 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             }
 
             await policyClearGate.waitUntilBlocked()
-            await MCPRoutingWaiter.notifyChildConnectionObserved(runID: runID)
-            let stickyObservation = await MCPRoutingWaiter.childConnectionWasObserved(runID: runID)
+            await MCPRoutingWaiter.notifyConnectionObserved(runID: runID)
+            let stickyObservation = await MCPRoutingWaiter.connectionWasObserved(runID: runID)
             XCTAssertTrue(stickyObservation)
             await policyClearGate.release()
 
@@ -328,6 +331,84 @@ final class MCPBootstrapLeaseTests: XCTestCase {
         #else
             throw XCTSkip("Bootstrap routing progress diagnostics require DEBUG helpers.")
         #endif
+    }
+
+    func testLateCommittedRouteRecheckWinsBeforeTimeoutCleanup() async {
+        let runID = UUID()
+        let policyRecorder = PolicyRecorder()
+        await HeadlessAgentConnectionGate.cancelAll()
+        await MCPRoutingWaiter.cleanup(runID: runID)
+        let lease = MCPBootstrapLease(
+            spec: MCPBootstrapLeaseSpec(
+                runID: runID,
+                gateID: UUID(),
+                windowID: 1,
+                tabID: UUID(),
+                clientName: "late-route-recheck",
+                restrictedTools: [],
+                additionalTools: nil,
+                oneShot: true,
+                reason: "late route recheck",
+                ttl: 10,
+                purpose: .discoverRun,
+                taskLabelKind: nil,
+                allowsAgentExternalControlTools: false,
+                requiresExpectedAgentPID: false
+            ),
+            policyInstaller: { _ in await policyRecorder.recordInstall() },
+            policyClearer: { _ in await policyRecorder.recordClear() },
+            committedRouteConfirmer: { _ in true }
+        )
+        await XCTAssertTrue(lease.acquire())
+
+        let outcome = await lease.releaseWhenRouted(
+            waitPolicy: MCPRoutingWaitPolicy(
+                noConnectionTimeout: .milliseconds(10),
+                observedConnectionGrace: .milliseconds(20)
+            )
+        )
+        XCTAssertEqual(outcome, .routed)
+        await XCTAssertEqual(policyRecorder.clearCount, 0)
+        await MCPRoutingWaiter.cleanup(runID: runID)
+    }
+
+    func testLegacyLeaseBooleanWrapperIgnoresObservedConnectionGrace() async {
+        let runID = UUID()
+        let policyRecorder = PolicyRecorder()
+        await HeadlessAgentConnectionGate.cancelAll()
+        await MCPRoutingWaiter.cleanup(runID: runID)
+        let lease = MCPBootstrapLease(
+            spec: MCPBootstrapLeaseSpec(
+                runID: runID,
+                gateID: UUID(),
+                windowID: 1,
+                tabID: UUID(),
+                clientName: "legacy-absolute-deadline",
+                restrictedTools: [],
+                additionalTools: nil,
+                oneShot: true,
+                reason: "legacy timing regression",
+                ttl: 10,
+                purpose: .discoverRun,
+                taskLabelKind: nil,
+                allowsAgentExternalControlTools: false,
+                requiresExpectedAgentPID: false
+            ),
+            policyInstaller: { _ in await policyRecorder.recordInstall() },
+            policyClearer: { _ in await policyRecorder.recordClear() },
+            committedRouteConfirmer: { _ in false }
+        )
+        await XCTAssertTrue(lease.acquire())
+        await MCPRoutingWaiter.notifyConnectionObserved(runID: runID)
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        await XCTAssertFalse(lease.releaseWhenRouted(timeoutMs: 40))
+        let elapsed = start.duration(to: clock.now)
+        XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(30))
+        XCTAssertLessThan(elapsed, .milliseconds(100))
+        await XCTAssertEqual(policyRecorder.clearCount, 1)
+        await MCPRoutingWaiter.cleanup(runID: runID)
     }
 
     func testPIDOwnedAcquireFailsClosedWhenPolicyCannotBeArmed() async throws {

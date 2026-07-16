@@ -966,7 +966,7 @@ private final class ContextBuilderImmediateCompletionProvider: HeadlessAgentProv
             continuation.finish()
         }
         if let runID {
-            await MCPRoutingWaiter.notifyChildConnectionObserved(runID: runID)
+            await MCPRoutingWaiter.notifyConnectionObserved(runID: runID)
             await MCPRoutingWaiter.notifyRouted(runID: runID)
         }
         return stream

@@ -298,6 +298,142 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
         #endif
     }
 
+    func testAdaptiveRoutingDistinguishesBothDeadlinePhasesAndDoesNotRefreshGrace() async {
+        let beforeRunID = UUID()
+        await MCPRoutingWaiter.register(runID: beforeRunID)
+        let beforeOutcome = await MCPRoutingWaiter.waitForRoutingOutcome(
+            runID: beforeRunID,
+            policy: MCPRoutingWaitPolicy(
+                noConnectionTimeout: .milliseconds(20),
+                observedConnectionGrace: .milliseconds(80)
+            )
+        )
+        XCTAssertEqual(beforeOutcome, .timedOutBeforeConnection)
+        await MCPRoutingWaiter.cleanup(runID: beforeRunID)
+
+        let afterRunID = UUID()
+        await MCPRoutingWaiter.register(runID: afterRunID)
+        let clock = ContinuousClock()
+        let start = clock.now
+        let afterWaiter = Task {
+            await MCPRoutingWaiter.waitForRoutingOutcome(
+                runID: afterRunID,
+                policy: MCPRoutingWaitPolicy(
+                    noConnectionTimeout: .milliseconds(30),
+                    observedConnectionGrace: .milliseconds(60)
+                )
+            )
+        }
+        try? await Task.sleep(for: .milliseconds(10))
+        await XCTAssertTrue(MCPRoutingWaiter.notifyConnectionObserved(runID: afterRunID))
+        try? await Task.sleep(for: .milliseconds(30))
+        await XCTAssertFalse(MCPRoutingWaiter.notifyConnectionObserved(runID: afterRunID))
+
+        let afterOutcome = await afterWaiter.value
+        let elapsed = start.duration(to: clock.now)
+        XCTAssertEqual(afterOutcome, .timedOutAfterConnection)
+        XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(55))
+        XCTAssertLessThan(elapsed, .milliseconds(130), "duplicate observation must not restart grace")
+        await MCPRoutingWaiter.cleanup(runID: afterRunID)
+    }
+
+    func testAdaptiveRoutingCanCommitDuringObservedGrace() async {
+        let runID = UUID()
+        await MCPRoutingWaiter.register(runID: runID)
+        let waiter = Task {
+            await MCPRoutingWaiter.waitForRoutingOutcome(
+                runID: runID,
+                policy: MCPRoutingWaitPolicy(
+                    noConnectionTimeout: .milliseconds(20),
+                    observedConnectionGrace: .milliseconds(100)
+                )
+            )
+        }
+        try? await Task.sleep(for: .milliseconds(10))
+        await MCPRoutingWaiter.notifyConnectionObserved(runID: runID)
+        try? await Task.sleep(for: .milliseconds(25))
+        await MCPRoutingWaiter.notifyRouted(runID: runID)
+        await XCTAssertEqual(waiter.value, .routed)
+        await MCPRoutingWaiter.cleanup(runID: runID)
+    }
+
+    func testLegacyBooleanWaitIgnoresObservationAndRetainsAbsoluteDeadline() async {
+        let runID = UUID()
+        await MCPRoutingWaiter.register(runID: runID)
+        let clock = ContinuousClock()
+        let start = clock.now
+        let waiter = Task {
+            await MCPRoutingWaiter.waitUntilRouted(runID: runID, timeoutSeconds: 0.04)
+        }
+        try? await Task.sleep(for: .milliseconds(20))
+        await MCPRoutingWaiter.notifyConnectionObserved(runID: runID)
+
+        await XCTAssertFalse(waiter.value)
+        let elapsed = start.duration(to: clock.now)
+        XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(30))
+        XCTAssertLessThan(elapsed, .milliseconds(100), "legacy observation must not add grace")
+        await MCPRoutingWaiter.cleanup(runID: runID)
+    }
+
+    func testLegacyNonpositiveTimeoutWaitsIndefinitelyUntilCancellationOrRouting() async throws {
+        #if DEBUG
+            let runID = UUID()
+            await MCPRoutingWaiter.register(runID: runID)
+            let cancelledWaiter = Task {
+                await MCPRoutingWaiter.waitForRoutingOutcome(runID: runID, timeoutSeconds: 0)
+            }
+            let routedWaiter = Task {
+                await MCPRoutingWaiter.waitUntilRouted(runID: runID, timeoutSeconds: -1)
+            }
+
+            var continuationCount = 0
+            for _ in 0 ..< 100 {
+                continuationCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+                if continuationCount == 2 { break }
+                await Task.yield()
+            }
+            XCTAssertEqual(continuationCount, 2, "nonpositive legacy timeouts must not resolve immediately")
+
+            cancelledWaiter.cancel()
+            await XCTAssertEqual(cancelledWaiter.value, .cancelled)
+            await XCTAssertEqual(MCPRoutingWaiter.debugContinuationCount(runID: runID), 1)
+
+            await MCPRoutingWaiter.notifyRouted(runID: runID)
+            await XCTAssertTrue(routedWaiter.value)
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Routing waiter continuation inspection is DEBUG-only.")
+        #endif
+    }
+
+    func testTypedCancellationAndCleanupRemainDistinct() async {
+        let runID = UUID()
+        await MCPRoutingWaiter.register(runID: runID)
+        let cancelledWaiter = Task {
+            await MCPRoutingWaiter.waitForRoutingOutcome(
+                runID: runID,
+                policy: MCPRoutingWaitPolicy(
+                    noConnectionTimeout: .seconds(5),
+                    observedConnectionGrace: .seconds(5)
+                )
+            )
+        }
+        let cleanupWaiter = Task {
+            await MCPRoutingWaiter.waitForRoutingOutcome(
+                runID: runID,
+                policy: MCPRoutingWaitPolicy(
+                    noConnectionTimeout: .seconds(5),
+                    observedConnectionGrace: .seconds(5)
+                )
+            )
+        }
+        try? await Task.sleep(for: .milliseconds(10))
+        cancelledWaiter.cancel()
+        await XCTAssertEqual(cancelledWaiter.value, .cancelled)
+        await MCPRoutingWaiter.cleanup(runID: runID)
+        await XCTAssertEqual(cleanupWaiter.value, .failed(.cleanedUp))
+    }
+
     #if DEBUG
         private func diagnosticsPayload(_ result: CallTool.Result) throws -> [String: Any] {
             let text = result.content.compactMap { content -> String? in

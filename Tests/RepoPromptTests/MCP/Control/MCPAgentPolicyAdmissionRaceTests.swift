@@ -10,6 +10,7 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
 
     override func tearDown() async throws {
         #if DEBUG
+            await manager.debugResumePendingPolicyObservation()
             await manager.debugResumePendingPolicyRouteInstallation()
             await manager.debugResumePendingPolicyCommit()
         #endif
@@ -588,7 +589,7 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             XCTAssertEqual(retainedContextAfterRejection.selection, firstBoundContext.selection)
             XCTAssertNil(window.mcpServer.connectionID(forRunID: secondRunID))
             XCTAssertTrue(pendingAfterRejection.contains { $0.runID == secondRunID })
-            let observedAfterWrongRunRejection = await MCPRoutingWaiter.childConnectionWasObserved(
+            let observedAfterWrongRunRejection = await MCPRoutingWaiter.connectionWasObserved(
                 runID: secondRunID
             )
             XCTAssertFalse(observedAfterWrongRunRejection)
@@ -606,7 +607,7 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             XCTAssertEqual(rejectedHandoverResult.runID, secondRunID)
             let rejectedHandoverRunID = await manager.runIDForConnection(rejectedHandoverConnectionID)
             XCTAssertNil(rejectedHandoverRunID)
-            let observedAfterWrongSessionRejection = await MCPRoutingWaiter.childConnectionWasObserved(
+            let observedAfterWrongSessionRejection = await MCPRoutingWaiter.connectionWasObserved(
                 runID: secondRunID
             )
             XCTAssertFalse(observedAfterWrongSessionRejection)
@@ -627,7 +628,7 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             let freshRunID = await manager.runIDForConnection(freshConnectionID)
             XCTAssertEqual(freshRunID, secondRunID)
             XCTAssertEqual(window.mcpServer.tabContextByConnectionID[freshConnectionID]?.tabID, secondTabID)
-            let observedAfterConsumingConnection = await MCPRoutingWaiter.childConnectionWasObserved(
+            let observedAfterConsumingConnection = await MCPRoutingWaiter.connectionWasObserved(
                 runID: secondRunID
             )
             XCTAssertTrue(observedAfterConsumingConnection)
@@ -1208,6 +1209,143 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             await MCPRoutingWaiter.cleanup(runID: runID)
         #else
             throw XCTSkip("Pending policy commit diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testDisconnectDuringObservationAwaitIsRejectedByExistingStalenessGuard() async throws {
+        #if DEBUG
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let runID = UUID()
+            let connectionID = UUID()
+            await installPolicy(runID: runID, windowID: window.windowID)
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+            await MCPRoutingWaiter.register(runID: runID)
+            await manager.debugSuspendNextPendingPolicyObservation()
+
+            let application = Task {
+                await manager.debugApplyPendingPolicy(
+                    clientName: clientName,
+                    connectionID: connectionID,
+                    clientPid: Int(getpid()),
+                    bootstrapClientName: "repoprompt_ce_cli_debug",
+                    pidGateTimeout: 0.25,
+                    requireRunRouting: true
+                )
+            }
+            await XCTAssertTrue(waitUntil {
+                await self.manager.debugIsPendingPolicyObservationSuspended()
+            })
+
+            await manager.debugInvalidatePendingPolicyApplication(connectionID: connectionID)
+            await manager.debugResumePendingPolicyObservation()
+            let result = await application.value
+
+            XCTAssertEqual(result.outcome, "rejected:stale_connection")
+            await XCTAssertTrue(MCPRoutingWaiter.connectionWasObserved(runID: runID))
+            XCTAssertNil(window.mcpServer.connectionIDByRunID[runID])
+            await cleanup(
+                runID: runID,
+                connectionID: connectionID,
+                windowID: window.windowID,
+                expectedPID: getpid()
+            )
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Pending policy observation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testRevocationDuringObservationAwaitCannotPublishRoute() async throws {
+        #if DEBUG
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let runID = UUID()
+            let connectionID = UUID()
+            await installPolicy(runID: runID, windowID: window.windowID)
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+            await MCPRoutingWaiter.register(runID: runID)
+            await manager.debugSuspendNextPendingPolicyObservation()
+
+            let application = Task {
+                await manager.debugApplyPendingPolicy(
+                    clientName: clientName,
+                    connectionID: connectionID,
+                    clientPid: Int(getpid()),
+                    bootstrapClientName: "repoprompt_ce_cli_debug",
+                    pidGateTimeout: 0.25,
+                    requireRunRouting: true
+                )
+            }
+            await XCTAssertTrue(waitUntil {
+                await self.manager.debugIsPendingPolicyObservationSuspended()
+            })
+
+            await manager.revokeClientConnectionPolicy(
+                for: clientName,
+                windowID: window.windowID,
+                runID: runID
+            )
+            await manager.debugResumePendingPolicyObservation()
+            let result = await application.value
+
+            XCTAssertTrue(
+                result.outcome == "rejected:policy_removed" || result.outcome == "rejected:stale_connection",
+                result.outcome
+            )
+            await XCTAssertTrue(MCPRoutingWaiter.connectionWasObserved(runID: runID))
+            XCTAssertNil(window.mcpServer.connectionIDByRunID[runID])
+            await cleanup(
+                runID: runID,
+                connectionID: connectionID,
+                windowID: window.windowID,
+                expectedPID: getpid()
+            )
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Pending policy observation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testMatchedNonOneShotRunPolicyAlsoPublishesObservation() async throws {
+        #if DEBUG
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let runID = UUID()
+            let connectionID = UUID()
+            let tabID = UUID()
+            await installAuthoritativePolicy(
+                runID: runID,
+                tabID: tabID,
+                windowID: window.windowID,
+                oneShot: false
+            )
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+            await MCPRoutingWaiter.register(runID: runID)
+
+            let result = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: connectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                pidGateTimeout: 0.25,
+                requireRunRouting: true
+            )
+
+            XCTAssertEqual(result.outcome, "applied")
+            await XCTAssertTrue(MCPRoutingWaiter.connectionWasObserved(runID: runID))
+            await cleanup(
+                runID: runID,
+                connectionID: connectionID,
+                windowID: window.windowID,
+                expectedPID: getpid()
+            )
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Pending policy observation diagnostics require DEBUG helpers.")
         #endif
     }
 
