@@ -98,6 +98,54 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
         }
     }
 
+    func testUnroutedResumeFailsClosedWithResumeFailurePrefix() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let controller = RoutingReadinessFakeCodexController()
+            let recorder = TerminalPublicationRecorder()
+            let coordinator = makeCoordinator(controller: controller, recorder: recorder, routeOnPolicyInstall: false)
+
+            let session = makeCodexSession()
+            session.setItemsSilently(
+                [
+                    .user("earlier", sequenceIndex: 0),
+                    .assistant("earlier reply", sequenceIndex: 1)
+                ],
+                reason: .persistedSessionHydration
+            )
+            session.codexConversationID = "resume-thread"
+            session.codexNeedsReconnect = true
+            session.beginRunAttempt(source: "test.routing-readiness.resume-fail")
+
+            let outcome = await coordinator.sendCodexNativeMessage(
+                session: session,
+                text: "next turn",
+                attachments: []
+            )
+            if let runID = session.runID {
+                trackedRunIDs.append(runID)
+            }
+
+            XCTAssertEqual(controller.startUserTurnCount, 0, "startUserTurn must never fire when resumed routing never confirmed")
+            XCTAssertEqual(outcome, .failed(message: "Codex native send failed: session not ready"))
+            XCTAssertEqual(recorder.publishedStates, [.failed], "the failed resumed run must publish exactly one failed terminal state")
+
+            let resumeReadinessErrors = session.items.filter {
+                $0.kind == .error
+                    && $0.text.hasPrefix("Codex native resume failed:")
+                    && $0.text.contains("RepoPrompt MCP routing was not confirmed")
+            }
+            XCTAssertEqual(
+                resumeReadinessErrors.count,
+                1,
+                "unrouted resumes must report a resume failure prefix, got \(session.items.filter { $0.kind == .error }.map(\.text))"
+            )
+            XCTAssertFalse(
+                session.items.contains { $0.kind == .error && $0.text.hasPrefix("Codex native start failed:") },
+                "unrouted resumes must not be mislabeled as fresh native starts"
+            )
+        }
+    }
+
     // MARK: - Cancellation cannot cross the first-turn boundary
 
     func testCancellationDuringRoutingWaitDoesNotReachFirstTurn() async throws {

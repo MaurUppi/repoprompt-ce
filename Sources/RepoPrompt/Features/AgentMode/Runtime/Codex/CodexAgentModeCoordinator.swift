@@ -2793,6 +2793,24 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         ) != nil
     }
 
+    private static func codexResumeCandidate(
+        for session: AgentModeViewModel.TabSession,
+        skipResumeWhenNoPriorCodexHistory: Bool
+    ) -> CodexNativeSessionController.SessionRef? {
+        guard session.codexNeedsReconnect else { return nil }
+        if skipResumeWhenNoPriorCodexHistory,
+           !hasResumeEligibleCodexHistory(session.items)
+        {
+            return nil
+        }
+        return CodexNativeSessionController.SessionRef(
+            conversationID: session.codexConversationID ?? "",
+            rolloutPath: session.codexRolloutPath,
+            model: session.codexModel,
+            reasoningEffort: session.codexReasoningEffort
+        )
+    }
+
     private static func codexNativeSessionFailurePrefix(attemptedResume: Bool) -> String {
         attemptedResume ? "Codex native resume failed:" : "Codex native start failed:"
     }
@@ -3634,9 +3652,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     /// finalizes without dispatching a first turn or appending a second error.
     private func failCodexStartupForRoutingReadiness(
         session: AgentModeViewModel.TabSession,
-        error: Error
+        error: Error,
+        attemptedResume: Bool
     ) async {
-        let message = "\(Self.codexNativeSessionFailurePrefix(attemptedResume: false)) \(Self.providerStartupFailureMessage(for: error))"
+        let message = "\(Self.codexNativeSessionFailurePrefix(attemptedResume: attemptedResume)) \(Self.providerStartupFailureMessage(for: error))"
         _ = invalidateCodexControllerForReconnect(
             session: session,
             expectedController: session.codexController,
@@ -3928,6 +3947,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard acquired else { return }
 
             await lease.providerInitializationStarted(provider: AgentProviderKind.codexExec.rawValue)
+            let routingReadinessResumeCandidate = Self.codexResumeCandidate(
+                for: session,
+                skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory
+            )
+            let routingReadinessAttemptedResume = Self.isCodexResumeAttempt(routingReadinessResumeCandidate)
+                && !shouldSkipResumeAfterRepeatedTimeouts(
+                    session: session,
+                    existingRef: routingReadinessResumeCandidate,
+                    allowResumeTimeoutFallback: allowResumeTimeoutFallback
+                )
             await ensureCodexNativeSession(
                 session: session,
                 policyAlreadyInstalled: true,
@@ -3968,7 +3997,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     // run's terminal outcome so the parent sees a failed start instead of a tool-less
                     // child.
                     logCodex("[AgentModeVM][CodexBootstrap] routing wait failed for tab \(session.tabID) run \(runID): \(error)")
-                    await failCodexStartupForRoutingReadiness(session: session, error: error)
+                    await failCodexStartupForRoutingReadiness(
+                        session: session,
+                        error: error,
+                        attemptedResume: routingReadinessAttemptedResume
+                    )
                 }
             } else {
                 await lease.releaseWithoutRoutingWait()
@@ -3987,20 +4020,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled()
         )
-        let resumeCandidate: CodexNativeSessionController.SessionRef? = {
-            guard session.codexNeedsReconnect else { return nil }
-            if skipResumeWhenNoPriorCodexHistory,
-               !Self.hasResumeEligibleCodexHistory(session.items)
-            {
-                return nil
-            }
-            return CodexNativeSessionController.SessionRef(
-                conversationID: session.codexConversationID ?? "",
-                rolloutPath: session.codexRolloutPath,
-                model: session.codexModel,
-                reasoningEffort: session.codexReasoningEffort
-            )
-        }()
+        let resumeCandidate = Self.codexResumeCandidate(
+            for: session,
+            skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory
+        )
         let shouldSkipTimedOutResumeTarget = shouldSkipResumeAfterRepeatedTimeouts(
             session: session,
             existingRef: resumeCandidate,
