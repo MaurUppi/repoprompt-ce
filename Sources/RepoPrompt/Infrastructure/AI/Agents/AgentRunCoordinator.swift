@@ -139,10 +139,10 @@ final class AgentRunCoordinator {
     /// Always releases the gate on timeout to prevent deadlocks.
     ///
     /// Uses event-driven waiting via `MCPRoutingWaiter` instead of polling. The waiter is notified when:
-    /// - `registerRunIDMapping` succeeds (routed = true)
-    /// - `cleanupRunIDMapping` is called (routed = false, early exit)
-    /// - Timeout expires (routed = false)
-    /// - Task is cancelled (routed = false, early exit via signalFailed)
+    /// - `registerRunIDMapping` succeeds
+    /// - cleanup or explicit routing failure resolves the run
+    /// - the selected absolute/adaptive deadline expires
+    /// - the individual waiting task is cancelled
     ///
     /// - Parameters:
     ///   - runID: The run identifier associated with routing state and waiter notifications.
@@ -154,25 +154,24 @@ final class AgentRunCoordinator {
         runID: UUID,
         gateID: UUID? = nil,
         timeoutMs: Int = defaultRoutingTimeoutMs,
+        waitPolicy: MCPRoutingWaitPolicy? = nil,
         progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil
     ) async -> GateRoutingReleaseResult {
         let timeoutSeconds = TimeInterval(timeoutMs) / 1000.0
-
-        // Event-driven wait with cancellation support:
-        // On task cancellation, we signal failure immediately so the wait doesn't block until timeout.
-        let observedRoutingOutcome = await withTaskCancellationHandler {
+        let routingOutcome: MCPRoutingWaitOutcome = if let waitPolicy {
+            await MCPRoutingWaiter.waitForRoutingOutcome(
+                runID: runID,
+                policy: waitPolicy,
+                progressLifecycle: progressLifecycle
+            )
+        } else {
+            // Compatibility path: one absolute deadline that ignores connection observation.
             await MCPRoutingWaiter.waitForRoutingOutcome(
                 runID: runID,
                 timeoutSeconds: timeoutSeconds,
                 progressLifecycle: progressLifecycle
             )
-        } onCancel: {
-            // Expedite: tell the waiter this run will never route (task was cancelled)
-            MCPRoutingWaiter.signalFailed(runID)
         }
-        let routingOutcome: MCPRoutingWaitOutcome = Task.isCancelled
-            ? .cancelled
-            : observedRoutingOutcome
 
         let gateKey = gateID ?? runID
         let gateRelease = await HeadlessAgentConnectionGate.completeIfActiveWithDiagnostics(gateKey)

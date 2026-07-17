@@ -22,9 +22,9 @@ typealias MCPBootstrapRoutingProgressReporter = @MainActor @Sendable (
 actor MCPBootstrapRoutingProgressLifecycle {
     private let reporter: MCPBootstrapRoutingProgressReporter
     private var childConnectionObserved = false
-    private var terminalOutcome: MCPRoutingWaitOutcome?
+    private var waitOutcomeFence: MCPRoutingWaitOutcome?
+    private var authoritativeOutcome: MCPRoutingWaitOutcome?
     private var deliveryTask: Task<Void, Never>?
-    private var didFinish = false
 
     init(reporter: @escaping MCPBootstrapRoutingProgressReporter) {
         self.reporter = reporter
@@ -34,41 +34,45 @@ actor MCPBootstrapRoutingProgressLifecycle {
     }
 
     func recordChildConnectionObserved() {
-        guard terminalOutcome == nil, !childConnectionObserved else { return }
+        guard waitOutcomeFence == nil, authoritativeOutcome == nil, !childConnectionObserved else { return }
         childConnectionObserved = true
         enqueue([.childConnectionObserved, .waitingForRouting])
     }
 
-    func recordTerminal(_ outcome: MCPRoutingWaitOutcome) {
-        guard terminalOutcome == nil else { return }
-        terminalOutcome = outcome
+    /// Fences late waiter callbacks without claiming authority over the lease's final outcome.
+    func fenceAfterWaitOutcome(_ outcome: MCPRoutingWaitOutcome) {
+        guard waitOutcomeFence == nil else { return }
+        waitOutcomeFence = outcome
     }
 
     func finish(with outcome: MCPRoutingWaitOutcome) async {
-        recordTerminal(outcome)
-        guard !didFinish else {
+        guard authoritativeOutcome == nil else {
             await deliveryTask?.value
             return
         }
-        didFinish = true
+        let fence = waitOutcomeFence
+        waitOutcomeFence = fence ?? outcome
+        authoritativeOutcome = outcome
 
-        let finalOutcome = terminalOutcome ?? outcome
-        if case .timedOut(childConnectionObserved: true) = finalOutcome,
-           !childConnectionObserved
-        {
+        let needsObservedBackfill = !childConnectionObserved && (
+            outcome == .timedOutAfterConnection
+                || outcome == .routed && (
+                    fence == .timedOutBeforeConnection
+                        || fence == .timedOutAfterConnection
+                )
+        )
+        if needsObservedBackfill {
             childConnectionObserved = true
             enqueue([.childConnectionObserved, .waitingForRouting])
         }
 
-        switch finalOutcome {
+        switch outcome {
         case .routed:
             enqueue([.routingConfirmed])
-        case let .timedOut(childConnectionObserved):
-            enqueue([
-                childConnectionObserved
-                    ? .routingTimeoutAfterConnection
-                    : .routingTimeoutBeforeConnection
-            ])
+        case .timedOutBeforeConnection:
+            enqueue([.routingTimeoutBeforeConnection])
+        case .timedOutAfterConnection:
+            enqueue([.routingTimeoutAfterConnection])
         case .failed, .cancelled:
             break
         }
@@ -163,6 +167,7 @@ actor MCPBootstrapLease {
     private let policyInstaller: (MCPBootstrapLeaseSpec) async -> Void
     private let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
     private let policyClearer: (MCPBootstrapLeaseSpec) async -> Void
+    private let committedRouteConfirmer: (MCPBootstrapLeaseSpec) async -> Bool
 
     private var hasAcquired = false
     private var hasReleased = false
@@ -197,13 +202,15 @@ actor MCPBootstrapLease {
         mcpServerEnabler: (() async -> Void)? = nil,
         policyInstaller: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
         expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil,
-        policyClearer: ((MCPBootstrapLeaseSpec) async -> Void)? = nil
+        policyClearer: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
+        committedRouteConfirmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil
     ) {
         self.spec = spec
         self.mcpServerEnabler = mcpServerEnabler
         self.policyInstaller = policyInstaller ?? Self.defaultPolicyInstaller
         self.expectedPIDPolicyArmer = expectedPIDPolicyArmer ?? Self.defaultExpectedPIDPolicyArmer
         self.policyClearer = policyClearer ?? Self.defaultPolicyClearer
+        self.committedRouteConfirmer = committedRouteConfirmer ?? Self.defaultCommittedRouteConfirmer
     }
 
     // MARK: - Core Lifecycle
@@ -349,19 +356,56 @@ actor MCPBootstrapLease {
 
     // MARK: - Release Strategies
 
-    /// Waits for routing and releases legacy gate ownership once established or timed out.
-    /// PID-owned policies have already released the gate but retain this routing/policy cleanup.
-    /// If routing fails/times out, clears the pending policy entry.
+    private enum RoutingWaitSelection {
+        case absolute(timeoutMs: Int)
+        case adaptive(MCPRoutingWaitPolicy)
+    }
+
+    /// Legacy compatibility API. The Boolean wrapper retains one absolute deadline and
+    /// deliberately ignores matching-connection observation.
     @discardableResult
     func releaseWhenRouted(
         timeoutMs: Int = 10000,
         progressReporter: MCPBootstrapRoutingProgressReporter? = nil
     ) async -> Bool {
-        if hasReleased {
-            acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) releaseWhenRouted() ignored because lease already released")
-            return false
+        let outcome = await releaseRouting(
+            selection: .absolute(timeoutMs: timeoutMs),
+            progressReporter: progressReporter
+        )
+        return outcome.routed
+    }
+
+    /// Typed adaptive API used by Context Builder.
+    func releaseWhenRouted(
+        waitPolicy: MCPRoutingWaitPolicy,
+        progressReporter: MCPBootstrapRoutingProgressReporter? = nil
+    ) async -> MCPRoutingWaitOutcome {
+        await releaseRouting(
+            selection: .adaptive(waitPolicy),
+            progressReporter: progressReporter
+        )
+    }
+
+    private func releaseRouting(
+        selection: RoutingWaitSelection,
+        progressReporter: MCPBootstrapRoutingProgressReporter?
+    ) async -> MCPRoutingWaitOutcome {
+        guard !hasReleased else {
+            acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) routing release ignored because lease already released")
+            return .failed(.cleanedUp)
         }
         hasReleased = true
+
+        let timeoutMs: Int
+        let waitPolicy: MCPRoutingWaitPolicy?
+        switch selection {
+        case let .absolute(value):
+            timeoutMs = value
+            waitPolicy = nil
+        case let .adaptive(policy):
+            timeoutMs = 0
+            waitPolicy = policy
+        }
 
         let ownedGateBeforeWait = ownsGate
         let progressLifecycle = progressReporter.map {
@@ -371,10 +415,10 @@ actor MCPBootstrapLease {
             runID: spec.runID,
             gateID: spec.gateID,
             timeoutMs: timeoutMs,
+            waitPolicy: waitPolicy,
             progressLifecycle: progressLifecycle
         )
 
-        acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) releaseWhenRouted() waiting for routing client=\(spec.clientName ?? "<none>") timeoutMs=\(timeoutMs)")
         #if DEBUG
             await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
                 runID: spec.runID,
@@ -382,83 +426,78 @@ actor MCPBootstrapLease {
                 fields: [
                     "client_name": spec.clientName ?? "nil",
                     "timeout_ms": String(timeoutMs),
+                    "adaptive": String(waitPolicy != nil),
                     "gate_id": spec.gateID.uuidString
                 ]
             )
         #endif
+
         let releaseResult = await pendingReleaseResult
         ownsGate = false
-        let routed = releaseResult.routed
+        var outcome = releaseResult.routingOutcome
+
+        // A committed route can cross the waiter deadline before its notification is delivered.
+        // Recheck authoritative maps before any revocation/cleanup, but never accept staged tokens.
+        switch outcome {
+        case .timedOutBeforeConnection, .timedOutAfterConnection:
+            if await committedRouteConfirmer(spec) {
+                outcome = .routed
+            }
+        case .routed, .failed, .cancelled:
+            break
+        }
+
         if ownedGateBeforeWait || releaseResult.gateRelease.released {
-            let gateReleaseReason = switch releaseResult.routingOutcome {
+            let gateReleaseReason = switch outcome {
             case .routed:
                 "routing_completed"
             case .cancelled:
                 "routing_cancelled"
             case .failed:
                 "routing_failed"
-            case .timedOut:
-                "routing_timeout"
+            case .timedOutBeforeConnection:
+                "routing_timeout_before_connection"
+            case .timedOutAfterConnection:
+                "routing_timeout_after_connection"
             }
-            await recordGateRelease(
-                releaseResult.gateRelease,
-                reason: gateReleaseReason
-            )
+            await recordGateRelease(releaseResult.gateRelease, reason: gateReleaseReason)
         }
-        acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) releaseWhenRouted() completed routed=\(routed)")
-        #if DEBUG
-            await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
-                runID: spec.runID,
-                event: "route_wait_completed",
-                fields: [
-                    "client_name": spec.clientName ?? "nil",
-                    "routed": String(routed),
-                    "gate_id": spec.gateID.uuidString
-                ]
-            )
-        #endif
 
-        // A concurrent cancelAndCleanup() can run while this waiter is suspended, so route both
-        // cleanups through the joinable helpers: they run the policy clear and routing teardown at
-        // most once and make every lifecycle path await the same in-flight operation.
-        if !routed, policyInstalled {
-            acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) routing wait failed or timed out; clearing connection policy")
+        if !outcome.routed, policyInstalled {
             await clearPolicyOnce()
         }
         if routingRegistered {
             await cleanupRoutingOnce()
         }
 
-        await progressLifecycle?.finish(with: releaseResult.routingOutcome)
+        await progressLifecycle?.finish(with: outcome)
 
-        return routed
+        #if DEBUG
+            await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+                runID: spec.runID,
+                event: "route_wait_completed",
+                fields: [
+                    "client_name": spec.clientName ?? "nil",
+                    "outcome": String(describing: outcome),
+                    "gate_id": spec.gateID.uuidString
+                ]
+            )
+        #endif
+        return outcome
     }
 
-    /// Fail-closed variant of ``releaseWhenRouted(timeoutMs:)``: waits for the run's routing signal
-    /// and throws instead of returning `false`, so a caller cannot silently proceed when the run
-    /// never routed.
-    ///
-    /// For the call that performs the release, this runs the same cleanup as
-    /// ``releaseWhenRouted(timeoutMs:)`` — gate release, one-shot policy clear, and routing-waiter
-    /// teardown — before throwing, and that cleanup is joinable: a concurrent lifecycle path (e.g. a
-    /// racing ``cancelAndCleanup()``) awaits the single in-flight clear/teardown rather than skipping
-    /// it, so cleanup has completed before this releasing call throws.
-    ///
-    /// A routing timeout or failure surfaces as ``MCPBootstrapReadinessError/routingUnavailable``.
-    /// A repeated call on a lease that was already released or consumed — its routing signal already
-    /// taken, which the Boolean API folds into `false` — fails fast with
-    /// ``MCPBootstrapReadinessError/routingUnavailable`` without waiting for the releasing call's
-    /// in-flight cleanup.
-    ///
-    /// Cancellation is attributed from `Task.isCancelled` at the point of failure and surfaces as
-    /// `CancellationError`. That attribution is best-effort: the routing wait reports only a Boolean,
-    /// so a cancellation that races the timeout may be classified as either outcome.
+    /// Fail-closed routing readiness that consumes the typed absolute-deadline core.
     func requireRouting(timeoutMs: Int = 10000) async throws {
-        let routed = await releaseWhenRouted(timeoutMs: timeoutMs)
-        guard routed else {
-            if Task.isCancelled {
-                throw CancellationError()
-            }
+        let outcome = await releaseRouting(
+            selection: .absolute(timeoutMs: timeoutMs),
+            progressReporter: nil
+        )
+        switch outcome {
+        case .routed:
+            return
+        case .cancelled:
+            throw CancellationError()
+        case .failed, .timedOutBeforeConnection, .timedOutAfterConnection:
             throw MCPBootstrapReadinessError.routingUnavailable
         }
     }
@@ -778,6 +817,14 @@ actor MCPBootstrapLease {
             for: clientName,
             windowID: spec.windowID,
             runID: spec.runID
+        )
+    }
+
+    private static let defaultCommittedRouteConfirmer: (MCPBootstrapLeaseSpec) async -> Bool = { spec in
+        await ServerNetworkManager.shared.isRunRouteAuthoritativelyCommitted(
+            runID: spec.runID,
+            windowID: spec.windowID,
+            tabID: spec.tabID
         )
     }
 }

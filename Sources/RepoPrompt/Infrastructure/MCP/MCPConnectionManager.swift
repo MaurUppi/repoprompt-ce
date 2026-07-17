@@ -1173,6 +1173,9 @@ actor ServerNetworkManager {
 
     private var pendingPoliciesByClient: [String: [ClientConnectionPolicy]] = [:]
     #if DEBUG
+        private var debugShouldSuspendNextPendingPolicyObservation = false
+        private var debugPendingPolicyObservationIsSuspended = false
+        private var debugPendingPolicyObservationResumeWaiters: [CheckedContinuation<Void, Never>] = []
         private var debugShouldSuspendNextPendingPolicyRouteInstallation = false
         private var debugPendingPolicyRouteInstallationIsSuspended = false
         private var debugPendingPolicyRouteInstallationResumeWaiters: [CheckedContinuation<Void, Never>] = []
@@ -2840,6 +2843,107 @@ actor ServerNetworkManager {
         runIDByConnectionID[connectionID] = resolved.runID
         windowIDByRunID[resolved.runID] = resolved.windowID
         return resolved.runID
+    }
+
+    /// Rechecks committed route authority after a waiter deadline.
+    ///
+    /// The MainActor forward mapping deterministically identifies the candidate connection.
+    /// Actor-owned application, policy identity, expected window/tab, and connection liveness
+    /// are then sampled on both sides of a second MainActor mapping validation.
+    func isRunRouteAuthoritativelyCommitted(
+        runID: UUID,
+        windowID: Int,
+        tabID: UUID?
+    ) async -> Bool {
+        let connectionID = await MainActor.run { () -> UUID? in
+            guard let window = WindowStatesManager.shared.window(withID: windowID),
+                  let connectionID = window.mcpServer.connectionIDByRunID[runID],
+                  window.mcpServer.hasCurrentRunRouteMapping(
+                      runID: runID,
+                      connectionID: connectionID,
+                      expectedTabID: tabID
+                  )
+            else { return nil }
+            return connectionID
+        }
+        guard let connectionID,
+              let actorSnapshot = authoritativeRunRouteActorSnapshot(
+                  runID: runID,
+                  connectionID: connectionID,
+                  windowID: windowID,
+                  tabID: tabID
+              )
+        else { return false }
+
+        let mappingIsStillCurrent = await MainActor.run {
+            guard let window = WindowStatesManager.shared.window(withID: windowID) else {
+                return false
+            }
+            return window.mcpServer.hasCurrentRunRouteMapping(
+                runID: runID,
+                connectionID: connectionID,
+                expectedTabID: tabID
+            )
+        }
+        guard mappingIsStillCurrent,
+              let revalidatedActorSnapshot = authoritativeRunRouteActorSnapshot(
+                  runID: runID,
+                  connectionID: connectionID,
+                  windowID: windowID,
+                  tabID: tabID
+              ),
+              revalidatedActorSnapshot == actorSnapshot
+        else { return false }
+        return true
+    }
+
+    private struct AuthoritativeRunRouteActorSnapshot: Equatable {
+        let pendingRunApplicationID: UUID?
+        let pendingConnectionApplicationID: UUID?
+        let mappedRunID: UUID?
+        let runWindowID: Int?
+        let connectionWindowID: Int?
+        let policyWindowID: Int?
+        let policyTabID: UUID?
+        let isRunAdmitted: Bool
+        let connectionLifecycleGeneration: UInt64?
+        let connectionIdentity: ObjectIdentifier?
+        let connectionIsBeingRemoved: Bool
+    }
+
+    private func authoritativeRunRouteActorSnapshot(
+        runID: UUID,
+        connectionID: UUID,
+        windowID: Int,
+        tabID: UUID?
+    ) -> AuthoritativeRunRouteActorSnapshot? {
+        let connection = connections[connectionID]
+        let snapshot = AuthoritativeRunRouteActorSnapshot(
+            pendingRunApplicationID: pendingPolicyApplicationIDByRunID[runID],
+            pendingConnectionApplicationID: pendingPolicyApplicationIDByConnectionID[connectionID],
+            mappedRunID: runIDByConnectionID[connectionID],
+            runWindowID: windowIDByRunID[runID],
+            connectionWindowID: connectionWindowMap[connectionID],
+            policyWindowID: runPolicyStateByRunID[runID]?.windowID,
+            policyTabID: runPolicyStateByRunID[runID]?.tabID,
+            isRunAdmitted: admittedPolicyRunIDs.contains(runID),
+            connectionLifecycleGeneration: connectionLifecycleGenerationByID[connectionID],
+            connectionIdentity: connection.map { ObjectIdentifier($0 as AnyObject) },
+            connectionIsBeingRemoved: connectionsBeingRemoved.contains(connectionID)
+        )
+        guard snapshot.pendingRunApplicationID == nil,
+              snapshot.pendingConnectionApplicationID == nil,
+              snapshot.mappedRunID == runID,
+              snapshot.runWindowID == windowID,
+              snapshot.connectionWindowID == windowID,
+              snapshot.policyWindowID == windowID,
+              snapshot.policyTabID == tabID,
+              snapshot.isRunAdmitted,
+              snapshot.connectionLifecycleGeneration != nil,
+              snapshot.connectionIdentity != nil,
+              !snapshot.connectionIsBeingRemoved
+        else { return nil }
+        return snapshot
     }
 
     func toolTrackingRunIDForCompletion(
@@ -6980,6 +7084,22 @@ actor ServerNetworkManager {
     }
 
     #if DEBUG
+        func debugSuspendNextPendingPolicyObservation() {
+            debugShouldSuspendNextPendingPolicyObservation = true
+        }
+
+        func debugIsPendingPolicyObservationSuspended() -> Bool {
+            debugPendingPolicyObservationIsSuspended
+        }
+
+        func debugResumePendingPolicyObservation() {
+            debugShouldSuspendNextPendingPolicyObservation = false
+            debugPendingPolicyObservationIsSuspended = false
+            let waiters = debugPendingPolicyObservationResumeWaiters
+            debugPendingPolicyObservationResumeWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+
         func debugSuspendNextPendingPolicyRouteInstallation() {
             debugShouldSuspendNextPendingPolicyRouteInstallation = true
         }
@@ -7020,6 +7140,16 @@ actor ServerNetworkManager {
             let waiters = debugPendingPolicyCommitResumeWaiters
             debugPendingPolicyCommitResumeWaiters.removeAll()
             waiters.forEach { $0.resume() }
+        }
+
+        private func debugSuspendPendingPolicyObservationIfNeeded() async {
+            guard debugShouldSuspendNextPendingPolicyObservation else { return }
+            debugShouldSuspendNextPendingPolicyObservation = false
+            debugPendingPolicyObservationIsSuspended = true
+            await withCheckedContinuation { continuation in
+                debugPendingPolicyObservationResumeWaiters.append(continuation)
+            }
+            debugPendingPolicyObservationIsSuspended = false
         }
 
         private func debugSuspendPendingPolicyRouteInstallationIfNeeded() async {
@@ -9754,7 +9884,24 @@ actor ServerNetworkManager {
         // run-affinity checks, but run-route installation has not started. Observation
         // remains sticky if a later route installation is rolled back.
         if requireRunRouting, let runID = policy.runID {
-            await MCPRoutingWaiter.notifyChildConnectionObserved(runID: runID)
+            #if DEBUG
+                await debugSuspendPendingPolicyObservationIfNeeded()
+            #endif
+            let wasFirstObservation = await MCPRoutingWaiter.notifyConnectionObserved(runID: runID)
+            #if DEBUG
+                if wasFirstObservation {
+                    debugRecordRunRoutingEvent(
+                        runID: runID,
+                        event: "connection_observed",
+                        connectionID: connectionID,
+                        fields: [
+                            "client_name": clientName,
+                            "window_id": String(policy.windowID),
+                            "one_shot": String(policy.oneShot)
+                        ]
+                    )
+                }
+            #endif
         }
 
         let restorePoint = PendingPolicyRestorePoint(
