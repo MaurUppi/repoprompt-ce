@@ -296,6 +296,38 @@ final class AgentManageMCPToolServiceCleanupTests: XCTestCase {
         XCTAssertEqual(recorder.metadataLookupIDs, [])
     }
 
+    func testLiveOpenTabDeleteFinalizesWorkspaceSessionReferences() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+        let sessionID = UUID()
+        let session = await window.agentModeViewModel.ensureSessionReady(tabID: tabID)
+        session.isMCPOriginated = true
+        session.runState = .completed
+        _ = window.agentModeViewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID,
+            on: session,
+            updateWorkspaceMetadata: true
+        )
+        XCTAssertEqual(
+            window.workspaceManager.activeAgentSessionID(
+                forTabID: tabID,
+                inWorkspaceID: workspace.id
+            ),
+            sessionID
+        )
+
+        let service = makeService(window: window, cleanupDependencies: .live)
+        let reply = try await responseObject(service.execute(args: cleanupArgs([sessionID])))
+
+        XCTAssertEqual(reply["status"]?.stringValue, "completed")
+        XCTAssertEqual(reply["deleted_count"]?.intValue, 1)
+        XCTAssertNil(window.agentModeViewModel.sessionIndex[sessionID])
+        XCTAssertFalse(workspace.composeTabs.contains { $0.activeAgentSessionID == sessionID })
+        XCTAssertFalse(workspace.stashedTabs.contains { $0.tab.activeAgentSessionID == sessionID })
+    }
+
     func testOpenDeleteFailureReportsPartialMutationAndRetryConverges() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
