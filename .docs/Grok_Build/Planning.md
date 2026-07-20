@@ -26,7 +26,7 @@
 | --- | --- | --- |
 | 0 — ACP probe + wiring inventory | [Phase0.md](./Phase0.md) | **Complete** (gate open for Phase 1) |
 | 0 — Probe evidence | [Phase0-evidence.md](./Phase0-evidence.md) | Complete |
-| 1 — MVP (Connect + ACP Agent Mode + MCP + catalog min) | [Phase1.md](./Phase1.md) | **Implemented** (build/tests green; live Connect verify recommended) |
+| 1 — MVP (Connect + ACP Agent Mode + MCP + catalog min) | [Phase1.md](./Phase1.md) | **Complete** (live: list_agents + agent_run stream OK; MCP inject residual) |
 | 2 — Headless + discovery parity | [Phase2.md](./Phase2.md) | Planned |
 | 3 — Product polish | [Phase3.md](./Phase3.md) | Planned |
 

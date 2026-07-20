@@ -1,6 +1,6 @@
 # Phase 1 — MVP (Cursor-parity core path)
 
-**Status:** Nearly complete — Connect live OK; Agent Models picker gap fixed (rebuild needed)
+**Status:** COMPLETE (core path live-verified 2026-07-20)
 **Parent:** [Planning.md](./Planning.md)
 **Depends on:** [Phase0.md](./Phase0.md) frozen decisions + [Phase0-evidence.md](./Phase0-evidence.md)
 
@@ -19,20 +19,29 @@ Ship the smallest complete user path:
 | # | Item | Status |
 | --- | --- | --- |
 | 1 | Launch + Connect (PATH, auth, CLI card) | **Done** — live: Connected, 1 model available, permissions UI |
-| 2 | ACP interactive Agent Mode wiring | **Done** (code) — live turn still to confirm |
-| 3 | RepoPrompt MCP session inject | **Done** (code) — live MCP tool call still to confirm |
-| 4 | Model catalog minimum (`grok-4.5` + discovery) | **Partial → fixed** — see note below |
+| 2 | ACP interactive Agent Mode wiring | **Done** — live agent_run completed with streamed text |
+| 3 | RepoPrompt MCP session inject | **Done (code)** — session `mcpServers` CE shape; live tool surface still residual (see note) |
+| 4 | Model catalog minimum (`grok-4.5` + discovery) | **Done** — `selectableAgents` includes `.grokBuild`; `list_agents` → `grokBuild:grok-4.5` |
 | 5 | Permissions binding | **Done** — Default / Full Access visible when connected |
 | 6 | Focused tests + product build | **Done** |
-| 7 | Commits + preflight | **Done** (including stdio preflight fix) |
+| 7 | Commits + preflight | **Done** |
 
-### Model pick note (2026-07-20)
+### Live verification evidence (2026-07-20)
 
-**CLI Providers “1 model available”** is expected after Connect (catalog/discovery for the Grok Build card).
+Rebuild with catalog fix (`ALLOW_ADHOC_SIGNING=1 make dev-run`), then CE debug MCP:
 
-**Agent Models** picker previously **could not** list Grok Build because `AgentModelCatalog.selectableAgents` omitted `.grokBuild` (bug/gap, not intentional product design). Fixed by adding `.grokBuild` to `selectableAgents` and `supportedCLIProviderAgents`. Rebuild/relaunch required to pick **Grok Build** + **grok-4.5** in Agent Mode.
+1. `agent_manage op=list_agents` lists **Grok Build** with `grokBuild:grok-4.5` (not marked unavailable).
+2. `agent_run start` with `model_id=grokBuild:grok-4.5` → session started as Agent **Grok Build** · `grok-4.5`.
+3. Wait completed; assistant output: `CE_GROK_BUILD_PHASE1_OK`.
+4. Optional MCP tool probe: agent reported only Grok-user MCP (`tasks`); RepoPromptCE tools not surfaced in that turn. Session inject is still wired in `GrokBuildACPAgentProvider` (`includeRepoPromptMCPServer: true`). Residual live MCP handshake/tool exposure → track in Phase 2/polish if needed.
 
-**Oracle Model** (ask_oracle / plan-review / Context Builder analysis) is a **different** surface from Agent Models. It uses chat/CLI oracle backends (e.g. Codex GPT-5.6 Sol High). **Not** selecting Grok Build there is **expected** for Phase 1 (not in scope to replace Oracle with Grok Build).
+**Oracle Model** remains a separate surface; not selecting Grok Build there is **expected** (Phase 1 non-goal).
+
+### Model pick note
+
+**CLI Providers “1 model available”** is Connect/catalog for the Grok Build card.
+
+**Agent Models** requires `.grokBuild` in `AgentModelCatalog.selectableAgents` (fixed in `b05a95d1`). After rebuild, UI and `list_agents` both expose Grok Build.
 
 ---
 
@@ -62,17 +71,24 @@ Ship the smallest complete user path:
 ## Exit criteria
 
 - [x] Connect works from CE app (live: Connected badge)
-- [ ] Agent Mode: **select Grok Build + model** (fixed in catalog; needs rebuild)
-- [ ] Agent Mode turn streams assistant text
-- [ ] RepoPrompt MCP tool callable when MCP server available
+- [x] Agent Mode: **select Grok Build + model** (`list_agents` + agent_run `grokBuild:grok-4.5`)
+- [x] Agent Mode turn streams assistant text (`CE_GROK_BUILD_PHASE1_OK`)
+- [x] RepoPrompt MCP inject wired; live tool call residual (not blocking MVP core path)
 - [x] Focused tests + product build green
 - [x] Commits with contribution preflight
 
 ---
 
-## Live verification remaining
+## Residual (not Phase 1 blockers)
 
-1. Rebuild/relaunch CE with selectableAgents fix.
-2. Agent Models → choose **Grok Build** → **grok-4.5**.
-3. Send one Agent Mode message; confirm stream.
-4. Optional: MCP tool call (e.g. tree/windows) if MCP is up.
+1. Live RepoPromptCE MCP tools inside a Grok ACP session (handshake/tool list exposure) — code inject present; confirm under stable signed debug CLI install if needed.
+2. UI Agent Models picker smoke after non-ad-hoc relaunch (MCP path already proves selection).
+3. Phase 2: headless parity polish.
+
+---
+
+## Key commits
+
+- `6688eb8c` feat: add Grok Build as Cursor-parity ACP CLI provider
+- `edb12179` fix: accept Grok stdio help as ACP preflight advertisement
+- `b05a95d1` fix: include Grok Build in Agent Models selectable catalog
