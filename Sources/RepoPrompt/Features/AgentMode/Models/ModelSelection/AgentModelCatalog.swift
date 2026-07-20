@@ -186,15 +186,25 @@ enum AgentModelCatalog {
         .codexExec,
         .claudeCode,
         .openCode,
-        .cursor
+        .cursor,
+        .grokBuild
     ]
 
     static func selectableAgents(
         availability: AvailabilityContext = .current,
         surface: AgentSelectionSurface = .general
     ) -> [AgentProviderKind] {
-        [.codexExec, .claudeCode, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible]
-            .filter { surface.allows($0) && isAgentAvailable($0, availability: availability) }
+        [
+            .codexExec,
+            .claudeCode,
+            .openCode,
+            .cursor,
+            .grokBuild,
+            .claudeCodeGLM,
+            .kimiCode,
+            .customClaudeCompatible
+        ]
+        .filter { surface.allows($0) && isAgentAvailable($0, availability: availability) }
     }
 
     static func hasUnconfiguredSupportedCLIProviders(
