@@ -21,6 +21,13 @@ enum ACPAgentProviderFactory {
                     modelString: modelString
                 )
             )
+        case .grokBuild:
+            GrokBuildACPAgentProvider(
+                config: GrokBuildAgentConfig(
+                    enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
+                    modelString: modelString
+                )
+            )
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
             nil
         }

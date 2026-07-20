@@ -56,6 +56,8 @@ struct CLIProvidersSettingsView: View {
     @State private var isCustomCompatibleExpanded: Bool = false
     @State private var isCodexExpanded: Bool = false
     @State private var isOpenCodeExpanded: Bool = false
+    @State private var isGrokBuildExpanded = false
+    @State private var isLoadingGrokBuild = false
     @State private var isCursorExpanded: Bool = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
@@ -132,6 +134,7 @@ struct CLIProvidersSettingsView: View {
                 claudeCompatibleBackendsSection
                 openCodeCard
                 cursorCard
+                grokBuildCard
             }
             .padding(16)
         }
@@ -1788,6 +1791,116 @@ struct CLIProvidersSettingsView: View {
         }
         let base = count == 1 ? "1 model available." : "\(count) models available."
         return hasComposer2 ? "\(base) Composer 2 is available when selected." : "\(base) Auto is the built-in fallback."
+    }
+
+
+    // MARK: - Grok Build Card
+
+    private var grokBuildCard: some View {
+        providerCard(
+            title: "Grok Build",
+            subtitle: "Uses Grok Build agent stdio ACP for Agent Mode. RepoPrompt MCP tools are injected through the ACP session configuration.",
+            infoURL: "https://grok.com/",
+            isConnected: viewModel.isGrokBuildConnected,
+            isExpanded: $isGrokBuildExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                if viewModel.isGrokBuildConnected {
+                    HStack(spacing: 8) {
+                        Button(action: { testGrokBuildConnection() }) {
+                            if isLoadingGrokBuild {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
+                            }
+                        }
+                        .disabled(isLoadingGrokBuild)
+                        .buttonStyle(CustomButtonStyle())
+
+                        Spacer()
+
+                        Button(action: { signOutFromGrokBuild() }) {
+                            Text("Sign Out")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
+                    Text(grokBuildModelSummary)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    directProviderInlineControls(for: .grokBuild)
+                } else {
+                    HStack(spacing: 10) {
+                        Button(action: { testGrokBuildConnection() }) {
+                            if isLoadingGrokBuild {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Connect", systemImage: "link")
+                            }
+                        }
+                        .disabled(isLoadingGrokBuild)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let error = viewModel.grokBuildError, !error.isEmpty {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Text("Run `grok login` in your terminal if prompted, then Connect. Uses login-shell PATH (~/.local/bin, ~/.grok/bin).")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var grokBuildModelSummary: String {
+        let options = viewModel.availableGrokBuildModelOptions
+        let count = options.count
+        if count == 0 {
+            return "Using grok-4.5 fallback; dynamic model discovery will refresh in the background."
+        }
+        return count == 1 ? "1 model available." : "\(count) models available."
+    }
+
+    private func testGrokBuildConnection() {
+        isLoadingGrokBuild = true
+        Task {
+            do {
+                let ok = try await viewModel.testGrokBuildConnection()
+                await MainActor.run {
+                    isLoadingGrokBuild = false
+                    if ok {
+                        alertMessage = "Grok Build connected."
+                        showAlert = true
+                        onAPIKeyUpdated?()
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    isLoadingGrokBuild = false
+                    alertMessage = viewModel.grokBuildError ?? error.asFriendlyString()
+                    showAlert = true
+                }
+            }
+        }
+    }
+
+    private func signOutFromGrokBuild() {
+        viewModel.disconnectGrokBuild()
+        alertMessage = "Signed out from Grok Build"
+        showAlert = true
+        onAPIKeyUpdated?()
     }
 
     // MARK: - Actions

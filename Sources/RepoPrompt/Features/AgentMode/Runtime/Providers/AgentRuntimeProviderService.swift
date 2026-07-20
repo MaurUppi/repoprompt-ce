@@ -43,11 +43,13 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     case claudeCodeGLM
     case kimiCode
     case customClaudeCompatible
+    case grokBuild
 
     static let claudeMCPClientID = "claude-code"
     static let codexMCPClientID = "codex-mcp-client"
     static let openCodeMCPClientID = "opencode"
     static let cursorMCPClientID = "cursor"
+    static let grokBuildMCPClientID = "grok"
 
     var commandName: String {
         switch self {
@@ -59,6 +61,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "opencode"
         case .cursor:
             "cursor-agent"
+        case .grokBuild:
+            "grok"
         }
     }
 
@@ -72,6 +76,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "OpenCode"
         case .cursor:
             "Cursor CLI"
+        case .grokBuild:
+            "Grok Build"
         case .claudeCodeGLM:
             ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI).normalizedDisplayName
         case .kimiCode:
@@ -91,6 +97,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             Self.openCodeMCPClientID
         case .cursor:
             Self.cursorMCPClientID
+        case .grokBuild:
+            Self.grokBuildMCPClientID
         }
     }
 
@@ -100,6 +108,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .openCode
         case .cursor:
             .cursor
+        case .grokBuild:
+            .grokBuild
         case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             nil
         }
@@ -109,7 +119,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
-        case .codexExec, .openCode, .cursor:
+        case .codexExec, .openCode, .cursor, .grokBuild:
             false
         }
     }
@@ -120,7 +130,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
 
     var requiresExpectedPIDOwnedAgentModeMCPRouting: Bool {
         switch self {
-        case .claudeCode, .codexExec, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
         }
     }
@@ -128,6 +138,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     var requiresPrePromptAgentModeMCPRouting: Bool {
         switch self {
         case .cursor:
+            false
+        case .grokBuild:
             false
         case .claudeCode, .codexExec, .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
@@ -145,6 +157,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             return "OpenCode ACP agent. Interactive Agent Mode uses RepoPrompt MCP tools; headless discovery/delegate runs use RepoPrompt's managed no-native-tools mode."
         case .cursor:
             return "Cursor CLI ACP agent. Uses Cursor's ACP runtime and injects RepoPrompt MCP tools through ACP session configuration."
+        case .grokBuild:
+            return "Grok Build ACP agent. Uses Grok's agent stdio ACP runtime and injects RepoPrompt MCP tools through ACP session configuration."
         case .claudeCodeGLM:
             let config = ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI)
             if case let .claudeSlotMapping(mapping) = config.modelBehavior {
@@ -177,6 +191,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "opencode_acp"
         case .cursor:
             "cursor_acp"
+        case .grokBuild:
+            "grok_build_acp"
         }
     }
 
@@ -190,7 +206,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .kimi
         case .customClaudeCompatible:
             .customCompatible
-        case .codexExec, .openCode, .cursor:
+        case .codexExec, .openCode, .cursor, .grokBuild:
             nil
         }
     }
@@ -290,6 +306,17 @@ final class AgentRuntimeProviderService {
                 Self.logger.debug("Created CursorACPHeadlessAgentProvider")
             }
             return CursorACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
+        case .grokBuild:
+            let config = GrokBuildAgentConfig(
+                commandName: agent.commandName,
+                enableDebugLogging: Self.enableDebugLogging,
+                modelString: modelString,
+                includeRepoPromptMCPServer: true
+            )
+            if Self.enableDebugLogging {
+                Self.logger.debug("Created GrokBuildACPHeadlessAgentProvider")
+            }
+            return GrokBuildACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
         }
     }
 }

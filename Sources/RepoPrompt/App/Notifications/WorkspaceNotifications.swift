@@ -38,4 +38,5 @@ extension Notification.Name {
     /// Posted when Cursor CLI connection status changes
     /// userInfo mirrors `claudeCodeConnectionChanged`
     static let cursorConnectionChanged = Notification.Name("cursorConnectionChanged")
+    static let grokBuildConnectionChanged = Notification.Name("grokBuildConnectionChanged")
 }

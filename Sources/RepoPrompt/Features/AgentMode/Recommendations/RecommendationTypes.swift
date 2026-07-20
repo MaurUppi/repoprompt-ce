@@ -17,6 +17,7 @@ enum RecommendationProviderKind: String, CaseIterable, Identifiable {
     case claudeCode
     case codex
     case cursor
+    case grokBuild
     case openAI
 
     var id: String {
@@ -28,6 +29,7 @@ enum RecommendationProviderKind: String, CaseIterable, Identifiable {
         case .claudeCode: "Claude Code"
         case .codex: "Codex CLI"
         case .cursor: "Cursor CLI"
+        case .grokBuild: "Grok Build"
         case .openAI: "OpenAI API"
         }
     }
@@ -37,6 +39,7 @@ enum RecommendationProviderKind: String, CaseIterable, Identifiable {
         case .claudeCode: "Claude"
         case .codex: "Codex"
         case .cursor: "Cursor"
+        case .grokBuild: "Grok Build"
         case .openAI: "OpenAI"
         }
     }

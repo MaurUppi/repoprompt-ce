@@ -6,6 +6,7 @@ enum AgentModelCatalog {
         let codexAvailable: Bool
         let openCodeAvailable: Bool
         let cursorAvailable: Bool
+        let grokBuildAvailable: Bool
         let zaiConfigured: Bool
         let kimiConfigured: Bool
         let customClaudeCompatibleConfigured: Bool
@@ -15,6 +16,7 @@ enum AgentModelCatalog {
             codexAvailable: false,
             openCodeAvailable: false,
             cursorAvailable: false,
+            grokBuildAvailable: false,
             zaiConfigured: false,
             kimiConfigured: false,
             customClaudeCompatibleConfigured: false
@@ -26,6 +28,7 @@ enum AgentModelCatalog {
                 codexAvailable: codexAvailable && providers.contains(.codex),
                 openCodeAvailable: false,
                 cursorAvailable: cursorAvailable && providers.contains(.cursor),
+                grokBuildAvailable: grokBuildAvailable && providers.contains(.grokBuild),
                 zaiConfigured: zaiConfigured && providers.contains(.claudeCode),
                 kimiConfigured: kimiConfigured && providers.contains(.claudeCode),
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured && providers.contains(.claudeCode)
@@ -39,6 +42,7 @@ enum AgentModelCatalog {
                 codexAvailable: true,
                 openCodeAvailable: true,
                 cursorAvailable: false,
+                grokBuildAvailable: false,
                 zaiConfigured: backendIsAvailable(.glmZAI, store: store),
                 kimiConfigured: backendIsAvailable(.kimi, store: store),
                 customClaudeCompatibleConfigured: backendIsAvailable(.custom, store: store)
@@ -50,6 +54,7 @@ enum AgentModelCatalog {
             codexAvailable: Bool = true,
             openCodeAvailable: Bool = true,
             cursorAvailable: Bool = false,
+            grokBuildAvailable: Bool = false,
             zaiConfigured: Bool = false,
             kimiConfigured: Bool = false,
             customClaudeCompatibleConfigured: Bool = false
@@ -58,6 +63,7 @@ enum AgentModelCatalog {
             self.codexAvailable = codexAvailable
             self.openCodeAvailable = openCodeAvailable
             self.cursorAvailable = cursorAvailable
+            self.grokBuildAvailable = grokBuildAvailable
             self.zaiConfigured = zaiConfigured
             self.kimiConfigured = kimiConfigured
             self.customClaudeCompatibleConfigured = customClaudeCompatibleConfigured
@@ -80,6 +86,7 @@ enum AgentModelCatalog {
                 codexAvailable: codexAvailable || agentKind == .codexExec,
                 openCodeAvailable: openCodeAvailable || agentKind == .openCode,
                 cursorAvailable: cursorAvailable || agentKind == .cursor,
+                grokBuildAvailable: grokBuildAvailable || agentKind == .grokBuild,
                 zaiConfigured: zaiConfigured || agentKind == .claudeCodeGLM,
                 kimiConfigured: kimiConfigured || agentKind == .kimiCode,
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured || agentKind == .customClaudeCompatible
@@ -216,6 +223,8 @@ enum AgentModelCatalog {
             availability.openCodeAvailable
         case .cursor:
             availability.cursorAvailable
+        case .grokBuild:
+            availability.grokBuildAvailable
         }
     }
 
@@ -228,6 +237,9 @@ enum AgentModelCatalog {
         if agentKind == .cursor {
             return AgentModel.cursorAuto.rawValue
         }
+        if agentKind == .grokBuild {
+            return AgentModel.grokBuildDefault.rawValue
+        }
         if isAgentAvailable(agentKind, availability: availability),
            let preferredModelRaw = resolvedACPDiscoveredModels(for: agentKind)?.preferredModelRaw
         {
@@ -236,6 +248,8 @@ enum AgentModelCatalog {
         switch agentKind {
         case .cursor:
             return AgentModel.cursorAuto.rawValue
+        case .grokBuild:
+            return AgentModel.grokBuildDefault.rawValue
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             return ClaudeCompatibleModelCatalogAdapter.defaultModelRaw(for: agentKind, availability: availability)
                 ?? AgentModel.defaultModel.rawValue
@@ -347,7 +361,7 @@ enum AgentModelCatalog {
                 availability: availability,
                 includeClaudeEffortVariants: includeClaudeEffortVariants
             ) ?? []
-        case .openCode, .cursor:
+        case .openCode, .cursor, .grokBuild:
             return AgentModel.modelsForAgent(agentKind)
                 .filter { isAvailable($0, for: agentKind, availability: availability) }
                 .map { staticOption($0, for: agentKind) }
@@ -1368,7 +1382,7 @@ enum AgentModelCatalog {
             .kimi
         case .customClaudeCompatible:
             .custom
-        case .claudeCode, .codexExec, .openCode, .cursor:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild:
             nil
         }
     }
@@ -1571,7 +1585,7 @@ enum AgentModelCatalog {
             availability.kimiConfigured
         case .customClaudeCompatible:
             availability.customClaudeCompatibleConfigured
-        case .claudeCode, .codexExec, .openCode, .cursor:
+        case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild:
             true
         }
     }

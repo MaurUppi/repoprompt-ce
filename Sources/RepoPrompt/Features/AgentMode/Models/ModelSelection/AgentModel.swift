@@ -105,6 +105,9 @@ enum AgentModel: String, CaseIterable, Codable {
     case cursorAuto = "auto"
     case cursorComposer2 = "composer-2"
 
+    // Grok Build models
+    case grokBuildDefault = "grok-4.5"
+
     /// Default (no model specified)
     case defaultModel = "default"
 
@@ -169,6 +172,7 @@ enum AgentModel: String, CaseIterable, Codable {
         case .customClaudeCompatible: "CC Custom"
         case .cursorAuto: "Auto"
         case .cursorComposer2: "Composer 2"
+        case .grokBuildDefault: "Grok 4.5"
         case .defaultModel: "Default"
         }
     }
@@ -234,6 +238,7 @@ enum AgentModel: String, CaseIterable, Codable {
         case .customClaudeCompatible: "Custom Claude-compatible backend. RepoPrompt does not pass a model flag when configured for no-model behavior."
         case .cursorAuto: "Let Cursor choose the best model automatically. Built-in fallback for Cursor ACP runs when dynamic model metadata is unavailable."
         case .cursorComposer2: "Cursor's Composer 2 model. Available when Cursor exposes it through ACP model metadata."
+        case .grokBuildDefault: "Grok Build default model (grok-4.5). Available when Grok Build is connected."
         case .defaultModel: "Use the agent's default model. Good starting point when unsure."
         }
     }
@@ -294,6 +299,8 @@ enum AgentModel: String, CaseIterable, Codable {
             [.defaultModel]
         case .cursor:
             [.cursorAuto, .cursorComposer2]
+        case .grokBuild:
+            [.grokBuildDefault]
         case .claudeCodeGLM:
             [.claudeHaiku, .claudeSonnet, .claudeOpus]
         case .kimiCode:

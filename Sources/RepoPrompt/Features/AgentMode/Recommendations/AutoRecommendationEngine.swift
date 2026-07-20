@@ -376,6 +376,8 @@ final class AutoRecommendationEngine {
                 enabledRecommendationProviders.contains(.codex)
             case .cursor:
                 enabledRecommendationProviders.contains(.cursor)
+            case .grokBuild:
+                enabledRecommendationProviders.contains(.grokBuild)
             case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
                 true
             }
@@ -440,6 +442,7 @@ final class AutoRecommendationEngine {
             codexAvailable: status.codexCLI == .ready,
             openCodeAvailable: false,
             cursorAvailable: status.cursorCLI == .ready,
+            grokBuildAvailable: false,
             zaiConfigured: backendStore.isConfigured(.glmZAI) && backendStore.config(for: .glmZAI).isEnabled && backendStore.config(for: .glmZAI).isValid,
             kimiConfigured: backendStore.isConfigured(.kimi) && backendStore.config(for: .kimi).isEnabled && backendStore.config(for: .kimi).isValid,
             customClaudeCompatibleConfigured: backendStore.isConfigured(.custom) && backendStore.config(for: .custom).isEnabled && backendStore.config(for: .custom).isValid

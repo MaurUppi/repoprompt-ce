@@ -1,6 +1,6 @@
 # Phase 1 — MVP (Cursor-parity core path)
 
-**Status:** Ready to start (blocked only by Phase 0 gate — **open**)
+**Status:** In progress / MVP implementation landed (build green; live Connect still recommended)
 **Parent:** [Planning.md](./Planning.md)
 **Depends on:** [Phase0.md](./Phase0.md) frozen decisions + [Phase0-evidence.md](./Phase0-evidence.md)
 
@@ -75,8 +75,8 @@ Wiring inventory: **Part B of Phase0.md**.
 
 ## Exit criteria
 
-- [ ] Connect works from CE app (login-shell PATH).
+- [ ] Connect works from CE app (login-shell PATH). *(code landed; live verify pending)*
 - [ ] Agent Mode turn streams assistant text.
 - [ ] RepoPrompt MCP tool callable when MCP server available.
-- [ ] Focused tests + `dev-swift-build` green.
+- [x] Focused tests + product build green (`swift build --product RepoPrompt` / `repoprompt-mcp`; `GrokBuildACPLaunchResolverTests` + catalog tests).
 - [ ] Commits per step with contribution preflight.

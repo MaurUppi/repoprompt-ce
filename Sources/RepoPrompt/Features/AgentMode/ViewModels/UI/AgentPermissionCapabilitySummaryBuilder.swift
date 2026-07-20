@@ -156,7 +156,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 approvalModeDescription: "Auto-accept: \(level.acceptsPendingApprovalWhenActivated ? "on" : "off")",
                 warnings: warnings
             )
-        case .cursor:
+        case .cursor, .grokBuild:
             let level = cursorPermissionLevel(profile: profile)
             let warnings = level == .fullAccess
                 ? ["Cursor auto-approves all ACP tool permissions."]
@@ -193,6 +193,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .claude: availability.claudeCodeAvailable
         case .openCode: availability.openCodeAvailable
         case .cursor: availability.cursorAvailable
+        case .grokBuild: availability.grokBuildAvailable
         }
     }
 

@@ -655,7 +655,7 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .openCode, .cursor:
+        case .openCode, .cursor, .grokBuild:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
             }
@@ -2688,7 +2688,7 @@ actor ACPAgentSessionController {
 
     private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String {
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor:
+        case .openCode, .cursor, .grokBuild:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
         }
         return optionID(for: options, preferences: preferences) ?? options.first?.optionID ?? ""
@@ -2714,7 +2714,7 @@ actor ACPAgentSessionController {
     private func fullAccessAutoApprovalOptionID(for options: [PermissionOption]) -> String? {
         guard autoApproveAllToolPermissions else { return nil }
         switch provider.providerID {
-        case .cursor:
+        case .cursor, .grokBuild:
             return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
         case .openCode:
             return nil
@@ -2759,7 +2759,7 @@ actor ACPAgentSessionController {
         }
 
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor:
+        case .openCode, .cursor, .grokBuild:
             [
                 .optionID("always"),
                 .optionID("allow_always"),
@@ -2947,7 +2947,7 @@ actor ACPAgentSessionController {
         private static func resolveRawACPCaptureURL(for providerID: ACPProviderID) -> URL? {
             let env = ProcessInfo.processInfo.environment
             let providerSpecificKey: String? = switch providerID {
-            case .cursor:
+            case .cursor, .grokBuild:
                 "RP_CURSOR_RAW_CAPTURE_PATH"
             case .openCode:
                 "RP_OPENCODE_ACP_RAW_CAPTURE_PATH"
