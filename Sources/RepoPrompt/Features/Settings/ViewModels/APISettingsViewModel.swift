@@ -1778,6 +1778,10 @@ public class APISettingsViewModel: ObservableObject {
             modelSet.formUnion(AIModel.modelsForProvider(.cursor))
         }
 
+        if isGrokBuildConnected {
+            modelSet.formUnion(AIModel.modelsForProvider(.grokBuild))
+        }
+
         // ── Custom provider (OpenAI compatible) ────────────────────────────────
         if isCustomProviderValid,
            let config = try? CustomProviderConfiguration.load()
@@ -1842,6 +1846,7 @@ public class APISettingsViewModel: ObservableObject {
         case .customProvider: "custom"
         case .azure: "azure"
         case .cursor: "cursor"
+        case .grokBuild: "grok_build"
         case .ollama: "ollama"
         case .claudeCode: "claude_code"
         case .codex: "codex"
@@ -1920,6 +1925,8 @@ public class APISettingsViewModel: ObservableObject {
                 break
             case .cursor:
                 break
+            case .grokBuild:
+                break
             }
 
             await updateAvailableModels()
@@ -1980,6 +1987,8 @@ public class APISettingsViewModel: ObservableObject {
             break
         case .cursor:
             break
+        case .grokBuild:
+            break
         }
         await updateAvailableModels()
         resetPreferredModelIfNeeded(for: provider)
@@ -2030,6 +2039,7 @@ public class APISettingsViewModel: ObservableObject {
         case .groq: condition = { $0.providerType == .groq }
         case .zAI: condition = { $0.providerType == .zAI }
         case .cursor: condition = { $0.providerType == .cursor }
+        case .grokBuild: condition = { $0.providerType == .grokBuild }
         // Add other providers if needed (Ollama usually doesn't need key resets this way)
         default: return // No reset needed for this provider type
         }
@@ -3536,6 +3546,7 @@ public class APISettingsViewModel: ObservableObject {
                         availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
                     )
                 }
+                await self.updateAvailableModels()
                 _ = snapshot
             }
         }

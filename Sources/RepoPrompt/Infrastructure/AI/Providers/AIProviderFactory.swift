@@ -18,7 +18,12 @@ class AIProviderFactory {
         }
 
         // CLI providers don't need API keys - they leverage existing authentication
-        if providerType == .claudeCode || providerType == .codex || providerType == .openCode || providerType == .cursor {
+        if providerType == .claudeCode
+            || providerType == .codex
+            || providerType == .openCode
+            || providerType == .cursor
+            || providerType == .grokBuild
+        {
             return try await createProvider(
                 for: providerType,
                 key: "",
@@ -87,6 +92,8 @@ class AIProviderFactory {
             return OpenCodeCLIProvider()
         case .cursor:
             return CursorCLIProvider()
+        case .grokBuild:
+            return GrokBuildCLIProvider()
         case .customProvider:
             let config = try CustomProviderConfiguration.load()
 
@@ -178,6 +185,8 @@ enum AIProviderType: Codable, Equatable {
     case codex // <-- New Codex CLI provider case
     case openCode // OpenCode CLI provider case
     case cursor // Cursor CLI provider case
+    /// Grok Build CLI (ACP) — distinct from HTTP `grok` (xAI API keys).
+    case grokBuild
 }
 
 extension AIProviderType {
@@ -199,6 +208,7 @@ extension AIProviderType {
         case .codex: "Codex CLI"
         case .openCode: "OpenCode"
         case .cursor: "Cursor CLI"
+        case .grokBuild: "Grok Build"
         }
     }
 

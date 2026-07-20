@@ -291,6 +291,51 @@ enum ACPAIModelCatalog {
         cursorModelOptionsFromStore().map { .cursorCustom(name: $0.rawValue) }
     }
 
+    /// Oracle / chat picker models for Grok Build (effort-expanded catalog).
+    static func grokBuildModelsFromCatalog() -> [AIModel] {
+        let options = AgentModelCatalog.options(
+            for: .grokBuild,
+            availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
+        )
+        if !options.isEmpty {
+            return options.map { .grokBuildCustom(name: $0.rawValue) }
+        }
+        return GrokBuildReasoningEffort.displayOrder.map { effort in
+            .grokBuildCustom(
+                name: GrokBuildModelSpecifier.encodedRaw(
+                    baseModelRaw: AgentModel.grokBuildDefault.rawValue,
+                    effort: effort
+                )
+            )
+        }
+    }
+
+    static func grokBuildModelOption(for rawValue: String) -> AgentModelOption? {
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        let options = AgentModelCatalog.options(
+            for: .grokBuild,
+            availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
+        )
+        if let match = options.first(where: { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }) {
+            return match
+        }
+        // Fallback synthetic option for bare / compound raws before catalog warm-up.
+        let display = AgentModelCatalog.displayName(
+            for: normalized,
+            agentKind: .grokBuild,
+            availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
+        )
+        return AgentModelOption(
+            rawValue: normalized,
+            displayName: display,
+            description: "Grok Build",
+            isPlaceholderDefault: false,
+            isProviderDefault: GrokBuildModelSpecifier(raw: normalized).effort == nil
+                || GrokBuildModelSpecifier(raw: normalized).effort == .defaultEffort
+        )
+    }
+
     static func openCodeModelOption(for rawValue: String) -> AgentModelOption? {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return nil }

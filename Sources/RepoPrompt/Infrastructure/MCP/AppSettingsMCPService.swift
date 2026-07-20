@@ -1319,7 +1319,7 @@ private enum AppSettingsMCPRegistry {
         case .cursor:
             .cursor
         case .grokBuild:
-            nil
+            .grokBuild
         }
     }
 
@@ -1341,6 +1341,7 @@ private enum AppSettingsMCPRegistry {
         case .codex: "codex"
         case .openCode: "openCode"
         case .cursor: "cursor"
+        case .grokBuild: "grokBuild"
         }
     }
 

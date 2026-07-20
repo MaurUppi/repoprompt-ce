@@ -20,6 +20,8 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
     case codexCLIAPI
     case openCodeCLIAPI
     case cursorCLIAPI
+    /// Placeholder account for Grok Build CLI (auth is CLI login, not a stored API key).
+    case grokBuildCLIAPI
     case zAIAPI
 
     // Claude-compatible backend accounts.
@@ -66,6 +68,8 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
             "OpenCodeCLIAPI"
         case .cursorCLIAPI:
             "CursorCLIAPI"
+        case .grokBuildCLIAPI:
+            "GrokBuildCLIAPI"
         case .zAIAPI:
             "ZAIAPI"
         case .claudeCompatibleKimiAPIKey:
@@ -123,6 +127,7 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
         case .codexCLIAPI: "Codex CLI API key"
         case .openCodeCLIAPI: "OpenCode CLI API key"
         case .cursorCLIAPI: "Cursor CLI API key"
+        case .grokBuildCLIAPI: "Grok Build CLI"
         case .zAIAPI: "Z.AI API key"
         case .claudeCompatibleKimiAPIKey: "Kimi compatible API key"
         case .claudeCompatibleCustomAPIKey: "Custom Claude-compatible API key"
@@ -157,6 +162,7 @@ enum SecureStorageAccountCatalog {
         .codexCLIAPI,
         .openCodeCLIAPI,
         .cursorCLIAPI,
+        .grokBuildCLIAPI,
         .zAIAPI
     ]
 
