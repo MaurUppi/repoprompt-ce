@@ -27,8 +27,8 @@
 | 0 — ACP probe + wiring inventory | [Phase0.md](./Phase0.md) | **Complete** (gate open for Phase 1) |
 | 0 — Probe evidence | [Phase0-evidence.md](./Phase0-evidence.md) | Complete |
 | 1 — MVP (Connect + ACP Agent Mode + MCP + catalog min) | [Phase1.md](./Phase1.md) | **Complete** (live: list_agents + agent_run stream OK; MCP inject residual) |
-| 2 — Headless + discovery + Phase 1 deferred surfaces | [Phase2.md](./Phase2.md) | **Partial** (effort UI + polling done; Oracle non-goal; MCP socket residual) |
-| 3 — Product polish | [Phase3.md](./Phase3.md) | Planned |
+| 2 — Headless + discovery + effort + MCP identity | [Phase2.md](./Phase2.md) | **Complete** (Oracle/Presets → Phase 3) |
+| 3 — Product polish + Oracle/Presets | [Phase3.md](./Phase3.md) | Planned (includes A/B from Phase 2) |
 
 ---
 

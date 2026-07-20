@@ -49,6 +49,20 @@ enum MCPClientIdentity {
         {
             return "cursor"
         }
+        // Grok Build ACP inject uses multiple client identities:
+        // - parent process: versioned download binary (`grok-0.2.106-macos-aarch64`)
+        // - MCP initialize clientInfo.name: `grok-shell-<ServerName>` (e.g. grok-shell-RepoPromptCE)
+        // Agent Mode policy / expected-PID routing keys remain the stable hint `grok`.
+        if normalized == "grok"
+            || normalized.hasPrefix("grok-")
+            || normalized.hasPrefix("grok ")
+            || matchesFamily(normalized, tokens: ["grok"])
+        {
+            return "grok"
+        }
+        if matchesFamily(normalized, tokens: ["opencode"]) {
+            return "opencode"
+        }
         if matchesFamily(normalized, tokens: ["claude", "ai"]) { return "claude-ai" }
         if matchesFamily(normalized, tokens: ["repoprompt", "cli"]) { return "repoprompt-cli" }
         return nil
@@ -82,7 +96,7 @@ enum MCPClientIdentity {
     static func isHeadlessAgentClient(_ raw: String?) -> Bool {
         guard let family = canonicalFamilyID(raw) else { return false }
         switch family {
-        case "claude-code", "codex-mcp-client", "gemini-cli-mcp-client", "cursor":
+        case "claude-code", "codex-mcp-client", "gemini-cli-mcp-client", "cursor", "grok", "opencode":
             return true
         default:
             return false
