@@ -2991,10 +2991,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         if buffered.droppedTextCharacterCount > 0 || buffered.droppedNonterminalEventCount > 0 {
             let details = [
                 buffered.droppedTextCharacterCount > 0
-                    ? "\(buffered.droppedTextCharacterCount) characters of early provider text"
+                    ? "\(buffered.droppedTextCharacterCount) characters of early provider payload"
                     : nil,
                 buffered.droppedNonterminalEventCount > 0
-                    ? "\(buffered.droppedNonterminalEventCount) redundant progress events"
+                    ? "\(buffered.droppedNonterminalEventCount) early provider events"
                     : nil
             ].compactMap(\.self).joined(separator: " and ")
             if record.session.appendLogEntry(

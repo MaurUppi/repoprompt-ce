@@ -72,15 +72,12 @@ final class ContextBuilderRouteSettlementCoordinator {
                $0.type == event.type && isCoalescibleProgressEvent($0)
            })
         {
-            removeBufferedEvent(at: existingIndex, countsAsDroppedNonterminal: true)
+            removeBufferedEvent(at: existingIndex)
         }
 
         bufferedEvents.append(event)
-        if event.type == "content" {
-            bufferedTextCharacterCount += event.text?.count ?? 0
-            trimOldestTextIfNeeded()
-        }
-        trimRedundantNonterminalEventsIfNeeded()
+        bufferedTextCharacterCount += stringPayloadCharacterCount(event)
+        trimBufferedEventsIfNeeded()
     }
 
     func drainBufferedEvents() -> BufferedEvents {
@@ -96,32 +93,58 @@ final class ContextBuilderRouteSettlementCoordinator {
         return result
     }
 
-    private func trimOldestTextIfNeeded() {
+    private func trimBufferedEventsIfNeeded() {
         while bufferedTextCharacterCount > maxBufferedTextCharacters,
-              let index = bufferedEvents.firstIndex(where: { $0.type == "content" })
+              let index = nextPayloadEvictionIndex()
         {
-            removeBufferedEvent(at: index, countsAsDroppedNonterminal: false)
+            removeBufferedEvent(at: index)
         }
-    }
-
-    private func trimRedundantNonterminalEventsIfNeeded() {
         while bufferedEvents.count > maxBufferedEventCount,
-              let index = bufferedEvents.firstIndex(where: isRedundantNonterminalEvent)
+              let index = nextCountEvictionIndex()
         {
-            removeBufferedEvent(at: index, countsAsDroppedNonterminal: true)
+            removeBufferedEvent(at: index)
         }
     }
 
-    private func removeBufferedEvent(at index: Int, countsAsDroppedNonterminal: Bool) {
+    /// Prefer ordinary content when reducing payload size so compact diagnostics survive. Fall back
+    /// to the oldest protected event so oversized tool, error, result, or terminal payloads cannot win.
+    private func nextPayloadEvictionIndex() -> Int? {
+        bufferedEvents.firstIndex(where: { $0.type == "content" })
+            ?? bufferedEvents.firstIndex(where: isRedundantNonterminalEvent)
+            ?? bufferedEvents.indices.first
+    }
+
+    /// Prefer redundant progress when reducing event count, then ordinary content, then the oldest
+    /// protected event so tool, error, result, or terminal-only streams remain hard bounded.
+    private func nextCountEvictionIndex() -> Int? {
+        bufferedEvents.firstIndex(where: isRedundantNonterminalEvent)
+            ?? bufferedEvents.firstIndex(where: { $0.type == "content" })
+            ?? bufferedEvents.indices.first
+    }
+
+    private func removeBufferedEvent(at index: Int) {
         let removed = bufferedEvents.remove(at: index)
-        if removed.type == "content" {
-            let removedCount = removed.text?.count ?? 0
-            bufferedTextCharacterCount -= removedCount
-            droppedTextCharacterCount += removedCount
-        }
-        if countsAsDroppedNonterminal {
-            droppedNonterminalEventCount += 1
-        }
+        let removedCount = stringPayloadCharacterCount(removed)
+        bufferedTextCharacterCount -= removedCount
+        droppedTextCharacterCount += removedCount
+        droppedNonterminalEventCount += 1
+    }
+
+    /// Counts every retained provider-supplied string value, including the event type discriminator.
+    private func stringPayloadCharacterCount(_ event: AIStreamResult) -> Int {
+        [
+            event.type,
+            event.text,
+            event.reasoning,
+            event.toolName,
+            event.toolArgs,
+            event.toolOutput,
+            event.toolResultJSON,
+            event.toolArgsJSON,
+            event.providerSessionID,
+            event.stopReason,
+            event.contentMessageID
+        ].compactMap(\.self).reduce(0) { $0 + $1.count }
     }
 
     private func isCoalescibleProgressEvent(_ event: AIStreamResult) -> Bool {

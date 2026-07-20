@@ -101,6 +101,49 @@ final class MCPBootstrapLeaseTests: XCTestCase {
         #endif
     }
 
+    func testIndefiniteRoutedOutcomeRemainsObservableForLeaseLifetime() async {
+        let runID = UUID()
+        let policyRecorder = PolicyRecorder()
+        await HeadlessAgentConnectionGate.cancelAll()
+        await MCPRoutingWaiter.cleanup(runID: runID)
+
+        let lease = MCPBootstrapLease(
+            spec: MCPBootstrapLeaseSpec(
+                runID: runID,
+                gateID: UUID(),
+                windowID: 1,
+                tabID: UUID(),
+                clientName: "bootstrap-indefinite-terminal-cache",
+                restrictedTools: [],
+                additionalTools: nil,
+                oneShot: true,
+                reason: "indefinite routed terminal lifetime regression",
+                ttl: 10,
+                purpose: .discoverRun,
+                taskLabelKind: nil,
+                allowsAgentExternalControlTools: false,
+                requiresExpectedAgentPID: false
+            ),
+            policyInstaller: { _ in await policyRecorder.recordInstall() },
+            policyClearer: { _ in await policyRecorder.recordClear() }
+        )
+        let acquired = await lease.acquire()
+        XCTAssertTrue(acquired)
+
+        await MCPRoutingWaiter.notifyRouted(runID: runID)
+        let releaseOutcome = await lease.releaseWhenRoutedIndefinitely()
+        let globalOutcomeAfterCleanup = await MCPRoutingWaiter.currentTerminalOutcome(runID: runID)
+        let firstLeaseOutcomeAfterCleanup = await lease.currentRoutingTerminalOutcome()
+        let secondLeaseOutcomeAfterCleanup = await lease.currentRoutingTerminalOutcome()
+        let clearCount = await policyRecorder.clearCount
+
+        XCTAssertEqual(releaseOutcome, .routed)
+        XCTAssertNil(globalOutcomeAfterCleanup)
+        XCTAssertEqual(firstLeaseOutcomeAfterCleanup, .routed)
+        XCTAssertEqual(secondLeaseOutcomeAfterCleanup, .routed)
+        XCTAssertEqual(clearCount, 0)
+    }
+
     func testPIDOwnedEarlyReleaseCleanupRemovesRetainedPolicyForEveryExit() async throws {
         #if DEBUG
             enum ExitMode: String, CaseIterable {

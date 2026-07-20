@@ -177,6 +177,10 @@ actor MCPBootstrapLease {
     private var policyInstalled = false
     private var didSignalRoutingFailure = false
     private var didReleaseGate = false
+    // Lease-local terminal memory survives teardown of the process-global waiter state. Because a
+    // lease is permanently scoped to one immutable run and releaseRouting is one-shot, this cache
+    // cannot confer routing authority on a successor run.
+    private var routingTerminalOutcome: MCPRoutingWaitOutcome?
     // Memoized in-flight cleanup operations backing the joinable clear/teardown (see clearPolicyOnce()).
     private var policyClearOperation: Task<Void, Never>?
     private var routingCleanupOperation: Task<Void, Never>?
@@ -399,7 +403,10 @@ actor MCPBootstrapLease {
 
     /// Returns a routing terminal signal that may have arrived before the waiter task enrolled.
     func currentRoutingTerminalOutcome() async -> MCPRoutingWaitOutcome? {
-        await MCPRoutingWaiter.currentTerminalOutcome(runID: spec.runID)
+        if let routingTerminalOutcome {
+            return routingTerminalOutcome
+        }
+        return await MCPRoutingWaiter.currentTerminalOutcome(runID: spec.runID)
     }
 
     /// Resolves a provider-boundary race through the same route authority used by bounded waits.
@@ -484,6 +491,10 @@ actor MCPBootstrapLease {
         case .routed, .failed, .cancelled:
             break
         }
+
+        // Publish the finalized result to this run's lease before any awaited diagnostics or
+        // cleanup can erase MCPRoutingWaiter's process-global terminal state.
+        routingTerminalOutcome = outcome
 
         if ownedGateBeforeWait || releaseResult.gateRelease.released {
             let gateReleaseReason = switch outcome {
