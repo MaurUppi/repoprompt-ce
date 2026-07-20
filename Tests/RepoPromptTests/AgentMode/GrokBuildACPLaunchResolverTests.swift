@@ -34,6 +34,20 @@ final class GrokBuildACPLaunchResolverTests: XCTestCase {
         XCTAssertEqual(launch.arguments, ["agent", "stdio"])
     }
 
+    func testLaunchArgumentsStripEffortSuffixFromModel() throws {
+        let grokPath = (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin/grok")
+        guard FileManager.default.isExecutableFile(atPath: grokPath) else {
+            throw XCTSkip("local grok executable not present at \(grokPath)")
+        }
+        let resolver = GrokBuildACPLaunchResolver(environmentProvider: { _ in
+            ["PATH": "/usr/bin:/bin", "HOME": NSHomeDirectory()]
+        })
+        let launch = try resolver.resolvedLaunch(
+            for: GrokBuildAgentConfig(commandName: grokPath, modelString: "grok-4.5:low")
+        )
+        XCTAssertEqual(launch.arguments, ["agent", "-m", "grok-4.5", "stdio"])
+    }
+
     func testProbeSupportAcceptsStdioHelpWithoutLiteralACPToken() async throws {
         let grokPath = (NSHomeDirectory() as NSString).appendingPathComponent(".local/bin/grok")
         guard FileManager.default.isExecutableFile(atPath: grokPath) else {

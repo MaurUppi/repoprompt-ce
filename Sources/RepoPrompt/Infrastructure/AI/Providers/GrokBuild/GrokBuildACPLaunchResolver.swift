@@ -37,10 +37,17 @@ final class GrokBuildACPLaunchResolver: @unchecked Sendable {
 
     private static func launchArguments(modelString: String?) -> [String] {
         let trimmed = modelString?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !trimmed.isEmpty {
-            return ["agent", "-m", trimmed, "stdio"]
+        guard !trimmed.isEmpty else {
+            return ["agent", "stdio"]
         }
-        return ["agent", "stdio"]
+        // Launch `-m` accepts base model ids only; effort is applied via session/set_mode.
+        let modelID = GrokBuildModelSpecifier(raw: trimmed).runtimeModelID ?? trimmed
+        guard !modelID.isEmpty,
+              modelID.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
+        else {
+            return ["agent", "stdio"]
+        }
+        return ["agent", "-m", modelID, "stdio"]
     }
 
     private let environmentProvider: EnvironmentProvider

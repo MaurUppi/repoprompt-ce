@@ -1,8 +1,8 @@
 # Phase 2 — Headless + discovery + deferred product surfaces
 
-**Status:** Planned
+**Status:** PARTIAL — implemented C + headless polling + D root-cause; A/B documented non-goal
 **Parent:** [Planning.md](./Planning.md)
-**Depends on:** [Phase1.md](./Phase1.md) **COMPLETE** (core Connect + Agent Mode ACP + catalog min)
+**Depends on:** [Phase1.md](./Phase1.md) **COMPLETE**
 
 ---
 
@@ -12,121 +12,109 @@ Close Phase 1 residuals and reach **Cursor-like parity** beyond the Agent Mode M
 
 1. Headless / discovery / polling lifecycle
 2. Product surfaces Phase 1 intentionally skipped (Oracle, Model Presets, reasoning effort UI)
-3. Live RepoPromptCE MCP tool exposure inside Grok ACP sessions
+3. Live RepoPromptCE MCP tool exposure inside a Grok ACP sessions
 
 ---
 
-## Inherited from Phase 1 (not implemented there)
+## Implementation status (2026-07-20)
 
-These were verified or documented as **out of Phase 1 scope** during live UI review (2026-07-20). Phase 2 owns them.
-
-### A. Oracle Model surface
-
-| Observation | Phase 1 stance |
+| Area | Status |
 | --- | --- |
-| Oracle Model picker lists Claude Code / Codex CLI only — **no Grok Build** | **Expected** Phase 1 non-goal |
-
-**Phase 2 work:**
-
-- Decide product policy: should `ask_oracle` / `oracle_send` / plan-review / Context Builder **analysis** run on Grok Build ACP (or headless)?
-- If yes: extend chat/`AIModel` catalog (today has `openCodeCustom` / `cursorCustom`, no Grok Build case) and Oracle routing so Grok appears in the Oracle Model menu when connected.
-- If no: keep non-goal and document permanently in user-facing docs (move to Phase 3 docs only).
-
-### B. Model Presets (Oracle Model Presets)
-
-| Observation | Phase 1 stance |
-| --- | --- |
-| Edit Model Preset → Model lists Claude Code / Codex CLI only — **no Grok** | **Expected** (same `AIModel` / `availableModels` path as Oracle) |
-
-**Phase 2 work:**
-
-- Same catalog/routing as Oracle once policy is yes.
-- Ensure presets round-trip stable raw ids (`grokBuild` + `grok-4.5` [+ effort if shipped]).
-- MCP “Use Oracle Model Presets” path must resolve Grok without collapsing to Claude/Codex.
-
-### C. Reasoning effort UI (Low / Medium / High)
-
-| Observation | Phase 1 stance |
-| --- | --- |
-| Context Builder (and Agent catalog) shows **Grok Build → Grok 4.5** only; **no** Low/Medium/High submenu | **Expected** Phase 1 minimum catalog (`AgentModel.grokBuildDefault` only) |
-
-**Phase 0 evidence:** session model list + reasoning efforts `high` / `medium` / `low` in `_meta`; persist base raw **`grok-4.5`** for users.
-
-**Phase 2 work:**
-
-- Expand `AgentModelCatalog.options(for: .grokBuild)` (and menu builders) from discovered `_meta` efforts — Codex/Claude-style nested or flattened options.
-- Encode/decode stable selection raw values (base model + effort) for Agent Mode, Context Builder, and role defaults.
-- Wire ACP session model / mode config so selected effort is applied (not display-only).
-- Agent Models picker and Context Builder Agent should show the same effort set when connected.
-
-### D. Live RepoPromptCE MCP tools in Grok ACP session
-
-| Observation | Phase 1 stance |
-| --- | --- |
-| Session inject code present (`includeRepoPromptMCPServer: true`, CE `acpJSONObject`) | **Done (code)** |
-| Live agent turn saw Grok-user MCP (e.g. `tasks`) but **not** RepoPromptCE tools | Residual, non-blocking for Phase 1 MVP |
-
-**Phase 2 work:**
-
-- Confirm handshake under **stable signed** debug CLI install (not only ad-hoc + manual symlink).
-- Diagnose spawn/handshake (empty `~/.grok/logs/mcp/RepoPromptCE.stderr.log`, tools not listed).
-- Prove one read-only CE MCP tool call from a Grok Build Agent Mode session (e.g. `windows` / `tree`).
-- Document any Grok-side limits vs Cursor MCP inject.
-
-### E. UI smoke (non-ad-hoc)
-
-- Agent Models picker smoke after **Apple Development** (or other persistent) signing relaunch — MCP already proved selection; UI smoke still useful for release confidence.
+| **C** Reasoning effort UI + ACP apply | **Done** |
+| Headless + model polling wiring | **Done** (Agent Mode + Context Builder subscribe; headless provider applies effort) |
+| **D** Live RepoPromptCE MCP | **Root-caused**; inject shape OK; socket connection is the live gate |
+| **A/B** Oracle + Model Presets | **Documented non-goal** for this phase (see below) |
+| **E** Non-ad-hoc UI smoke | Optional; no Apple Development identity on this machine |
 
 ---
 
-## Scope (original Phase 2 + above)
+## C — Reasoning effort (done)
 
-### Headless + discovery
+**Grok protocol facts:**
 
-- `GrokBuildACPHeadlessAgentProvider` and/or `grok -p` + `--output-format streaming-json` (Phase 0 H1/H2).
-- Model polling lifecycle in `WindowStateManager` (start/stop with connection).
-- Context Builder / Prompt availability refresh keys (`GrokBuildCLIConnected`, etc.).
-- Prompt/`AIModel` availability refresh when Grok connects/disconnects (shared with Oracle/Presets if those ship).
-- Headless tool filtering / yolo policy as needed for CE safety.
+- Base model: `grok-4.5` via legacy `models` / `session/set_model`
+- Effort: `high` / `medium` / `low` via `session/set_mode` (not `session/set_config_option`)
+- Grok does **not** advertise modern ACP `configOptions`
 
-### Catalog parity
+**CE changes:**
 
-- Richer catalog menus; **effort levels** from session model `_meta` (see **C** above).
-- Keep default user-facing model raw **`grok-4.5`**.
+- `GrokBuildModelSpecifier` + `GrokBuildReasoningEffort`
+- Catalog expands to `grok-4.5:high|medium|low` (display **Grok 4.5 High/Medium/Low**)
+- Bare `grok-4.5` remains valid (default effort **high**)
+- `ACPAgentSessionController`: Grok paths for `session/set_model` + `session/set_mode`; parse legacy models + `_meta.reasoningEfforts`
+- `ACPIntegratedAgentModeRunner` + headless provider apply base model + effort
+- Launch `-m` strips effort suffix
 
-### Deferred product surfaces (from Phase 1 review)
-
-- Oracle Model + Model Presets (**A**, **B**) if product accepts Grok as oracle backend.
-- Live MCP tool proof (**D**).
+**Tests:** `GrokBuildModelSpecifierTests`, launch-resolver strip-effort case
 
 ---
 
-## Non-goals
+## Headless + polling (done)
 
-- Recommendation ranking / onboarding wizard polish (→ Phase 3)
-- Extracting a SwiftPM provider package (→ Phase 3 optional)
-- Changing HTTP `GrokProvider` (xAI API keys) or conflating it with Grok Build CLI
-- `x.ai/*` ACP extensions unless required for effort/MCP
-- Claude plugin package shape
+- `AgentModeViewModel` / `ContextBuilderAgentViewModel`: Grok Build model polling subscribe/stop (Cursor parity)
+- Existing `GrokBuildACPHeadlessAgentProvider` + `GrokBuildACPModelPollingService` (Connect path) retained
+- Window shutdown already stops `GrokBuildACPModelPollingService.shared`
+
+---
+
+## D — Live RepoPromptCE MCP (root cause)
+
+**Inject shape:** OK (session `mcpServers` CE `acpJSONObject`; Grok accepts it).
+
+**Live failure:** when Grok spawns RepoPromptCE, CLI logs:
+
+```text
+Bootstrap connection lost (... SocketProxyError.connectionRefused)
+```
+
+RepoPromptCE MCP is a **socket client** into the running CE app. If the app MCP bootstrap socket is not accepting (app not running, wrong identity path, ad-hoc timing), tools never register. Grok’s user-local MCPs (`tasks`, `context-mode`, …) still appear.
+
+**Not a blocker for missing Apple Developer Program** — ad-hoc is fine; the gate is **live app MCP socket readiness**, not signing.
+
+**Phase 2 residual (follow-up):** when CE app is running with MCP listening, prove one tool call from a Grok Agent Mode turn; optionally improve spawn diagnostics / wait-for-socket.
+
+---
+
+## A/B — Oracle Model + Model Presets (non-goal for Phase 2)
+
+**Product decision:** keep Oracle / Model Presets on the **chat `AIModel` / `AIProviderType`** path (Claude Code, Codex CLI, Cursor CLI, OpenCode, HTTP providers).
+
+Grok Build remains:
+
+- Agent Mode CLI agent
+- Context Builder **Agent** (discovery)
+- **Not** Oracle analysis / Model Preset backend
+
+Rationale: Oracle needs a full `AIProviderType` + `*CLIProvider` (see Cursor/OpenCode), ~many exhaustive switches, separate from ACP Agent Mode. Phase 3 may revisit if product wants Grok as Oracle.
+
+---
+
+## Non-goals (unchanged)
+
+- Recommendation ranking / onboarding polish (→ Phase 3)
+- SwiftPM provider package extract
+- Changing HTTP `GrokProvider`
+- Full `x.ai/*` extension surface beyond effort/mode/model needed for catalog
 
 ---
 
 ## Exit criteria
 
-- [ ] Headless path used by CE discovery/delegate (or explicit deferral documented).
-- [ ] Model polling stable; no thrash on connect/disconnect.
-- [ ] Reasoning effort options available in Agent Models + Context Builder when Grok reports them.
-- [ ] Oracle Model + Model Presets either list Grok when connected **or** documented permanent non-goal with user-facing note.
-- [ ] Live RepoPromptCE MCP tool callable from a Grok Build Agent Mode session (or root-caused + filed follow-up).
-- [ ] Prompt/Context Builder treat Grok Build like Cursor when connected (availability + menus).
-- [ ] Tests + contribution preflight commits.
+- [x] Headless path present (`GrokBuildACPHeadlessAgentProvider`); polling wired in Agent Mode + Context Builder
+- [x] Model polling lifecycle start/stop with selection + window close
+- [x] Reasoning effort options in catalog (High/Medium/Low) when Grok Build available
+- [x] Oracle + Model Presets: **documented permanent Phase 2 non-goal** (Agent Mode / CB agent only)
+- [~] Live RepoPromptCE MCP: inject OK; socket connection residual
+- [x] Context Builder can select Grok + effort options via same catalog
+- [x] Focused tests + commits
 
 ---
 
-## Suggested implementation order
+## Key files
 
-1. **C** Reasoning effort catalog + ACP apply (high user-visible value; reuses Phase 0 `_meta`).
-2. **D** Live MCP handshake proof (unblocks “full Cursor-parity” claim).
-3. Headless + polling lifecycle.
-4. **A/B** Oracle + Model Presets (product decision gate first).
-5. UI smoke under persistent signing.
+- `Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildModelSpecifier.swift`
+- `Sources/RepoPrompt/Infrastructure/AI/ACP/ACPAgentSessionController.swift`
+- `Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentModelCatalog.swift`
+- `Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel.swift`
+- `Sources/RepoPrompt/Features/ContextBuilder/ViewModels/ContextBuilderAgentViewModel.swift`
+- `Tests/RepoPromptTests/AgentMode/GrokBuildModelSpecifierTests.swift`

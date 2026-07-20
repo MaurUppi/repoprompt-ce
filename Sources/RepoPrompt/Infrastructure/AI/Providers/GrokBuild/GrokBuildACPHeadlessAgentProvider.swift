@@ -48,7 +48,12 @@ final class GrokBuildACPHeadlessAgentProvider: HeadlessAgentProvider {
             makeController: controllerFactory,
             beforePrompt: { controller, _ in
                 if let model = Self.selectedModelToApply(config: config) {
-                    try await controller.setSessionModel(model)
+                    let specifier = GrokBuildModelSpecifier(raw: model)
+                    let base = specifier.runtimeModelID ?? model
+                    try await controller.setSessionModel(base)
+                    if let modeID = specifier.sessionModeIDToApply {
+                        try await controller.setSessionMode(modeID)
+                    }
                 }
             },
             approvalPolicy: .declineUnsupported

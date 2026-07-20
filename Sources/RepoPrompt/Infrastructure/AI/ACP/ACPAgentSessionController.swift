@@ -655,7 +655,9 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .openCode, .cursor, .grokBuild:
+        case .grokBuild:
+            try await setGrokBuildSessionModel(model, sessionID: sessionID)
+        case .openCode, .cursor:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
             }
@@ -694,6 +696,34 @@ actor ACPAgentSessionController {
         }
     }
 
+    /// Grok Build uses `session/set_model` (not modern configOptions) for base model ids.
+    private func setGrokBuildSessionModel(_ selectedRaw: String, sessionID: String) async throws {
+        let specifier = GrokBuildModelSpecifier(raw: selectedRaw)
+        let modelID = specifier.runtimeModelID
+            ?? (selectedRaw.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
+                ? AgentModel.grokBuildDefault.rawValue
+                : selectedRaw)
+        let trimmedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModelID.isEmpty else { return }
+        if discoveredSessionModels?.currentModelRaw?.caseInsensitiveCompare(trimmedModelID) == .orderedSame {
+            return
+        }
+        log("Applying Grok Build session/set_model modelId=\(trimmedModelID)")
+        _ = try await sendRequestResponse(
+            method: "session/set_model",
+            params: [
+                "sessionId": sessionID,
+                "modelId": trimmedModelID
+            ]
+        )
+        if let snapshot = discoveredSessionModels {
+            discoveredSessionModels = ACPDiscoveredSessionModels(
+                options: snapshot.options,
+                currentModelRaw: trimmedModelID
+            )
+        }
+    }
+
     func setSessionMode(_ modeID: String) async throws {
         try await configurationMutationMutex.withLock { [weak self] in
             guard let self else { throw CancellationError() }
@@ -710,6 +740,14 @@ actor ACPAgentSessionController {
         guard state == .sessionOpen || state == .promptRunning else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
         }
+
+        // Grok Build: effort is a session mode (high/medium/low) via session/set_mode.
+        // It does not advertise modern configOptions mode selectors.
+        if provider.providerID == .grokBuild {
+            try await setGrokBuildSessionMode(trimmedModeID, sessionID: sessionID)
+            return
+        }
+
         guard let snapshot = sessionModeSnapshot else {
             if let sessionModeFailureReason {
                 throw ControllerError.protocolViolation("malformed modern session mode config option: \(sessionModeFailureReason)")
@@ -737,6 +775,31 @@ actor ACPAgentSessionController {
             requiredModeValue: canonicalModeID,
             requiredModelValue: nil
         )
+    }
+
+    private func setGrokBuildSessionMode(_ modeID: String, sessionID: String) async throws {
+        // Accept bare effort ids (low) or compound model raw values (grok-4.5:low).
+        let effort = GrokBuildReasoningEffort.parse(modeID) ?? GrokBuildModelSpecifier(raw: modeID).effort
+        let modeToApply = effort?.sessionModeID ?? modeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !modeToApply.isEmpty else { return }
+        if modeToApply.caseInsensitiveCompare("default") == .orderedSame {
+            return
+        }
+        log("Applying Grok Build session/set_mode modeId=\(modeToApply)")
+        _ = try await sendRequestResponse(
+            method: "session/set_mode",
+            params: [
+                "sessionId": sessionID,
+                "modeId": modeToApply
+            ]
+        )
+        if let snapshot = sessionModeSnapshot {
+            sessionModeSnapshot = SessionModeSnapshot(
+                configID: snapshot.configID,
+                currentValue: modeToApply,
+                availableValues: snapshot.availableValues
+            )
+        }
     }
 
     func respondToPermissionRequest(
@@ -2280,20 +2343,98 @@ actor ACPAgentSessionController {
         case .absent:
             sessionModelConfigOptionID = nil
             sessionModelFailureReason = nil
-            parsed = nil
-            if response["models"] != nil {
-                diagnose(.info("Ignoring legacy ACP models metadata because model discovery and selection require configOptions."))
+            // Grok Build advertises models via legacy `models` + `_meta.reasoningEfforts`, not configOptions.
+            if provider.providerID == .grokBuild,
+               let grokModels = parseGrokBuildLegacyModels(from: response)
+            {
+                parsed = grokModels
+                diagnose(.info("Using Grok Build legacy models metadata for discovery (configOptions absent)."))
+            } else {
+                parsed = nil
+                if response["models"] != nil {
+                    diagnose(.info("Ignoring legacy ACP models metadata because model discovery and selection require configOptions."))
+                }
             }
         case let .malformed(reason):
             sessionModelConfigOptionID = nil
             sessionModelFailureReason = reason
-            parsed = nil
-            diagnose(.info("ACP session advertised a malformed modern model config option; legacy fallback is disabled: \(reason)"))
+            if provider.providerID == .grokBuild,
+               let grokModels = parseGrokBuildLegacyModels(from: response)
+            {
+                parsed = grokModels
+                diagnose(.info("Falling back to Grok Build legacy models after malformed configOptions: \(reason)"))
+            } else {
+                parsed = nil
+                diagnose(.info("ACP session advertised a malformed modern model config option; legacy fallback is disabled: \(reason)"))
+            }
         }
 
         discoveredSessionModels = parsed
         guard let parsed else { return }
         _ = AgentACPModelRegistry.shared.updateDiscoveredModels(parsed, for: provider.providerID)
+    }
+
+    /// Parse Grok Build `session/new` models.availableModels (+ reasoning efforts in `_meta`).
+    private func parseGrokBuildLegacyModels(from response: [String: Any]) -> ACPDiscoveredSessionModels? {
+        guard let modelsObject = response["models"] as? [String: Any] else { return nil }
+        let available = modelsObject["availableModels"] as? [[String: Any]] ?? []
+        var options: [AgentModelOption] = []
+        for entry in available {
+            guard let modelID = normalizedACPModelString(
+                (entry["modelId"] as? String) ?? (entry["id"] as? String) ?? (entry["value"] as? String)
+            ) else { continue }
+            let name = normalizedACPModelString(
+                (entry["name"] as? String) ?? (entry["displayName"] as? String)
+            ) ?? modelID
+            let description = normalizedACPModelString(entry["description"] as? String)
+            let meta = entry["_meta"] as? [String: Any]
+            var efforts: [CodexReasoningEffort] = []
+            if let rawEfforts = meta?["reasoningEfforts"] as? [[String: Any]] {
+                for effortEntry in rawEfforts {
+                    let raw = (effortEntry["value"] as? String)
+                        ?? (effortEntry["id"] as? String)
+                        ?? (effortEntry["label"] as? String)
+                    if let effort = CodexReasoningEffort.parse(raw),
+                       GrokBuildReasoningEffort.parse(effort.rawValue) != nil
+                    {
+                        efforts.append(effort)
+                    }
+                }
+            }
+            if efforts.isEmpty {
+                efforts = GrokBuildReasoningEffort.displayOrder.compactMap { CodexReasoningEffort(rawValue: $0.rawValue) }
+            }
+            let defaultEffortRaw = (meta?["reasoningEffort"] as? String)
+                ?? rawEffortsDefault(from: meta?["reasoningEfforts"] as? [[String: Any]])
+            let defaultEffort = CodexReasoningEffort.parse(defaultEffortRaw)
+            options.append(
+                AgentModelOption(
+                    rawValue: modelID,
+                    displayName: name,
+                    description: description,
+                    isPlaceholderDefault: false,
+                    isProviderDefault: modelID.caseInsensitiveCompare(AgentModel.grokBuildDefault.rawValue) == .orderedSame,
+                    supportedReasoningEfforts: efforts,
+                    defaultReasoningEffort: defaultEffort
+                )
+            )
+        }
+        guard !options.isEmpty else { return nil }
+        let current = normalizedACPModelString(modelsObject["currentModelId"] as? String)
+            ?? options.first(where: \.isProviderDefault)?.rawValue
+            ?? options.first?.rawValue
+        guard let current else { return nil }
+        return ACPDiscoveredSessionModels(options: options, currentModelRaw: current)
+    }
+
+    private func rawEffortsDefault(from entries: [[String: Any]]?) -> String? {
+        guard let entries else { return nil }
+        for entry in entries {
+            if entry["default"] as? Bool == true {
+                return (entry["value"] as? String) ?? (entry["id"] as? String)
+            }
+        }
+        return nil
     }
 
     private func parseModernModelSnapshot(from response: [String: Any]) -> ParsedModernModelSnapshot {

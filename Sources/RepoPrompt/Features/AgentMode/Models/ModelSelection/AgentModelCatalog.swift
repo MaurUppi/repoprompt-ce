@@ -353,6 +353,9 @@ enum AgentModelCatalog {
             }
             return fallbacks
         }
+        if agentKind == .grokBuild {
+            return grokBuildOptions(availability: availability)
+        }
         if let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
            !discoveredOptions.isEmpty
         {
@@ -378,6 +381,71 @@ enum AgentModelCatalog {
         }
     }
 
+    /// Grok Build model menu: base `grok-4.5` expanded into High / Medium / Low effort options.
+    private static func grokBuildOptions(
+        availability: AvailabilityContext
+    ) -> [AgentModelOption] {
+        guard isAgentAvailable(.grokBuild, availability: availability) else { return [] }
+
+        let baseOptions: [AgentModelOption]
+        if let discovered = resolvedACPDiscoveredModels(for: .grokBuild)?.options, !discovered.isEmpty {
+            baseOptions = discovered
+        } else {
+            baseOptions = AgentModel.modelsForAgent(.grokBuild)
+                .filter { isAvailable($0, for: .grokBuild, availability: availability) }
+                .map { staticOption($0, for: .grokBuild) }
+        }
+
+        var expanded: [AgentModelOption] = []
+        var seen = Set<String>()
+        for base in baseOptions {
+            let specifier = GrokBuildModelSpecifier(raw: base.rawValue)
+            let baseModelRaw = specifier.runtimeModelID
+                ?? base.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !baseModelRaw.isEmpty else { continue }
+
+            let efforts: [GrokBuildReasoningEffort]
+            if !base.supportedReasoningEfforts.isEmpty {
+                efforts = GrokBuildReasoningEffort.displayOrder.filter { effort in
+                    base.supportedReasoningEfforts.contains { codex in
+                        codex.rawValue.caseInsensitiveCompare(effort.rawValue) == .orderedSame
+                    }
+                }
+            } else if let single = specifier.effort {
+                efforts = [single]
+            } else {
+                efforts = GrokBuildReasoningEffort.displayOrder
+            }
+            let resolvedEfforts = efforts.isEmpty ? GrokBuildReasoningEffort.displayOrder : efforts
+
+            let baseDisplay = base.displayName
+                .replacingOccurrences(of: " High", with: "")
+                .replacingOccurrences(of: " Medium", with: "")
+                .replacingOccurrences(of: " Low", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayRoot = baseDisplay.isEmpty ? baseModelRaw : baseDisplay
+
+            for effort in resolvedEfforts {
+                let raw = GrokBuildModelSpecifier.encodedRaw(baseModelRaw: baseModelRaw, effort: effort)
+                let key = raw.lowercased()
+                guard seen.insert(key).inserted else { continue }
+                expanded.append(
+                    AgentModelOption(
+                        rawValue: raw,
+                        displayName: "\(displayRoot) \(effort.displayName)",
+                        description: base.description ?? "Grok Build · \(effort.displayName) effort",
+                        isPlaceholderDefault: false,
+                        isProviderDefault: effort == .defaultEffort
+                            && baseModelRaw.caseInsensitiveCompare(AgentModel.grokBuildDefault.rawValue) == .orderedSame,
+                        supportedReasoningEfforts: [],
+                        defaultReasoningEffort: nil
+                    )
+                )
+            }
+        }
+        return expanded
+    }
+
     static func isValid(
         rawModel: String,
         for agentKind: AgentProviderKind,
@@ -397,6 +465,22 @@ enum AgentModelCatalog {
            normalized.caseInsensitiveCompare(AgentModel.cursorComposer2.rawValue) == .orderedSame
         {
             return true
+        }
+        if agentKind == .grokBuild {
+            let specifier = GrokBuildModelSpecifier(raw: normalized)
+            let base = specifier.runtimeModelID ?? normalized
+            if base.caseInsensitiveCompare(AgentModel.grokBuildDefault.rawValue) == .orderedSame {
+                return true
+            }
+            if let discoveredModels = resolvedACPDiscoveredModels(for: .grokBuild) {
+                if discoveredModels.contains(rawModel: base) || discoveredModels.contains(rawModel: normalized) {
+                    return true
+                }
+            }
+            return options(for: .grokBuild, availability: availability).contains {
+                $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame
+                    || $0.rawValue.caseInsensitiveCompare(base) == .orderedSame
+            }
         }
         if let discoveredModels = resolvedACPDiscoveredModels(for: agentKind) {
             if agentKind == .cursor {
@@ -455,6 +539,14 @@ enum AgentModelCatalog {
             return raw
         }
 
+        if agentKind == .grokBuild {
+            let specifier = GrokBuildModelSpecifier(raw: effectiveRaw)
+            let baseRaw = specifier.runtimeModelID ?? AgentModel.grokBuildDefault.rawValue
+            let baseName = baseDisplayName(for: baseRaw)
+            guard includeEffortSuffix else { return baseName }
+            let effort = specifier.effort ?? GrokBuildReasoningEffort.defaultEffort
+            return "\(baseName) \(effort.displayName)"
+        }
         if agentKind.usesClaudeTooling {
             let specifier = ClaudeModelSpecifier(raw: effectiveRaw)
             let baseRaw = specifier.baseModel ?? AgentModel.defaultModel.rawValue

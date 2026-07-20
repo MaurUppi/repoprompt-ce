@@ -815,7 +815,10 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         runID: UUID
     ) async throws {
-        guard runRequest.agentKind == .openCode || runRequest.agentKind == .cursor else { return }
+        guard runRequest.agentKind == .openCode
+            || runRequest.agentKind == .cursor
+            || runRequest.agentKind == .grokBuild
+        else { return }
         guard let model = runRequest.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
               !model.isEmpty,
               model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
@@ -826,6 +829,16 @@ final class ACPIntegratedAgentModeRunner {
            model.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) != .orderedSame,
            AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.contains(rawModel: model) != true
         {
+            return
+        }
+        if runRequest.agentKind == .grokBuild {
+            let specifier = GrokBuildModelSpecifier(raw: model)
+            let baseModel = specifier.runtimeModelID ?? AgentModel.grokBuildDefault.rawValue
+            log("applying Grok Build selected model=\(baseModel) effort=\(specifier.sessionModeIDToApply ?? "default")", runID: runID)
+            try await controller.setSessionModel(baseModel)
+            if let modeID = specifier.sessionModeIDToApply {
+                try await controller.setSessionMode(modeID)
+            }
             return
         }
         log("applying \(runRequest.agentKind.displayName) selected model=\(model)", runID: runID)
