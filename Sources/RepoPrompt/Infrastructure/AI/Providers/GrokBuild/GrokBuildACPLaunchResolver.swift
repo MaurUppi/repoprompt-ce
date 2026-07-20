@@ -124,8 +124,17 @@ final class GrokBuildACPLaunchResolver: @unchecked Sendable {
 
             let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
             let stderr = String(data: result.stderr, encoding: .utf8) ?? ""
-            guard "\(stdout)\n\(stderr)".localizedCaseInsensitiveContains("acp") else {
-                return .unsupported(reason: "Installed Grok Build CLI does not advertise ACP support.")
+            // Grok advertises the ACP transport as `agent stdio`, not the literal token "acp"
+            // (unlike OpenCode/Cursor `acp --help`). Accept stdio / ACP / protocol wording.
+            let combined = "\(stdout)\n\(stderr)".lowercased()
+            let advertisesStdioACP =
+                combined.contains("stdio")
+                    || combined.contains("agent client protocol")
+                    || combined.range(of: #"\bacp\b"#, options: .regularExpression) != nil
+            guard advertisesStdioACP else {
+                return .unsupported(
+                    reason: "Installed Grok Build CLI does not advertise agent stdio ACP support. Update Grok Build and ensure `grok agent stdio --help` works."
+                )
             }
 
             try launch.executableIdentity.validateForTrustedPathLaunch(atPath: launch.command)
