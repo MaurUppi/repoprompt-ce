@@ -59,6 +59,100 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         XCTAssertEqual(snapshot.agentOutput, "done")
     }
 
+    func testRouteSettlementCoordinatorClaimsFirstSettlement() async {
+        let routeFirst = ContextBuilderRouteSettlementCoordinator(
+            maxBufferedTextCharacters: 5,
+            maxBufferedEventCount: 5
+        )
+        XCTAssertTrue(routeFirst.settle(.routed))
+        XCTAssertFalse(routeFirst.settle(.failedWithoutRoute("provider failed")))
+        let routeFirstSettlement = await routeFirst.waitForSettlement()
+        XCTAssertEqual(routeFirstSettlement, .routed)
+
+        let terminalFirst = ContextBuilderRouteSettlementCoordinator(
+            maxBufferedTextCharacters: 5,
+            maxBufferedEventCount: 5
+        )
+        XCTAssertTrue(terminalFirst.settle(.failedWithoutRoute("provider failed")))
+        XCTAssertFalse(terminalFirst.settle(.routed))
+        let terminalFirstSettlement = await terminalFirst.waitForSettlement()
+        XCTAssertEqual(terminalFirstSettlement, .failedWithoutRoute("provider failed"))
+    }
+
+    func testRouteSettlementCoordinatorBoundsBufferedPayloadsAndEvents() {
+        let payloadBounded = ContextBuilderRouteSettlementCoordinator(
+            maxBufferedTextCharacters: 28,
+            maxBufferedEventCount: 10
+        )
+        payloadBounded.appendWhilePending(AIStreamResult(type: "content", text: "1234"))
+        payloadBounded.appendWhilePending(AIStreamResult(type: "lifecycle", text: "retrying"))
+        payloadBounded.appendWhilePending(AIStreamResult(type: "content", text: "6789"))
+        let payloadResult = payloadBounded.drainBufferedEvents()
+        XCTAssertEqual(payloadResult.events.map(\.type), ["lifecycle", "content"])
+        XCTAssertEqual(payloadResult.events.map(\.text), ["retrying", "6789"])
+        XCTAssertEqual(payloadResult.droppedTextCharacterCount, 11)
+        XCTAssertEqual(payloadResult.droppedNonterminalEventCount, 1)
+
+        let redundantProgressBounded = ContextBuilderRouteSettlementCoordinator(
+            maxBufferedTextCharacters: 100,
+            maxBufferedEventCount: 3
+        )
+        for index in 0 ..< 20 {
+            redundantProgressBounded.appendWhilePending(
+                AIStreamResult(type: "lifecycle", text: "retry-\(index)")
+            )
+            redundantProgressBounded.appendWhilePending(AIStreamResult(type: "content", text: ""))
+        }
+        redundantProgressBounded.appendWhilePending(AIStreamResult(type: "tool_call", text: "call"))
+        redundantProgressBounded.appendWhilePending(AIStreamResult(type: "error", text: "provider warning"))
+        redundantProgressBounded.appendWhilePending(AIStreamResult(type: "tool_result", text: "result"))
+        let redundantProgressResult = redundantProgressBounded.drainBufferedEvents()
+        XCTAssertEqual(redundantProgressResult.events.map(\.type), ["tool_call", "error", "tool_result"])
+        XCTAssertEqual(redundantProgressResult.droppedNonterminalEventCount, 40)
+
+        let protectedEventBounded = ContextBuilderRouteSettlementCoordinator(
+            maxBufferedTextCharacters: 1000,
+            maxBufferedEventCount: 3
+        )
+        let protectedEvents = [
+            AIStreamResult(type: "tool_call", text: "call-0"),
+            AIStreamResult(type: "error", text: "warning-1"),
+            AIStreamResult(type: "tool_result", text: "result-2"),
+            AIStreamResult(type: "tool_call", text: "call-3"),
+            AIStreamResult(type: "error", text: "warning-4")
+        ]
+        for event in protectedEvents {
+            protectedEventBounded.appendWhilePending(event)
+        }
+        let protectedEventResult = protectedEventBounded.drainBufferedEvents()
+        XCTAssertEqual(protectedEventResult.events.map(\.text), ["result-2", "call-3", "warning-4"])
+        XCTAssertEqual(protectedEventResult.droppedNonterminalEventCount, 2)
+        XCTAssertEqual(protectedEventResult.droppedTextCharacterCount, 29)
+
+        let oversizedPayloadBounded = ContextBuilderRouteSettlementCoordinator(
+            maxBufferedTextCharacters: 8,
+            maxBufferedEventCount: 3
+        )
+        oversizedPayloadBounded.appendWhilePending(
+            AIStreamResult(type: "tool_call", text: nil, toolArgs: String(repeating: "x", count: 20))
+        )
+        let oversizedPayloadResult = oversizedPayloadBounded.drainBufferedEvents()
+        XCTAssertTrue(oversizedPayloadResult.events.isEmpty)
+        XCTAssertEqual(oversizedPayloadResult.droppedTextCharacterCount, 29)
+        XCTAssertEqual(oversizedPayloadResult.droppedNonterminalEventCount, 1)
+
+        let oversizedType = String(repeating: "t", count: 20)
+        let zeroLimitTypeBounded = ContextBuilderRouteSettlementCoordinator(
+            maxBufferedTextCharacters: 0,
+            maxBufferedEventCount: 3
+        )
+        zeroLimitTypeBounded.appendWhilePending(AIStreamResult(type: oversizedType, text: nil))
+        let zeroLimitTypeResult = zeroLimitTypeBounded.drainBufferedEvents()
+        XCTAssertTrue(zeroLimitTypeResult.events.isEmpty)
+        XCTAssertEqual(zeroLimitTypeResult.droppedTextCharacterCount, oversizedType.count)
+        XCTAssertEqual(zeroLimitTypeResult.droppedNonterminalEventCount, 1)
+    }
+
     func testCancellationDuringFinalCommitDefersUntilSafeBoundary() {
         let tabID = UUID()
         let session = ContextBuilderAgentViewModel.TabSession(tabID: tabID)
@@ -594,7 +688,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
 
             // Begin finalization while the connection is live, then complete a non-orderly
             // teardown after every accepted request has a delivered response. The failed live
-            // drain is accepted only from the retained close-time delivery snapshot.
+            // drain is accepted from the final delivery snapshot taken after awaited cleanup.
             let transitioningConnectionID = UUID()
             let transitioningRunID = UUID()
             let transitioningPrompt = "context detached during response drain"
@@ -612,7 +706,10 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             transitioningContext.promptText = transitioningPrompt
             window.mcpServer.tabContextByConnectionID[transitioningConnectionID] = transitioningContext
 
-            let transitioningConnection = ContextBuilderCleanupTestConnection(pendingRequestCount: 0)
+            let transitioningConnection = ContextBuilderCleanupTestConnection(
+                pendingRequestCount: 1,
+                subsequentPendingRequestCount: 0
+            )
             await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
                 connectionID: transitioningConnectionID,
                 connection: transitioningConnection,
@@ -1261,6 +1358,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         let firstTeardownCompleted = expectation(description: "first run teardown completed")
         let successorStreamStarted = expectation(description: "successor provider stream started")
         let successorEventAccepted = expectation(description: "successor provider event accepted")
+        let successorRouteSettled = expectation(description: "successor route settled and replay completed")
         let lateEventParked = expectation(description: "late provider event parked before processing")
         let lateEventRejected = expectation(description: "late provider event rejected")
         let firstProvider = ControllableLifecycleTestProvider(
@@ -1418,7 +1516,11 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 do {
                     _ = try await viewModel.runContextBuilderForMCP(
                         tabID: tabID,
-                        mcpControlToken: successorToken
+                        mcpControlToken: successorToken,
+                        progressReporter: { phase in
+                            guard phase == .providerStreamActive else { return }
+                            successorRouteSettled.fulfill()
+                        }
                     )
                     wasCancelled = false
                 } catch is CancellationError {
@@ -1431,7 +1533,10 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 return wasCancelled
             }
 
-            await fulfillment(of: [successorStreamStarted, successorEventAccepted], timeout: 2)
+            await fulfillment(
+                of: [successorStreamStarted, successorEventAccepted, successorRouteSettled],
+                timeout: 2
+            )
             let successorRunID = try XCTUnwrap(viewModel.activeRunIDForTesting(tabID: tabID))
             XCTAssertNotEqual(successorRunID, firstRunID)
             XCTAssertTrue(try viewModel.isRunTeardownPendingForTesting(runID: XCTUnwrap(firstRunID)))
@@ -2180,15 +2285,20 @@ private actor CodexShapedBlockedRoutingTestState {
 private actor ContextBuilderCleanupTestConnection: MCPServerConnection {
     private var terminations = 0
     private var stops = 0
-    private let deliverySnapshot: MCPResponseDeliverySnapshot?
+    private var deliverySnapshots: [MCPResponseDeliverySnapshot] = []
 
-    init(pendingRequestCount: Int? = nil) {
-        deliverySnapshot = pendingRequestCount.map {
-            MCPResponseDeliverySnapshot(
-                pendingRequestCount: $0,
-                waiterCount: 0,
-                isTerminal: true
-            )
+    init(
+        pendingRequestCount: Int? = nil,
+        subsequentPendingRequestCount: Int? = nil
+    ) {
+        deliverySnapshots = [pendingRequestCount, subsequentPendingRequestCount].compactMap { count in
+            count.map {
+                MCPResponseDeliverySnapshot(
+                    pendingRequestCount: $0,
+                    waiterCount: 0,
+                    isTerminal: true
+                )
+            }
         }
     }
 
@@ -2237,7 +2347,8 @@ private actor ContextBuilderCleanupTestConnection: MCPServerConnection {
     }
 
     func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot? {
-        deliverySnapshot
+        guard deliverySnapshots.count > 1 else { return deliverySnapshots.first }
+        return deliverySnapshots.removeFirst()
     }
 
     func terminate(reason _: TerminationReason, message _: String?) async {
