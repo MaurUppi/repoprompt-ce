@@ -79,11 +79,18 @@ Rebuild with catalog fix (`ALLOW_ADHOC_SIGNING=1 make dev-run`), then CE debug M
 
 ---
 
-## Residual (not Phase 1 blockers)
+## Residual (not Phase 1 blockers) → [Phase2.md](./Phase2.md)
 
-1. Live RepoPromptCE MCP tools inside a Grok ACP session (handshake/tool list exposure) — code inject present; confirm under stable signed debug CLI install if needed.
-2. UI Agent Models picker smoke after non-ad-hoc relaunch (MCP path already proves selection).
-3. Phase 2: headless parity polish.
+Phase 1 intentionally did **not** ship these; they are scoped in Phase 2:
+
+| Item | Phase 1 stance | Phase 2 section |
+| --- | --- | --- |
+| Oracle Model cannot select Grok Build | Expected non-goal | **A** |
+| Model Presets cannot select Grok | Expected (Oracle `AIModel` path) | **B** |
+| No Reasoning Low/Medium/High for `grok-4.5` | Expected min catalog | **C** |
+| Live RepoPromptCE MCP tools not listed in Grok session | Inject code done; live residual | **D** |
+| Headless / polling / richer discovery | Out of Phase 1 MVP | Headless + discovery |
+| UI smoke under non-ad-hoc signing | Optional confidence | **E** |
 
 ---
 
