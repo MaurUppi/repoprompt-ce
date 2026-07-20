@@ -14,7 +14,7 @@ Updated: 2026-07-19
 | --- | --- | --- | --- |
 | Dependency/grammar upgrade and broad parser-lock removal | `3b330db9fdfad6c23e715c84d47877995214f1c7` | Swift 5 | Exact SwiftTreeSitter 0.10/runtime 0.25.10 and grammar revisions; scanner shim retained after clean-link proof. |
 | `RepoPromptRegexCore` | `6feead2fcfbbd53bc9d4b9d0255401ec51bfd374` | Swift 5 + complete | Owner tests, lint, RepoPrompt build, generator contracts, and preflight passed. |
-| `RepoPromptCodeMapCore` / owner tests | Item 3 working tree | Swift 5 + complete | Deterministic synchronous parser/query/extraction and canonical artifact core extracted; focused evidence is recorded below and finalized with the Item 3 commit. |
+| `RepoPromptCodeMapCore` / owner tests | `22bfff1c5904d5f02c0a881055142c94f4783a84` | Swift 5 + complete | Deterministic synchronous parser/query/extraction and canonical artifact core extracted; focused evidence is recorded below and finalized with the Item 3 commit. |
 
 ## Item 3 ownership record
 
