@@ -24,6 +24,10 @@ Contributors may also propose ordinary reviewed changes to the tracked list.
 
 ## Before Submitting A Pull Request
 
+Read [`MUST_READ_BEFORE_PUSH.md`](MUST_READ_BEFORE_PUSH.md) for hard contracts
+(test ledger, preflight, style, source layout). Agents and humans must not push
+new XCTest suites without a surgical ledger update.
+
 Keep changes focused and explain what they do. AI-assisted work is welcome, but
 you should understand the code you submit and be able to explain its behavior.
 

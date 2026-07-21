@@ -94,6 +94,7 @@ Sandbox profiles and fine-grained rules stay in Grok (`~/.grok`); CE does not re
 
 | Doc | Purpose |
 | --- | --- |
+| [`MUST_READ_BEFORE_PUSH.md`](MUST_READ_BEFORE_PUSH.md) | Hard contracts before commit/push (ledger, preflight, style, layout) |
 | [`.docs/Grok_Build/Usage.md`](.docs/Grok_Build/Usage.md) | Full maintainer usage & troubleshooting |
 | [`.docs/Grok_Build/Planning.md`](.docs/Grok_Build/Planning.md) | Phase index |
 | [`.docs/Grok_Build/Phase4.md`](.docs/Grok_Build/Phase4.md) | T1/T2 first-class product work |
