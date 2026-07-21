@@ -1,3 +1,116 @@
+# RepoPrompt CE (fork)
+
+[![CI](https://github.com/MaurUppi/repoprompt-ce/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MaurUppi/repoprompt-ce/actions/workflows/ci.yml?query=branch%3Amain)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+![Platform: macOS 26+](https://img.shields.io/badge/platform-macOS%2026%2B-black)
+
+**Fork of [repoprompt/repoprompt-ce](https://github.com/repoprompt/repoprompt-ce)** with **Grok Build** as a first-class Agent Mode / CLI provider (ACP), alongside Codex, Claude Code, Cursor, and OpenCode.
+
+Upstream remains a free, open-source native macOS app for context engineering and agent orchestration. This fork keeps that base and adds Grok Build integration docs and product wiring.
+
+---
+
+## Grok Build (this fork)
+
+Grok Build is SpaceXAI’s terminal coding agent ([xai-org/grok-build](https://github.com/xai-org/grok-build)). In this CE tree it is wired like **Cursor CLI** (ACP `grok agent stdio`), **not** the HTTP xAI API provider (`AIProviderType.grok`).
+
+### What works
+
+| Surface | Notes |
+| --- | --- |
+| **CLI Providers → Connect** | PATH + `grok agent stdio` probe; auth via `grok login` / ACP `cached_token` |
+| **Agent Models** | **Grok Build** + effort **High / Medium / Low** |
+| **Agent Mode** | Multi-turn ACP; optional RepoPrompt MCP tool inject |
+| **Oracle / Model Presets** | Headless ACP (`grokbuild_custom_*`); no MCP inject on Oracle path |
+| **Context Builder Agent** | Same catalog when Connected; recommendation fallback after Cursor |
+| **Recommendations** | Status grids + chat/Oracle cards; default only if higher-priority backends are off |
+
+### Quick start
+
+1. Install Grok Build and log in:
+
+```bash
+curl -fsSL https://x.ai/cli/install.sh | bash
+grok login
+# ensure GUI apps see it: ~/.local/bin and/or ~/.grok/bin on PATH
+```
+
+2. Build and launch CE debug (no Apple Development identity):
+
+```bash
+ALLOW_ADHOC_SIGNING=1 make dev-run
+# or: ALLOW_ADHOC_SIGNING=1 ./conductor app relaunch
+```
+
+Ad-hoc builds use **ephemeral** secure storage (Connect/permissions may not persist). Prefer a stable `SIGN_IDENTITY="Apple Development: …"` when you need Keychain persistence.
+
+3. In the app: **Settings → Agent Mode → CLI Providers → Grok Build → Connect**.
+   Then pick **Grok Build** under Agent Models / Oracle Model (effort High/Medium/Low).
+
+4. Optional debug CLI smoke (app running + MCP on; workspace not Default):
+
+```bash
+# Agent Mode
+rpce-cli-debug -w 1 -c agent_run -j '{
+  "op":"start",
+  "model_id":"grokBuild:grok-4.5:low",
+  "session_name":"Grok smoke",
+  "message":"Reply exactly with CE_GROK_BUILD_SMOKE_OK and stop.",
+  "detach":true
+}'
+
+# Oracle (planning model)
+rpce-cli-debug -w 1 -c app_settings -j '{
+  "op":"set",
+  "key":"models.planning_model",
+  "value":"grokbuild_custom_grok-4.5:low"
+}'
+rpce-cli-debug -w 1 -c oracle_send -j '{
+  "message":"Reply exactly with CE_GROK_ORACLE_SMOKE_OK and stop. Do not use tools.",
+  "mode":"chat",
+  "new_chat":true
+}'
+```
+
+### IDs (do not confuse)
+
+| Kind | Value |
+| --- | --- |
+| Agent kind | `grokBuild` |
+| Agent model raws | `grok-4.5`, `grok-4.5:high\|medium\|low` |
+| Oracle / chat raws | `grokbuild_custom_grok-4.5:high\|medium\|low` |
+| HTTP xAI Grok | Settings API keys **Grok (xAI)** — separate from **Grok Build** |
+
+### Permissions
+
+| CE level | Meaning |
+| --- | --- |
+| **Default** | Grok may prompt for tool approval over ACP |
+| **Full Access** | CE auto-approves ACP tool permissions (similar intent to Grok `--always-approve` / `bypassPermissions`) |
+
+Sandbox profiles and fine-grained rules stay in Grok (`~/.grok`); CE does not re-host them.
+
+### Docs in this tree
+
+| Doc | Purpose |
+| --- | --- |
+| [`.docs/Grok_Build/Usage.md`](.docs/Grok_Build/Usage.md) | Full maintainer usage & troubleshooting |
+| [`.docs/Grok_Build/Planning.md`](.docs/Grok_Build/Planning.md) | Phase index |
+| [`.docs/Grok_Build/Phase4.md`](.docs/Grok_Build/Phase4.md) | T1/T2 first-class product work |
+| [`.docs/Grok_Build/Gap-vs-Codex-Claude.md`](.docs/Grok_Build/Gap-vs-Codex-Claude.md) | Gap vs Codex/Claude |
+| [`.docs/Grok_Build/Phase3-oracle-smoke.md`](.docs/Grok_Build/Phase3-oracle-smoke.md) | Live Oracle smoke evidence |
+
+### Not in scope (yet)
+
+- Optional write of `~/.grok/config.toml` MCP install helper (Agent Mode uses ACP inject)
+- Grok ACP extensions (`x.ai/fs/*`, …) and Codex app-server parity
+- Embedding the xAI Python cloud SDK for Agent Mode
+
+---
+
+<details>
+<summary><strong>Official RepoPrompt CE README</strong> (upstream overview, install, features, contributor docs)</summary>
+
 # RepoPrompt CE
 
 [![CI](https://github.com/repoprompt/repoprompt-ce/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/repoprompt/repoprompt-ce/actions/workflows/ci.yml?query=branch%3Amain)
@@ -160,6 +273,8 @@ third-party notices in
   workflows
 - [`docs/open-source-readiness.md`](docs/open-source-readiness.md): public
   readiness inventory
+
+</details>
 
 ## License
 
