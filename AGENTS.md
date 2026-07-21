@@ -6,7 +6,7 @@ Prefer the coordinated developer daemon (`make dev-*`, see "Developer daemon / c
 
 ## Contribution preflight
 
-Before every commit or push, read and run the repository-local `$rpce-contribution-check` skill:
+Before every commit or push, read [`MUST_READ_BEFORE_PUSH.md`](MUST_READ_BEFORE_PUSH.md) (hard contracts: test ledger, preflight, style, layout). Then read and run the repository-local `$rpce-contribution-check` skill:
 
 ```bash
 .agents/skills/rpce-contribution-check/scripts/preflight.sh commit
