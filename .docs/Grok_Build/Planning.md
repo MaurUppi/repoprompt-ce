@@ -28,7 +28,9 @@
 | 0 — Probe evidence | [Phase0-evidence.md](./Phase0-evidence.md) | Complete |
 | 1 — MVP (Connect + ACP Agent Mode + MCP + catalog min) | [Phase1.md](./Phase1.md) | **Complete** (live: list_agents + agent_run stream OK; MCP inject residual) |
 | 2 — Headless + discovery + effort + MCP identity | [Phase2.md](./Phase2.md) | **Complete** (Oracle/Presets → Phase 3) |
-| 3 — Product polish + Oracle/Presets | [Phase3.md](./Phase3.md) | **In progress** (Oracle/Presets Grok Build wired; polish optional) |
+| 3 — Product polish + Oracle/Presets | [Phase3.md](./Phase3.md) | **Core complete** (Oracle live smoke + Usage.md; optional onboarding) |
+| — Usage | [Usage.md](./Usage.md) | Maintainer how-to |
+| — Oracle smoke | [Phase3-oracle-smoke.md](./Phase3-oracle-smoke.md) | Live evidence 2026-07-21 |
 
 ---
 
