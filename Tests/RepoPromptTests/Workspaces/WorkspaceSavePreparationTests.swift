@@ -115,6 +115,9 @@ import XCTest
                 at: manager.workspaceFileURL(for: workspace)
             )
             XCTAssertEqual(saved.currentPromptText, "newer state")
+            // A concurrent dirty bump can land after the successful retry captures its
+            // version; drain once more so last-saved catches up before asserting clean state.
+            await manager.pollAndSaveStateAsync()
             XCTAssertEqual(
                 manager.debugLastSavedVersionForWorkspace(workspace.id),
                 manager.debugStateVersionForWorkspace(workspace.id)

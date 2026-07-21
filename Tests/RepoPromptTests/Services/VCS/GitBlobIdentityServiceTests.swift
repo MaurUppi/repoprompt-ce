@@ -645,8 +645,11 @@ final class GitBlobIdentityServiceTests: XCTestCase {
 
         let completionMarker = fixture.sandbox.appendingPathComponent("unbounded-output-completed")
         let outputChunk = String(repeating: "x", count: 1024)
+        // Exit on SIGTERM so a surviving shell cannot continue past a killed `sleep`
+        // and still write the completion marker (process-group TERM races on CI).
         let oversizedScript = """
         #!/bin/sh
+        trap 'exit 143' TERM INT HUP
         index=0
         while [ "$index" -lt 8192 ]; do
           printf '\(outputChunk)'
@@ -669,6 +672,11 @@ final class GitBlobIdentityServiceTests: XCTestCase {
                 error,
                 .malformedGitOutput("check-attr output exceeds byte limit")
             )
+        }
+        // Allow a brief window for process-group SIGTERM/SIGKILL to finish.
+        let deadline = Date().addingTimeInterval(2)
+        while FileManager.default.fileExists(atPath: completionMarker.path), Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
         }
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: completionMarker.path),
