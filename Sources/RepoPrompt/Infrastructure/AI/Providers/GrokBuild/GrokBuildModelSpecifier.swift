@@ -1,7 +1,7 @@
 import Foundation
 
 /// Grok Build reasoning effort advertised in session model `_meta.reasoningEfforts`.
-enum GrokBuildReasoningEffort: String, CaseIterable, Equatable, Sendable {
+enum GrokBuildReasoningEffort: String, CaseIterable, Equatable {
     case high
     case medium
     case low
@@ -20,7 +20,9 @@ enum GrokBuildReasoningEffort: String, CaseIterable, Equatable, Sendable {
         }
     }
 
-    var sessionModeID: String { rawValue }
+    var sessionModeID: String {
+        rawValue
+    }
 
     static func parse(_ raw: String?) -> GrokBuildReasoningEffort? {
         let normalized = raw?
@@ -35,7 +37,7 @@ enum GrokBuildReasoningEffort: String, CaseIterable, Equatable, Sendable {
 ///
 /// - Bare base id (`grok-4.5`) means default effort (high).
 /// - Compound form (`grok-4.5:medium`) pins an explicit effort applied via `session/set_mode`.
-struct GrokBuildModelSpecifier: Equatable, Sendable {
+struct GrokBuildModelSpecifier: Equatable {
     let baseModel: String?
     let effort: GrokBuildReasoningEffort?
 

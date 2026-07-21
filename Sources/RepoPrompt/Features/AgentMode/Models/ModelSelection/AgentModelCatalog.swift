@@ -387,11 +387,10 @@ enum AgentModelCatalog {
     ) -> [AgentModelOption] {
         guard isAgentAvailable(.grokBuild, availability: availability) else { return [] }
 
-        let baseOptions: [AgentModelOption]
-        if let discovered = resolvedACPDiscoveredModels(for: .grokBuild)?.options, !discovered.isEmpty {
-            baseOptions = discovered
+        let baseOptions: [AgentModelOption] = if let discovered = resolvedACPDiscoveredModels(for: .grokBuild)?.options, !discovered.isEmpty {
+            discovered
         } else {
-            baseOptions = AgentModel.modelsForAgent(.grokBuild)
+            AgentModel.modelsForAgent(.grokBuild)
                 .filter { isAvailable($0, for: .grokBuild, availability: availability) }
                 .map { staticOption($0, for: .grokBuild) }
         }
@@ -404,17 +403,16 @@ enum AgentModelCatalog {
                 ?? base.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !baseModelRaw.isEmpty else { continue }
 
-            let efforts: [GrokBuildReasoningEffort]
-            if !base.supportedReasoningEfforts.isEmpty {
-                efforts = GrokBuildReasoningEffort.displayOrder.filter { effort in
+            let efforts: [GrokBuildReasoningEffort] = if !base.supportedReasoningEfforts.isEmpty {
+                GrokBuildReasoningEffort.displayOrder.filter { effort in
                     base.supportedReasoningEfforts.contains { codex in
                         codex.rawValue.caseInsensitiveCompare(effort.rawValue) == .orderedSame
                     }
                 }
             } else if let single = specifier.effort {
-                efforts = [single]
+                [single]
             } else {
-                efforts = GrokBuildReasoningEffort.displayOrder
+                GrokBuildReasoningEffort.displayOrder
             }
             let resolvedEfforts = efforts.isEmpty ? GrokBuildReasoningEffort.displayOrder : efforts
 

@@ -1793,7 +1793,6 @@ struct CLIProvidersSettingsView: View {
         return hasComposer2 ? "\(base) Composer 2 is available when selected." : "\(base) Auto is the built-in fallback."
     }
 
-
     // MARK: - Grok Build Card
 
     private var grokBuildCard: some View {

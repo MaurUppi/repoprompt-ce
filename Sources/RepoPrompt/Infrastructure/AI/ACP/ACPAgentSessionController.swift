@@ -700,9 +700,11 @@ actor ACPAgentSessionController {
     private func setGrokBuildSessionModel(_ selectedRaw: String, sessionID: String) async throws {
         let specifier = GrokBuildModelSpecifier(raw: selectedRaw)
         let modelID = specifier.runtimeModelID
-            ?? (selectedRaw.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
-                ? AgentModel.grokBuildDefault.rawValue
-                : selectedRaw)
+            ?? (
+                selectedRaw.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
+                    ? AgentModel.grokBuildDefault.rawValue
+                    : selectedRaw
+            )
         let trimmedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedModelID.isEmpty else { return }
         if discoveredSessionModels?.currentModelRaw?.caseInsensitiveCompare(trimmedModelID) == .orderedSame {

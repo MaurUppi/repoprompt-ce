@@ -1,5 +1,5 @@
-import XCTest
 @testable import RepoPromptApp
+import XCTest
 
 @MainActor
 final class GrokBuildRecommendationStatusTests: XCTestCase {

@@ -3447,8 +3447,6 @@ public class APISettingsViewModel: ObservableObject {
         return url
     }
 
-
-
     // MARK: - Grok Build CLI / ACP
 
     func testGrokBuildConnection() async throws -> Bool {
@@ -3563,7 +3561,7 @@ public class APISettingsViewModel: ObservableObject {
                         availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
                     )
                 }
-                await self.updateAvailableModels()
+                await updateAvailableModels()
                 _ = snapshot
             }
         }
@@ -3577,7 +3575,7 @@ public class APISettingsViewModel: ObservableObject {
         }
     }
 
-private func startCursorModelsSubscriptionIfNeeded(workspacePath: String?) {
+    private func startCursorModelsSubscriptionIfNeeded(workspacePath: String?) {
         guard !hasPreparedForWindowClose else { return }
         guard cursorModelsTask == nil else { return }
         cursorModelsTask = Task { [weak self, workspacePath] in

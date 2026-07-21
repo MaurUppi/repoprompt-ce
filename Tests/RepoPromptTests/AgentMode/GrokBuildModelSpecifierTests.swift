@@ -1,5 +1,5 @@
-import XCTest
 @testable import RepoPromptApp
+import XCTest
 
 final class GrokBuildModelSpecifierTests: XCTestCase {
     func testBareBaseDefaultsEffortNilAndRuntimeModel() {

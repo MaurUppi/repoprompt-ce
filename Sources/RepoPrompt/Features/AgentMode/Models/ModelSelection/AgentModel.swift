@@ -105,7 +105,7 @@ enum AgentModel: String, CaseIterable, Codable {
     case cursorAuto = "auto"
     case cursorComposer2 = "composer-2"
 
-    // Grok Build models
+    /// Grok Build models
     case grokBuildDefault = "grok-4.5"
 
     /// Default (no model specified)
