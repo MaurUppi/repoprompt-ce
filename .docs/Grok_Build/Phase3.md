@@ -1,6 +1,6 @@
 # Phase 3 — Product polish + Oracle / Model Presets
 
-**Status:** In progress — Oracle/Presets Grok Build wiring shipped
+**Status:** Complete for Oracle/Presets + live smoke — optional polish remains
 **Parent:** [Planning.md](./Planning.md)
 **Depends on:** Phase 1 (required), Phase 2 (preferred)
 

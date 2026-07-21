@@ -30,7 +30,7 @@
 | 2 — Headless + discovery + effort + MCP identity | [Phase2.md](./Phase2.md) | **Complete** (Oracle/Presets → Phase 3) |
 | 3 — Product polish + Oracle/Presets | [Phase3.md](./Phase3.md) | **Core complete** (Oracle live smoke + Usage.md; optional onboarding) |
 | — Usage | [Usage.md](./Usage.md) | Maintainer how-to |
-| — Oracle smoke | [Phase3-oracle-smoke.md](./Phase3-oracle-smoke.md) | Live evidence 2026-07-21 |
+| — Oracle smoke | [Phase3-oracle-smoke.md](./Phase3-oracle-smoke.md) | Live evidence 2026-07-21 (run 1 + re-verify run 2) |
 
 ---
 
