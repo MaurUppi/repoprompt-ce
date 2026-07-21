@@ -156,3 +156,4 @@ CE maps these to family **`grok`** for Agent Mode policy routing (`MCPClientIden
 | 2 Effort + MCP | [Phase2.md](./Phase2.md) |
 | 3 Oracle/Presets | [Phase3.md](./Phase3.md) |
 | Live Oracle smoke | [Phase3-oracle-smoke.md](./Phase3-oracle-smoke.md) |
+| Gap vs Codex/Claude | [Gap-vs-Codex-Claude.md](./Gap-vs-Codex-Claude.md) |

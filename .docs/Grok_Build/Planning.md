@@ -31,6 +31,7 @@
 | 3 — Product polish + Oracle/Presets | [Phase3.md](./Phase3.md) | **Core complete** (Oracle live smoke + Usage.md; optional onboarding) |
 | — Usage | [Usage.md](./Usage.md) | Maintainer how-to |
 | — Oracle smoke | [Phase3-oracle-smoke.md](./Phase3-oracle-smoke.md) | Live evidence 2026-07-21 (run 1 + re-verify run 2) |
+| — Gap analysis | [Gap-vs-Codex-Claude.md](./Gap-vs-Codex-Claude.md) | Codex/Claude baseline + Grok backlog (2026-07-21) |
 
 ---
 

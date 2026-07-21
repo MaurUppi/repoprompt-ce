@@ -46,7 +46,7 @@ Oracle analysis / ask_oracle / plan-review / Model Presets pickers use `promptVi
 - [x] Live Oracle smoke (`CE_GROK_ORACLE_SMOKE_OK`) — [Phase3-oracle-smoke.md](./Phase3-oracle-smoke.md)
 - [x] Maintainer usage notes — [Usage.md](./Usage.md)
 - [ ] Product release changelog (when shipping a named release)
-- [ ] Recommendation onboarding entries (optional)
+- [ ] Recommendation onboarding entries (optional) — see [Gap-vs-Codex-Claude.md](./Gap-vs-Codex-Claude.md) G-01…G-13
 
 ## Key files
 
