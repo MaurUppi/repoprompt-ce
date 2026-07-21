@@ -28,10 +28,13 @@
 | 0 — Probe evidence | [Phase0-evidence.md](./Phase0-evidence.md) | Complete |
 | 1 — MVP (Connect + ACP Agent Mode + MCP + catalog min) | [Phase1.md](./Phase1.md) | **Complete** (live: list_agents + agent_run stream OK; MCP inject residual) |
 | 2 — Headless + discovery + effort + MCP identity | [Phase2.md](./Phase2.md) | **Complete** (Oracle/Presets → Phase 3) |
-| 3 — Product polish + Oracle/Presets | [Phase3.md](./Phase3.md) | **Core complete** (Oracle live smoke + Usage.md; optional onboarding) |
+| 3 — Product polish + Oracle/Presets | [Phase3.md](./Phase3.md) | **Complete** (core); polish leftovers → Phase 4 |
+| 4 — T1 product + T2 ACP/contract | [Phase4.md](./Phase4.md) | **In progress** (G-01/02/10–14/17; T3/T4 shelved) |
 | — Usage | [Usage.md](./Usage.md) | Maintainer how-to |
 | — Oracle smoke | [Phase3-oracle-smoke.md](./Phase3-oracle-smoke.md) | Live evidence 2026-07-21 (run 1 + re-verify run 2) |
 | — Gap analysis | [Gap-vs-Codex-Claude.md](./Gap-vs-Codex-Claude.md) | Codex/Claude baseline + Grok backlog (2026-07-21) |
+| — xai-sdk research | [Research-xai-sdk-python.md](./Research-xai-sdk-python.md) | Cloud SDK ≠ Grok Build; reject for Codex-depth agent path |
+| — Codex-depth B/R | [Benefits-Risks-Codex-Depth-No-Fork.md](./Benefits-Risks-Codex-Depth-No-Fork.md) | CE-only depth vs [grok-build](https://github.com/xai-org/grok-build) OSS; no fork |
 
 ---
 

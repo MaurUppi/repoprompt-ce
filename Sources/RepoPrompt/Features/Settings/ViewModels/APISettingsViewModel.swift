@@ -449,6 +449,7 @@ public class APISettingsViewModel: ObservableObject {
             claudeCodeCLI: recommendationAvailability(isConnected: isClaudeCodeConnected, provider: .claudeCode),
             codexCLI: recommendationAvailability(isConnected: isCodexConnected, provider: .codexExec),
             cursorCLI: recommendationAvailability(isConnected: isCursorConnected, provider: .cursor),
+            grokBuildCLI: recommendationAvailability(isConnected: isGrokBuildConnected, provider: .grokBuild),
             openAI: isOpenAIKeyValid ? .ready : (!openAIApiKey.isEmpty ? .configured : .notConfigured)
         )
     }
@@ -1163,6 +1164,7 @@ public class APISettingsViewModel: ObservableObject {
         let shouldValidateCodex = isCodexConnected
         let shouldValidateOpenCode = isOpenCodeConnected
         let shouldValidateCursor = isCursorConnected
+        let shouldValidateGrokBuild = isGrokBuildConnected
 
         let task = Task { @MainActor [weak self] in
             guard let self, !Task.isCancelled, !hasPreparedForWindowClose else { return }
@@ -1174,15 +1176,20 @@ public class APISettingsViewModel: ObservableObject {
             async let codexReady = probeCachedCodexConnection(ifNeeded: shouldValidateCodex)
             async let openCodeReady = probeCachedOpenCodeConnection(ifNeeded: shouldValidateOpenCode)
             async let cursorReady = probeCachedCursorConnection(ifNeeded: shouldValidateCursor)
-            let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady)
+            async let grokBuildReady = probeCachedGrokBuildConnection(ifNeeded: shouldValidateGrokBuild)
+            let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady, grokBuildReady)
             guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
             applyContextBuilderProviderValidationResult(readiness.0, provider: .claudeCode)
             applyContextBuilderProviderValidationResult(readiness.1, provider: .codexExec)
             applyContextBuilderProviderValidationResult(readiness.2, provider: .openCode)
             applyContextBuilderProviderValidationResult(readiness.3, provider: .cursor)
+            applyContextBuilderProviderValidationResult(readiness.4, provider: .grokBuild)
             if isCodexConnected, isVerifiedContextBuilderProvider(.codexExec) {
                 startCodexModelsSubscriptionIfNeeded()
+            }
+            if isGrokBuildConnected, isVerifiedContextBuilderProvider(.grokBuild) {
+                startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil)
             }
             isContextBuilderProviderValidationComplete = true
             contextBuilderProviderValidationTask = nil
@@ -1268,6 +1275,16 @@ public class APISettingsViewModel: ObservableObject {
             return true
         }
         return await CursorACPModelPollingService.shared.refreshNow(workspacePath: nil)
+    }
+
+    private func probeCachedGrokBuildConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        if let latest = await GrokBuildACPModelPollingService.shared.latestSnapshot(),
+           latest.isLiveDiscovery
+        {
+            return true
+        }
+        return await GrokBuildACPModelPollingService.shared.refreshNow(workspacePath: nil)
     }
 
     private func diagnosticReason(for error: Error) -> APIKeychainAccessDiagnostic.Reason {

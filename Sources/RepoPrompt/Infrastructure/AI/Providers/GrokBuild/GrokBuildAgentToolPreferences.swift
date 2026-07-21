@@ -17,9 +17,9 @@ enum GrokBuildAgentToolPreferences {
         var detailText: String {
             switch self {
             case .managedDefault:
-                "Grok Build asks before running tools that need approval. RepoPrompt MCP is injected through the ACP session."
+                "Grok Build asks before running tools that need approval (Grok permission mode default). RepoPrompt MCP is injected through the ACP session. Sandbox profiles and fine-grained rules stay in ~/.grok."
             case .fullAccess:
-                "RepoPrompt automatically approves Grok Build ACP tool permission requests."
+                "RepoPrompt automatically approves Grok Build ACP tool permission requests (similar intent to Grok --always-approve / bypassPermissions). Use only in trusted environments."
             }
         }
 

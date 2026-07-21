@@ -1937,7 +1937,14 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt54MiniMedium.rawValue),
                 SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.codexMini.rawValue),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorAuto.rawValue)
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorAuto.rawValue),
+                SelectionCandidate(
+                    agent: .grokBuild,
+                    modelRaw: GrokBuildModelSpecifier.encodedRaw(
+                        baseModelRaw: AgentModel.grokBuildDefault.rawValue,
+                        effort: .low
+                    )
+                )
             ]
         case .engineer:
             [
@@ -1946,7 +1953,14 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeSonnet.rawValue),
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue)
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
+                SelectionCandidate(
+                    agent: .grokBuild,
+                    modelRaw: GrokBuildModelSpecifier.encodedRaw(
+                        baseModelRaw: AgentModel.grokBuildDefault.rawValue,
+                        effort: .medium
+                    )
+                )
             ]
         case .pair:
             [
@@ -1955,7 +1969,14 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeOpus.rawValue),
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
-                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue)
+                SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
+                SelectionCandidate(
+                    agent: .grokBuild,
+                    modelRaw: GrokBuildModelSpecifier.encodedRaw(
+                        baseModelRaw: AgentModel.grokBuildDefault.rawValue,
+                        effort: .high
+                    )
+                )
             ]
         case .design:
             [
@@ -1964,7 +1985,14 @@ enum AgentModelCatalog {
                 SelectionCandidate(agent: .kimiCode, modelRaw: AgentModel.kimiCode.rawValue),
                 SelectionCandidate(agent: .customClaudeCompatible, modelRaw: defaultCompatibleBackendModelRaw(for: .customClaudeCompatible)),
                 SelectionCandidate(agent: .cursor, modelRaw: AgentModel.cursorComposer2.rawValue),
-                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt56SolMedium.rawValue)
+                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt56SolMedium.rawValue),
+                SelectionCandidate(
+                    agent: .grokBuild,
+                    modelRaw: GrokBuildModelSpecifier.encodedRaw(
+                        baseModelRaw: AgentModel.grokBuildDefault.rawValue,
+                        effort: .high
+                    )
+                )
             ]
         }
     }

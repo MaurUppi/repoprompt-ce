@@ -194,6 +194,7 @@ struct RecommendationWizardPopoverView: View {
                 providerRow("Claude Code", status: status.claudeCodeCLI)
                 providerRow("Codex CLI", status: status.codexCLI)
                 providerRow("Cursor CLI", status: status.cursorCLI)
+                providerRow("Grok Build", status: status.grokBuildCLI)
                 providerRow("OpenAI API", status: status.openAI)
             }
         }
@@ -583,6 +584,7 @@ private struct IntroStepView: View {
                 providerStatusRow("Claude Code", status: status.claudeCodeCLI)
                 providerStatusRow("Codex CLI", status: status.codexCLI)
                 providerStatusRow("Cursor CLI", status: status.cursorCLI)
+                providerStatusRow("Grok Build", status: status.grokBuildCLI)
                 providerStatusRow("OpenAI API", status: status.openAI)
             }
         }
@@ -809,6 +811,9 @@ private struct ChatModelStepView: View {
                     }
                     if rec.openAIOption != nil {
                         backendCard(.openAI, option: rec.openAIOption!)
+                    }
+                    if rec.grokBuildOption != nil {
+                        backendCard(.grokBuild, option: rec.grokBuildOption!)
                     }
                 }
                 .id("recommendationContent")

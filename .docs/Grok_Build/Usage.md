@@ -157,3 +157,14 @@ CE maps these to family **`grok`** for Agent Mode policy routing (`MCPClientIden
 | 3 Oracle/Presets | [Phase3.md](./Phase3.md) |
 | Live Oracle smoke | [Phase3-oracle-smoke.md](./Phase3-oracle-smoke.md) |
 | Gap vs Codex/Claude | [Gap-vs-Codex-Claude.md](./Gap-vs-Codex-Claude.md) |
+| Phase 4 (T1/T2 first-class) | [Phase4.md](./Phase4.md) |
+| Codex-depth benefits/risks | [Benefits-Risks-Codex-Depth-No-Fork.md](./Benefits-Risks-Codex-Depth-No-Fork.md) |
+
+### Permission levels (Phase 4 T2)
+
+| CE setting | Effect |
+| --- | --- |
+| Default | Grok may prompt for tool approval via ACP |
+| Full Access | CE auto-approves Grok ACP tool permission requests (similar intent to Grok `--always-approve` / `bypassPermissions`) |
+
+Sandbox profiles and fine-grained Grok rules remain in Grok’s own config/TUI (`~/.grok`); CE does not fork Grok to re-host them.

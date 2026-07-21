@@ -490,6 +490,8 @@ private struct TrustedClientRow: View {
             return "terminal"
         } else if lowercased.contains("gemini") {
             return "sparkles"
+        } else if lowercased.contains("grok") {
+            return "hammer.fill"
         } else {
             return "app.connected.to.app.below.fill"
         }

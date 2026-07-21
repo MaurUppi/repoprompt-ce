@@ -1,6 +1,6 @@
 # Phase 3 — Product polish + Oracle / Model Presets
 
-**Status:** Complete for Oracle/Presets + live smoke — optional polish remains
+**Status:** **Complete** (core). Incomplete polish migrated to [Phase4.md](./Phase4.md).
 **Parent:** [Planning.md](./Planning.md)
 **Depends on:** Phase 1 (required), Phase 2 (preferred)
 
@@ -8,13 +8,13 @@
 
 ## Goal
 
-Ship polish that is not required for MVP correctness, plus product surfaces deferred from Phase 2.
+Ship Oracle / Model Presets for Grok Build plus maintainer usage and live smoke evidence.
 
 ---
 
-## Scope
+## Scope (completed)
 
-### A/B — Oracle Model + Model Presets (implemented)
+### A/B — Oracle Model + Model Presets
 
 **Product decision:** Grok Build **is** available as an Oracle / Model Presets backend when Connect succeeds (same pattern as Cursor CLI / OpenCode).
 
@@ -26,16 +26,9 @@ Ship polish that is not required for MVP correctness, plus product surfaces defe
 | Catalog | Effort options High/Medium/Low via `AgentModelCatalog` when connected |
 | Settings | `updateAvailableModels` includes Grok Build when `isGrokBuildConnected` |
 
-Oracle analysis / ask_oracle / plan-review / Model Presets pickers use `promptViewModel.availableModels` → now lists **Grok Build** when connected.
+Oracle analysis / ask_oracle / plan-review / Model Presets pickers use `promptViewModel.availableModels` → lists **Grok Build** when connected.
 
-### Polish (remaining / optional)
-
-- Onboarding / recommendation engine entries (optional product policy).
-- Changelog + user-facing docs (install `grok`, `grok login`, Connect).
-- Telemetry enums (do not overload HTTP `.grok` if already used).
-- MCP timeout documentation **only if** Grok documents a real config.
-- Optional: extract pure helpers to `Packages/RepoPromptAgentProviders`.
-- Permission UX re-validation on non-always-approve hosts.
+---
 
 ## Exit criteria
 
@@ -45,8 +38,19 @@ Oracle analysis / ask_oracle / plan-review / Model Presets pickers use `promptVi
 - [x] Focused tests + product build
 - [x] Live Oracle smoke (`CE_GROK_ORACLE_SMOKE_OK`) — [Phase3-oracle-smoke.md](./Phase3-oracle-smoke.md)
 - [x] Maintainer usage notes — [Usage.md](./Usage.md)
-- [ ] Product release changelog (when shipping a named release)
-- [ ] Recommendation onboarding entries (optional) — see [Gap-vs-Codex-Claude.md](./Gap-vs-Codex-Claude.md) G-01…G-13
+- [x] Incomplete polish **migrated to Phase 4** (recommendations, changelog, permission re-validation, package extract)
+
+### Migrated to Phase 4 (was open here)
+
+| Former Phase 3 item | Phase 4 |
+| --- | --- |
+| Recommendation / onboarding entries | T1 G-01…G-13 |
+| Product release changelog | G-20 / ship note |
+| Permission UX re-validation | T2-perm |
+| Optional package extract | Shelved in Phase 4 non-goals |
+| MCP timeout docs | G-15 / evidence-gated |
+
+---
 
 ## Key files
 

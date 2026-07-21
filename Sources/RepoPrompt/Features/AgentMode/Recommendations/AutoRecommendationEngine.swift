@@ -54,6 +54,7 @@ final class AutoRecommendationEngine {
                 claudeCodeCLI: .notConfigured,
                 codexCLI: .notConfigured,
                 cursorCLI: .notConfigured,
+                grokBuildCLI: .notConfigured,
                 openAI: .notConfigured
             )
         }
@@ -131,6 +132,7 @@ final class AutoRecommendationEngine {
         var codexOption: ChatBackendOption?
         var openAIOption: ChatBackendOption?
         var claudeCodeOption: ChatBackendOption?
+        var grokBuildOption: ChatBackendOption?
 
         // Codex CLI option - PREFERRED for chat
         if status.codexCLI == .ready {
@@ -178,23 +180,42 @@ final class AutoRecommendationEngine {
             )
         }
 
+        // Grok Build CLI — Oracle/chat via headless ACP (not HTTP xAI Grok)
+        if status.grokBuildCLI == .ready {
+            grokBuildOption = ChatBackendOption(
+                kind: .grokBuild,
+                displayName: "Grok Build",
+                modelString: AIModel.grokBuildCustom(name: "grok-4.5:medium").rawValue,
+                description: "Grok 4.5 Medium via Grok Build CLI (ACP)",
+                tradeoffs: [
+                    "• Local coding-agent CLI with Connect in CLI Providers",
+                    "• Medium effort balances quality and latency for Oracle",
+                    "• Distinct from HTTP Grok (xAI API keys)"
+                ]
+            )
+        }
+
         // Determine default backend and upgrade hint
-        // Priority for CHAT: Codex CLI > OpenAI API > Claude Code
+        // Priority for CHAT: Codex CLI > OpenAI API > Claude Code > Grok Build
         let defaultBackend: ChatBackendKind
         var priorityPath: [String] = []
         var upgradeHint: String? = nil
 
         if codexOption != nil {
             defaultBackend = .codex
-            priorityPath = ["Codex CLI (\(inAppPlanning.modelLabel))", "OpenAI API", "Claude Code"]
+            priorityPath = ["Codex CLI (\(inAppPlanning.modelLabel))", "OpenAI API", "Claude Code", "Grok Build"]
         } else if openAIOption != nil {
             defaultBackend = .openAI
-            priorityPath = ["OpenAI API (\(apiPlanningModelLabel))", "Claude Code"]
+            priorityPath = ["OpenAI API (\(apiPlanningModelLabel))", "Claude Code", "Grok Build"]
             upgradeHint = "Connect Codex CLI for \(inAppPlanning.modelLabel) – strong reasoning with practical usage limits (requires OpenAI Plus/Pro)."
         } else if claudeCodeOption != nil {
             defaultBackend = .claudeCode
-            priorityPath = ["Claude Code"]
+            priorityPath = ["Claude Code", "Grok Build"]
             upgradeHint = "For best chat experience, connect Codex CLI (requires OpenAI Plus/Pro) for \(inAppPlanning.modelLabel) – balances quality with usage limits."
+        } else if grokBuildOption != nil {
+            defaultBackend = .grokBuild
+            priorityPath = ["Grok Build"]
+            upgradeHint = "For best chat experience, connect Codex CLI (requires OpenAI Plus/Pro) for \(inAppPlanning.modelLabel), or Claude Code as an alternative."
         } else {
             return nil
         }
@@ -204,6 +225,7 @@ final class AutoRecommendationEngine {
             codexOption: codexOption,
             openAIOption: openAIOption,
             claudeCodeOption: claudeCodeOption,
+            grokBuildOption: grokBuildOption,
             priorityPath: priorityPath,
             upgradeHint: upgradeHint
         )
@@ -217,6 +239,7 @@ final class AutoRecommendationEngine {
         var claudeCodeOption: ChatBackendOption?
         var codexOption: ChatBackendOption?
         var openAIOption: ChatBackendOption?
+        var grokBuildOption: ChatBackendOption?
 
         // Priority 1: Claude Code CLI
         if status.claudeCodeCLI == .ready {
@@ -248,7 +271,7 @@ final class AutoRecommendationEngine {
             )
         }
 
-        // Priority 4: OpenAI API
+        // Priority 3: OpenAI API
         if status.openAI == .ready {
             openAIOption = ChatBackendOption(
                 kind: .openAI,
@@ -259,6 +282,21 @@ final class AutoRecommendationEngine {
                     "• Superior reasoning capabilities",
                     "• Pay-per-use pricing",
                     "• Direct API access"
+                ]
+            )
+        }
+
+        // Priority 4: Grok Build CLI
+        if status.grokBuildCLI == .ready {
+            grokBuildOption = ChatBackendOption(
+                kind: .grokBuild,
+                displayName: "Grok Build",
+                modelString: AIModel.grokBuildCustom(name: "grok-4.5:medium").rawValue,
+                description: "Grok 4.5 Medium via Grok Build CLI",
+                tradeoffs: [
+                    "• Local Grok Build agent CLI",
+                    "• Uses your Grok Build login",
+                    "• Distinct from HTTP Grok API keys"
                 ]
             )
         }
@@ -276,6 +314,9 @@ final class AutoRecommendationEngine {
         } else if openAIOption != nil {
             defaultBackend = .openAI
             priorityPath.append("OpenAI API")
+        } else if grokBuildOption != nil {
+            defaultBackend = .grokBuild
+            priorityPath.append("Grok Build")
         } else {
             // No suitable providers available
             return nil
@@ -286,6 +327,7 @@ final class AutoRecommendationEngine {
             codexOption: codexOption,
             openAIOption: openAIOption,
             claudeCodeOption: claudeCodeOption,
+            grokBuildOption: grokBuildOption,
             priorityPath: priorityPath,
             upgradeHint: nil
         )
@@ -304,8 +346,8 @@ final class AutoRecommendationEngine {
     static func contextBuilderRecommendation(
         status: ProviderStatusSnapshot
     ) -> ContextBuilderRecommendation? {
-        // Priority: Codex CLI (requires CLI) > Claude Code > Cursor CLI
-        // Cursor is a fallback only; it does not take priority over existing recommended providers.
+        // Priority: Codex CLI (requires CLI) > Claude Code > Cursor CLI > Grok Build
+        // Cursor/Grok are fallbacks only; they do not take priority over preferred providers.
         // Note: codexExec agent requires Codex CLI specifically, not just OpenAI API key
         if status.codexCLI == .ready {
             return ContextBuilderRecommendation(
@@ -325,6 +367,13 @@ final class AutoRecommendationEngine {
                 recommendedAgent: .cursor,
                 recommendedModel: .cursorComposer2,
                 rationale: "Cursor CLI with Composer 2 can handle context building when the preferred Codex or Claude Code providers are not configured.",
+                upgradeHint: "For best context building, connect Codex CLI with GPT-5.6 Sol Low or Claude Code with Sonnet."
+            )
+        } else if status.grokBuildCLI == .ready {
+            return ContextBuilderRecommendation(
+                recommendedAgent: .grokBuild,
+                recommendedModel: .grokBuildDefault,
+                rationale: "Grok Build with Grok 4.5 can handle context building when Codex, Claude Code, or Cursor are not configured.",
                 upgradeHint: "For best context building, connect Codex CLI with GPT-5.6 Sol Low or Claude Code with Sonnet."
             )
         }
@@ -358,6 +407,7 @@ final class AutoRecommendationEngine {
             claudeCodeCLI: availability.claudeCodeAvailable ? .ready : .notConfigured,
             codexCLI: availability.codexAvailable ? .ready : .notConfigured,
             cursorCLI: availability.cursorAvailable ? .ready : .notConfigured,
+            grokBuildCLI: availability.grokBuildAvailable ? .ready : .notConfigured,
             openAI: .notConfigured
         ).filtered(to: enabledRecommendationProviders)
         if let recommendation = contextBuilderRecommendation(status: status) {
@@ -442,7 +492,7 @@ final class AutoRecommendationEngine {
             codexAvailable: status.codexCLI == .ready,
             openCodeAvailable: false,
             cursorAvailable: status.cursorCLI == .ready,
-            grokBuildAvailable: false,
+            grokBuildAvailable: status.grokBuildCLI == .ready,
             zaiConfigured: backendStore.isConfigured(.glmZAI) && backendStore.config(for: .glmZAI).isEnabled && backendStore.config(for: .glmZAI).isValid,
             kimiConfigured: backendStore.isConfigured(.kimi) && backendStore.config(for: .kimi).isEnabled && backendStore.config(for: .kimi).isValid,
             customClaudeCompatibleConfigured: backendStore.isConfigured(.custom) && backendStore.config(for: .custom).isEnabled && backendStore.config(for: .custom).isValid
@@ -608,6 +658,8 @@ final class AutoRecommendationEngine {
             rec.codexOption?.modelString ?? AIModel.codexCliGpt56SolHigh.rawValue
         case .openAI:
             rec.openAIOption?.modelString ?? AIModel.gpt54Pro.rawValue
+        case .grokBuild:
+            rec.grokBuildOption?.modelString ?? AIModel.grokBuildCustom(name: "grok-4.5:medium").rawValue
         }
         let trimmedModel = modelString.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmedModel.isEmpty ? nil : trimmedModel

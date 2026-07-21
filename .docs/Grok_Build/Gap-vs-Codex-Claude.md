@@ -292,3 +292,11 @@ Planning target is **Cursor ACP parity**. Rough peer check:
 ## 9. One-line summary
 
 **Grok Build has core Agent Mode + Oracle wiring at Cursor-ACP depth; vs Codex/Claude it intentionally lacks native-runtime features, but still has clear product gaps where recommendation/onboarding and status plumbing treat Grok as a stub (`grokBuildAvailable: false`, no status field) despite Connect and live smokes succeeding.**
+
+---
+
+## 10. Follow-on: Codex-depth without forking Grok Build
+
+Grok Build is open source ([xai-org/grok-build](https://github.com/xai-org/grok-build)); CE can deepen integration **without modifying that tree**. Benefits/risks and tiered ceiling (T1 product → T2 ACP/config → T3 `x.ai/*` → T4 non-goal): [Benefits-Risks-Codex-Depth-No-Fork.md](./Benefits-Risks-Codex-Depth-No-Fork.md).
+
+**Execution plan (agreed):** prioritize **T1 + T2** with explicit IDs **G-01, G-02, G-10–G-14, G-17**; migrate Phase 3 leftover polish into **[Phase4.md](./Phase4.md)**; **shelve T3/T4** (record only).

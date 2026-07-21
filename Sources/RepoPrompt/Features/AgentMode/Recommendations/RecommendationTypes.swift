@@ -58,17 +58,18 @@ struct ProviderStatusSnapshot {
     let claudeCodeCLI: Availability
     let codexCLI: Availability
     let cursorCLI: Availability
+    let grokBuildCLI: Availability
 
     let openAI: Availability
 
     /// Returns true if at least one provider is ready for chat.
     var hasAnyReadyProvider: Bool {
-        [claudeCodeCLI, codexCLI, cursorCLI, openAI].contains(.ready)
+        [claudeCodeCLI, codexCLI, cursorCLI, grokBuildCLI, openAI].contains(.ready)
     }
 
     /// Returns true if any CLI agent is ready.
     var hasAnyCLIAgentReady: Bool {
-        [claudeCodeCLI, codexCLI, cursorCLI].contains(.ready)
+        [claudeCodeCLI, codexCLI, cursorCLI, grokBuildCLI].contains(.ready)
     }
 
     /// Returns a copy with providers outside the enabled set treated as unavailable.
@@ -77,6 +78,7 @@ struct ProviderStatusSnapshot {
             claudeCodeCLI: enabledProviders.contains(.claudeCode) ? claudeCodeCLI : .notConfigured,
             codexCLI: enabledProviders.contains(.codex) ? codexCLI : .notConfigured,
             cursorCLI: enabledProviders.contains(.cursor) ? cursorCLI : .notConfigured,
+            grokBuildCLI: enabledProviders.contains(.grokBuild) ? grokBuildCLI : .notConfigured,
             openAI: enabledProviders.contains(.openAI) ? openAI : .notConfigured
         )
     }
@@ -89,12 +91,14 @@ enum ChatBackendKind: String, Codable {
     case claudeCode
     case codex
     case openAI
+    case grokBuild
 
     var displayName: String {
         switch self {
         case .claudeCode: "Claude Code"
         case .codex: "Codex CLI"
         case .openAI: "OpenAI API"
+        case .grokBuild: "Grok Build"
         }
     }
 }
@@ -132,6 +136,9 @@ struct ChatModelRecommendation {
     /// Option for Claude Code CLI, if available.
     let claudeCodeOption: ChatBackendOption?
 
+    /// Option for Grok Build CLI, if available.
+    let grokBuildOption: ChatBackendOption?
+
     /// Priority path used to determine the default (e.g., ["OpenAI API", "Codex CLI"]).
     let priorityPath: [String]
 
@@ -140,7 +147,7 @@ struct ChatModelRecommendation {
 
     /// Returns all available options.
     var availableOptions: [ChatBackendOption] {
-        [openAIOption, codexOption, claudeCodeOption].compactMap(\.self)
+        [openAIOption, codexOption, claudeCodeOption, grokBuildOption].compactMap(\.self)
     }
 
     /// Returns the option for a specific backend kind.
@@ -149,14 +156,24 @@ struct ChatModelRecommendation {
         case .claudeCode: claudeCodeOption
         case .codex: codexOption
         case .openAI: openAIOption
+        case .grokBuild: grokBuildOption
         }
     }
 
-    init(defaultBackend: ChatBackendKind, codexOption: ChatBackendOption?, openAIOption: ChatBackendOption?, claudeCodeOption: ChatBackendOption?, priorityPath: [String], upgradeHint: String? = nil) {
+    init(
+        defaultBackend: ChatBackendKind,
+        codexOption: ChatBackendOption?,
+        openAIOption: ChatBackendOption?,
+        claudeCodeOption: ChatBackendOption?,
+        grokBuildOption: ChatBackendOption? = nil,
+        priorityPath: [String],
+        upgradeHint: String? = nil
+    ) {
         self.defaultBackend = defaultBackend
         self.codexOption = codexOption
         self.openAIOption = openAIOption
         self.claudeCodeOption = claudeCodeOption
+        self.grokBuildOption = grokBuildOption
         self.priorityPath = priorityPath
         self.upgradeHint = upgradeHint
     }
